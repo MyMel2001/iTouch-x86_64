@@ -75,7 +75,10 @@ $(GEN)/font8x16.o: $(GEN)/font8x16.c | $(UAPI)/.stamp
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 LIBK93 := $(BUILD)/libk93.a
+# `ar rcs` updates members in place, so make can wrongly consider the archive
+# fresh; force the recipe to run and re-archive every member
 $(LIBK93): $(LIBK93_OBJ)
+	@rm -f $@
 	ar rcs $@ $^
 
 $(GBIN)/init: $(TOP)/userspace/sbin/init.c $(LIBK93)
@@ -85,7 +88,9 @@ $(GBIN)/init: $(TOP)/userspace/sbin/init.c $(LIBK93)
 $(GBIN)/launchd: $(TOP)/userspace/sbin/launchd.c $(LIBK93)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS)
 
-$(GBIN)/%: $(TOP)/userspace/apps/%/main.c $(LIBK93)
+# the app binaries must relink when libk93 objects change; make only tracks the
+# .a file, so the objects have to be explicit prerequisites here too
+$(GBIN)/%: $(TOP)/userspace/apps/%/main.c $(LIBK93) $(LIBK93_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS) $(LDLIBS_Z)
 

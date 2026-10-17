@@ -10,13 +10,17 @@ import sys
 
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src, "r", encoding="ascii", errors="replace").read()
-bytes_ = re.findall(r"0x([0-9a-fA-F]{2})", text)
-# skip the 4-word font header (0, 0, 4096, 0) - the header uses decimal for
-# FONTDATAMAX so only the leading 0x00,0x00 pair needs dropping.
-data = bytes(int(b, 16) for b in bytes_[2:])
-if len(data) < 4096:
-    sys.exit(f"expected >=4096 glyph bytes, got {len(data)}")
-data = data[:4096]
+# Strip comments BEFORE extracting hex. Each glyph is introduced by a comment
+# carrying its index in hex (e.g. "/* 1 0x01 '^A' */"); the regex would match
+# those 256 index bytes and splice them into the bitmap stream (4352 tokens
+# instead of 4096), scrambling every glyph. The struct header
+# "{ 0, 0, FONTDATAMAX, 0 }" is decimal (no 0x), so after comment removal only
+# the 4096 real bitmap bytes remain and no offset skip is needed.
+text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+text = re.sub(r"//.*?$", "", text, flags=re.M)
+data = bytes(int(b, 16) for b in re.findall(r"0x([0-9a-fA-F]{2})", text))
+if len(data) != 4096:
+    sys.exit(f"expected 4096 glyph bytes, got {len(data)}")
 
 with open(dst, "w") as f:
     f.write(

@@ -76,10 +76,10 @@ if grep -q "SpringBoard - .* apps" "$GLOG" 2>/dev/null; then
     echo "GRAPHICS TEST FAIL: SpringBoard fell back to text mode (no KMS device)"
     exit 1
 fi
-if [ "$grc" = 0 ]; then
+if [ "$grc" = 0 ] && python3 "$TOP/tools/check-screendump.py" "$PPM" landscape; then
     echo "GRAPHICS TEST PASS (DRM/KMS + SpringBoard rendered: $PPM)"
 else
-    echo "GRAPHICS TEST FAIL (springboard_seen=$ok_wait, log: $GLOG)"
+    echo "GRAPHICS TEST FAIL (springboard_seen=$ok_wait, screendump rc=$grc, log: $GLOG)"
     exit 1
 fi
 
@@ -104,7 +104,10 @@ qemu-system-x86_64 \
 QPID3=$!
 portrait_seen=0
 for _ in $(seq 1 90); do
-    if grep -q "orientation=portrait" "$PLOG" 2>/dev/null; then portrait_seen=1; break; fi
+    # k93ui reads k93.orientation= straight from /proc/cmdline (independent of
+    # serial loglevel), so wait for SpringBoard like phase 2 does; the pixel
+    # check below is what actually asserts the rotated render.
+    if grep -q "started com.k93.springboard" "$PLOG" 2>/dev/null; then portrait_seen=1; break; fi
     kill -0 $QPID3 2>/dev/null || break
     sleep 1
 done
@@ -115,8 +118,7 @@ if [ "$portrait_seen" = 1 ]; then
 fi
 kill $QPID3 2>/dev/null || true
 wait $QPID3 2>/dev/null || true
-if [ "$prc" = 0 ] && grep -q "canvas .*x.* orientation=portrait" "$PLOG" && \
-   [ -s "$PPM2" ] && [ "$(stat -c%s "$PPM2")" -gt 100000 ]; then
+if [ "$prc" = 0 ] && python3 "$TOP/tools/check-screendump.py" "$PPM2" portrait; then
     echo "PORTRAIT TEST PASS (rotated canvas: $PPM2)"
     exit 0
 fi

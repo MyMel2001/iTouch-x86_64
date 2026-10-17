@@ -36,8 +36,11 @@ explanation (K93OS runs native x86_64 ELF only).
   original rootfs are not used)
 * Serial-console-first UI toolkit. Graphics stack is DRM/KMS (clean-room
   client in `libk93/k93ui.c`): init waits for `/dev/dri/card0`, loads the
-  GPU driver, SpringBoard creates a dumb buffer, maps it, sets a mode and
-  notifies damage via `DIRTYFB`. ANSI text console is the fallback when no
+  GPU driver, SpringBoard becomes DRM master, creates its own dumb buffer
+  at the active CRTC's mode, maps it, and hands the CRTC to it with an
+  atomic commit. Each flush re-commits the buffer (mmap + `DIRTYFB` alone
+  never reach the host: they don't drive the plane's `atomic_update`, so the
+  host scanout never switches). ANSI text console is the fallback when no
   KMS device appears. evdev + tty input, embedded GPL font
 * Display configuration (`/etc/k93/display.conf`: `MODE=auto|WxH`,
   `ORIENTATION=landscape|portrait`), settable in **Settings > Display**

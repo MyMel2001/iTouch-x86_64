@@ -118,10 +118,17 @@ Formats: `.ipa` = ZIP (inflate + XML plist parse + optional CMS/sig check) and
 * [x] QEMU image + serial autotest — **AUTOTEST PASS** (2026-10-16).
 * [x] Graphics stack: DRM/KMS dumb-buffer backend in `libk93/k93ui.c`
   (`/dev/fb0` unavailable on this kernel — `CONFIG_FB_DEVICE=n`); init waits
-  for `/dev/dri/card0` + loads `bochs-drm`; SpringBoard renders to a mapped
-  dumb buffer, damage via `DIRTYFB`. `make qemu-test` phase 2
-  (QMP screendump of the SpringBoard framebuffer) — **GRAPHICS TEST PASS**
-  (2026-10-17).
+  for `/dev/dri/card0` + loads the GPU driver; SpringBoard becomes DRM
+  master, creates its **own** dumb buffer at the active CRTC's mode and
+  hands the CRTC to it with an **atomic commit**, re-committed every flush.
+  `DIRTYFB`/mmap alone never reach the host (they don't drive the plane's
+  `atomic_update`, so `set_scanout`/`resource_flush` never fire and the host
+  keeps scanning fbcon's buffer). A second bug scrambled the font: the
+  generator regex also matched the per-glyph hex index inside
+  `font_8x16.c` comments (`0x00`..`0xff`), splicing 256 index bytes into
+  the 4096-byte bitmap — `tools/genfont.py` now strips comments first.
+  `make qemu-test` phase 2/3 (QMP screendump pixel check via
+  `tools/check-screendump.py`) — **GRAPHICS TEST PASS** (2026-10-17).
 * [x] Guest networking: udhcpc + clean-room hook; virtio-net (QEMU) and
   real-hardware wired NIC drivers (`e1000`/`e1000e`/`r8169`/
   `8139too`/`8139cp`) in the initrd.

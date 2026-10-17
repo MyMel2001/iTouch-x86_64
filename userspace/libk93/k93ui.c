@@ -23,11 +23,20 @@
 #include <poll.h>
 #include <signal.h>
 #include <linux/fb.h>
+#include <linux/kd.h>
 #ifndef __user
 #define __user
 #endif
 #include <linux/drm.h>
 #include <linux/drm_mode.h>
+
+/* fourcc constants not exposed via linux/drm_mode.h (drm_fourcc.h not pulled) */
+#ifndef DRM_FORMAT_XRGB8888
+#define DRM_FORMAT_XRGB8888 ((uint32_t)('X' | ('R' << 8) | ('2' << 16) | ('4' << 24)))
+#endif
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR ((uint64_t)0)
+#endif
 #ifndef DRM_MODE_CONNECTED           /* removed from v7.2 uapi (kernel enum) */
 #define DRM_MODE_UNKNOWN    0
 #define DRM_MODE_CONNECTED  1
@@ -42,12 +51,15 @@ extern const uint8_t k93_font8x16[4096];
 enum { BACK_NONE, BACK_FB, BACK_TEXT };
 
 static int drm_ioctl(int fd, unsigned long req, void *arg);
+static int kms_flip(void);
 
 static struct {
     int backend;
     int cols, rows;
     int fbfd;
     int drmfb;                           /* DRM fb id (KMS backend) */
+    uint32_t planeid;                    /* primary plane id (KMS backend) */
+    uint32_t drmcrtc, drmconn;           /* adopted scanout crtc/connector */
     uint8_t *fbr;                        /* mmapped framebuffer (physical) */
     uint8_t *fbw;                        /* shadow buffer (logical) */
     size_t fblen, wlen;
@@ -310,18 +322,12 @@ static void fb_render_all(void)
                    G.fbw + (size_t)y * (size_t)G.wline, (size_t)bytes);
     }
     if (G.drmfb > 0 && G.fbfd >= 0) {
-        /* KMS (DRM) scanout: drivers with shadow planes (bochs-drm) only
-         * copy our mmap'd buffer to real VRAM on damage notification -
-         * tell the kernel the whole screen changed after each flush. */
-        struct drm_clip_rect clip = {
-            0, 0, (uint16_t)G.sx, (uint16_t)G.sy,
-        };
-        struct drm_mode_fb_dirty_cmd d = {
-            .fb_id = (uint32_t)G.drmfb,
-            .num_clips = 1,
-            .clips_ptr = (uintptr_t)&clip,
-        };
-        drm_ioctl(G.fbfd, DRM_IOCTL_MODE_DIRTYFB, &d);
+        /* KMS: an atomic re-commit is the only thing that reaches the host.
+         * mmap + DIRTYFB update KMS state but never drive the plane's
+         * atomic_update, so no set_scanout/resource_flush happens and the
+         * display keeps stale content. kms_flip() re-commits the adopted
+         * buffer (full damage -> full plane update -> host flush). */
+        kms_flip();
     }
 }
 
@@ -380,7 +386,9 @@ void ui_clear(void)
 
 void ui_flush(void)
 {
-    if (G.backend == BACK_FB) fb_render_all();
+    if (G.backend == BACK_FB) {
+        fb_render_all();
+    }
 }
 
 void ui_statusbar(const char *title)
@@ -468,6 +476,10 @@ static int fb_open(void)
     size_t len = fi.smem_len ? fi.smem_len : (size_t)fi.line_length * vi.yres_virtual;
     uint8_t *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) { close(fd); return -1; }
+    /* fbcon may have left stale glyphs in the scanout buffer; the shadow is
+     * cleared but only the logical region gets blitted, so clear the real
+     * buffer too or the leftovers stay on screen. */
+    memset(m, 0, len);
     G.fbr = m; G.fblen = len;
     G.fbw = k93_xmalloc(len);
     memset(G.fbw, 0, len);
@@ -514,6 +526,234 @@ static void drm_dbg(const char *fmt, ...)
     if (c >= 0) { ssize_t w = write(c, line, strlen(line)); (void)w; close(c); }
 }
 
+/* Resolve an object's property ID by name. Modern KMS drivers are atomic-only:
+ * the legacy SETCRTC ioctl updates kernel state but never flushes a full modeset
+ * to hardware, so scanout keeps showing fbcon's buffer. A real atomic commit is
+ * the only way to hand the CRTC to our framebuffer. */
+static uint32_t drm_obj_prop(int fd, uint32_t obj, uint32_t type, const char *name)
+{
+    struct drm_mode_obj_get_properties gp;
+    memset(&gp, 0, sizeof gp);
+    gp.obj_id = obj;
+    gp.obj_type = type;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &gp) < 0 || !gp.count_props)
+        return 0;
+    uint32_t ids[64], n = gp.count_props < 64 ? gp.count_props : 64;
+    uint64_t vals[64];
+    gp.props_ptr = (uintptr_t)ids;
+    gp.prop_values_ptr = (uintptr_t)vals;
+    gp.count_props = n;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &gp) < 0) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        struct drm_mode_get_property pr; memset(&pr, 0, sizeof pr);
+        pr.prop_id = ids[i];
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &pr) < 0) continue;
+        if (!strncmp(pr.name, name, DRM_PROP_NAME_LEN)) return ids[i];
+    }
+    return 0;
+}
+
+/* Resolve an object's property *value* by name: same lookup as drm_obj_prop,
+ * but reads back the current value. The kernel needs a count-probe first. */
+static int drm_obj_prop_val(int fd, uint32_t obj, uint32_t type,
+                            const char *name, uint64_t *out)
+{
+    struct drm_mode_obj_get_properties gp;
+    memset(&gp, 0, sizeof gp);
+    gp.obj_id = obj;
+    gp.obj_type = type;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &gp) < 0 || !gp.count_props)
+        return -1;
+    uint32_t ids[64], n = gp.count_props < 64 ? gp.count_props : 64;
+    uint64_t vals[64];
+    gp.props_ptr = (uintptr_t)ids;
+    gp.prop_values_ptr = (uintptr_t)vals;
+    gp.count_props = n;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &gp) < 0) return -1;
+    for (uint32_t i = 0; i < n; i++) {
+        struct drm_mode_get_property pr; memset(&pr, 0, sizeof pr);
+        pr.prop_id = ids[i];
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &pr) < 0) continue;
+        if (strncmp(pr.name, name, DRM_PROP_NAME_LEN)) continue;
+        /* count-probe the values array, then fetch */
+        memset(&pr, 0, sizeof pr);
+        pr.prop_id = ids[i];
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &pr) < 0 || !pr.count_values)
+            return -1;
+        uint64_t v = 0;
+        pr.values_ptr = (uintptr_t)&v;
+        pr.count_values = 1;
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &pr) < 0) return -1;
+        *out = v;
+        return 0;
+    }
+    return -1;
+}
+
+/* Atomic commit: point the primary plane at our fb and drive the CRTC with the
+ * chosen mode. Returns 0 on success. */
+static int drm_atomic_scanout(int fd, uint32_t crtc_id, uint32_t conn_id,
+                              uint32_t fb_id, const struct drm_mode_modeinfo *mode)
+{
+    drm_ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP,
+              &(struct drm_set_client_cap){ DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1 });
+    drm_ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP,
+              &(struct drm_set_client_cap){ DRM_CLIENT_CAP_ATOMIC, 1 });
+
+    /* find the primary plane whose possible_crtcs covers our CRTC index */
+    struct drm_mode_get_plane_res pr; memset(&pr, 0, sizeof pr);
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr) < 0 || !pr.count_planes)
+        return -1;
+    uint32_t planes[32], pn = pr.count_planes < 32 ? pr.count_planes : 32;
+    pr.plane_id_ptr = (uintptr_t)planes;
+    pr.count_planes = pn;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr) < 0) return -1;
+
+    /* CRTC index = position of crtc_id in GETRESOURCES crtcs list */
+    struct drm_mode_card_res res2; memset(&res2, 0, sizeof res2);
+    uint32_t cidx = 0;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res2) == 0 && res2.count_crtcs) {
+        uint32_t cl[32], cn = res2.count_crtcs < 32 ? res2.count_crtcs : 32;
+        res2.crtc_id_ptr = (uintptr_t)cl;
+        res2.count_crtcs = cn;
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res2) == 0)
+            for (uint32_t i = 0; i < cn; i++) if (cl[i] == crtc_id) cidx = i;
+    }
+
+    /* Pick the PRIMARY plane for this CRTC. The kernel enumerates planes in an
+     * arbitrary order (virtio-gpu lists the cursor plane first); attaching the
+     * framebuffer to a non-primary plane leaves the primary scanning fbcon's
+     * buffer, which is why the screen keeps showing garbage. The plane's
+     * standard "type" property is Primary=1, Overlay=2, Cursor=3. */
+    uint32_t plane = 0, fallback = 0;
+    for (uint32_t i = 0; i < pr.count_planes; i++) {
+        struct drm_mode_get_plane pl; memset(&pl, 0, sizeof pl);
+        pl.plane_id = planes[i];
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &pl) < 0) continue;
+        if (!(pl.possible_crtcs & (1u << cidx))) continue;
+        if (!fallback) fallback = planes[i];
+        uint64_t ptype = 0;
+        if (drm_obj_prop_val(fd, planes[i], DRM_MODE_OBJECT_PLANE, "type", &ptype) == 0
+            && ptype == 1) {                      /* 1 = DRM_PLANE_TYPE_PRIMARY */
+            plane = planes[i];
+            break;
+        }
+    }
+    if (!plane) plane = fallback;
+    if (!plane) { drm_dbg("k93ui: no primary plane for crtc %u idx %u\n", crtc_id, cidx); return -1; }
+
+    uint32_t p_fb   = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "FB_ID");
+    uint32_t p_crtc = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+    uint32_t p_src  = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_X");
+    uint32_t p_src_y= drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+    uint32_t p_src_w= drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_W");
+    uint32_t p_src_h= drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_H");
+    uint32_t p_cx   = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+    uint32_t p_cy   = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+    uint32_t p_cw   = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_W");
+    uint32_t p_ch   = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+    uint32_t c_mode = drm_obj_prop(fd, crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+    uint32_t c_act  = drm_obj_prop(fd, crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+    uint32_t o_conn = drm_obj_prop(fd, conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+    if (!p_fb || !p_crtc || !c_mode || !c_act || !o_conn) {
+        drm_dbg("k93ui: missing props fb=%u crtc=%u mode=%u act=%u conn=%u\n",
+                p_fb, p_crtc, c_mode, c_act, o_conn);
+        return -1;
+    }
+
+    /* MODE_ID takes a blob; create one from our modeline */
+    struct drm_mode_create_blob mb; memset(&mb, 0, sizeof mb);
+    mb.data = (uintptr_t)mode;
+    mb.length = sizeof *mode;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &mb) < 0) {
+        drm_dbg("k93ui: create_blob: %s\n", strerror(errno));
+        return -1;
+    }
+
+    uint64_t W = mode->hdisplay, H = mode->vdisplay;
+    /* three objects: plane gets 10 props, crtc gets MODE_ID+ACTIVE, connector
+     * gets CRTC_ID */
+    uint32_t objs2[3] = { plane, crtc_id, conn_id };
+    uint32_t npc2[3]  = { 10,    2,       1 };
+
+    uint32_t props[13] = {
+        p_fb, p_crtc, p_src, p_src_y, p_src_w, p_src_h, p_cx, p_cy, p_cw, p_ch,
+        c_mode, c_act,
+        o_conn,
+    };
+    uint64_t vals[13] = {
+        fb_id, crtc_id, 0, 0, W << 16, H << 16, 0, 0, W, H,
+        mb.blob_id, 1,
+        crtc_id,
+    };
+
+    struct drm_mode_atomic at; memset(&at, 0, sizeof at);
+    at.flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+    at.count_objs = 3;
+    at.objs_ptr = (uintptr_t)objs2;
+    at.count_props_ptr = (uintptr_t)npc2;
+    at.props_ptr = (uintptr_t)props;
+    at.prop_values_ptr = (uintptr_t)vals;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &at) < 0) {
+        drm_dbg("k93ui: atomic commit: %s\n", strerror(errno));
+        struct drm_mode_destroy_blob db = { .blob_id = mb.blob_id };
+        drm_ioctl(fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, &db);
+        return -1;
+    }
+    G.planeid = plane;
+    struct drm_mode_destroy_blob db = { .blob_id = mb.blob_id };
+    drm_ioctl(fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, &db);
+    return 0;
+}
+
+/* Atomically (re)commit the adopted scanout buffer. mmap + DIRTYFB never reach
+ * the host: DIRTYFB does not drive the plane's atomic_update, so no
+ * set_scanout/resource_flush is issued and the display keeps the old content.
+ * Only a real atomic commit does (same path fbcon's fbdev client uses). A
+ * re-commit of the SAME fb yields full damage -> full plane update -> flush.
+ * Mode is already set from the initial drm_atomic_scanout; flips just refresh
+ * FB_ID/geometry. Returns 0 on success. */
+static int kms_flip(void)
+{
+    int fd = G.fbfd;
+    uint32_t plane = G.planeid, crtc = G.drmcrtc, conn = G.drmconn;
+    uint32_t fb = (uint32_t)G.drmfb;
+    uint32_t p_fb    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "FB_ID");
+    uint32_t p_crtc  = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+    uint32_t p_sx    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_X");
+    uint32_t p_sy    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+    uint32_t p_sw    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_W");
+    uint32_t p_sh    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_H");
+    uint32_t p_cx    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+    uint32_t p_cy    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+    uint32_t p_cw    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_W");
+    uint32_t p_ch    = drm_obj_prop(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+    uint32_t c_act   = drm_obj_prop(fd, crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+    uint32_t o_conn  = conn ? drm_obj_prop(fd, conn, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID") : 0;
+    if (!p_fb || !p_crtc || !c_act) return -1;
+    uint64_t W = (uint64_t)G.sx, H = (uint64_t)G.sy;
+    uint32_t objs[3] = { plane, crtc, conn };
+    uint32_t npc[3]  = { 10, 1, conn ? 1u : 0u };
+    uint32_t props[12] = {
+        p_fb, p_crtc, p_sx, p_sy, p_sw, p_sh, p_cx, p_cy, p_cw, p_ch,
+        c_act,
+        o_conn,
+    };
+    uint64_t vals[12] = {
+        fb, crtc, 0, 0, W << 16, H << 16, 0, 0, W, H,
+        1,
+        crtc,
+    };
+    struct drm_mode_atomic at; memset(&at, 0, sizeof at);
+    at.flags = 0;                       /* same mode: fast page-flip */
+    at.count_objs = conn ? 3u : 2u;
+    at.objs_ptr = (uintptr_t)objs;
+    at.count_props_ptr = (uintptr_t)npc;
+    at.props_ptr = (uintptr_t)props;
+    at.prop_values_ptr = (uintptr_t)vals;
+    return drm_ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &at);
+}
+
 static int drm_open(void)
 {
     int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -542,79 +782,91 @@ static int drm_open(void)
         return -1;
     }
 
-    /* first connected connector with a mode list */
-    uint32_t conn_id = 0, crtc_id = crt[0];
-    struct drm_mode_modeinfo mode;
-    memset(&mode, 0, sizeof mode);
-    int got = 0;
-    drm_dbg("k93ui: %u connectors, %u crtcs, first mode %dx%d\n",
-            res.count_connectors, res.count_crtcs, mode.hdisplay, mode.vdisplay);
-    for (uint32_t i = 0; i < res.count_connectors && !got; i++) {
-        struct drm_mode_get_connector cc;
-        memset(&cc, 0, sizeof cc);
-        cc.connector_id = con[i];
-        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &cc) < 0) {
-            drm_dbg("k93ui: getconnector %u: %s\n", con[i], strerror(errno));
-            continue;
-        }
-        if (cc.count_modes == 0) {
-            drm_dbg("k93ui: connector %u status=%u has no modes\n", con[i], cc.connection);
-            continue;
-        }
-        struct drm_mode_modeinfo modes[32];
-        uint32_t n = cc.count_modes < 32 ? cc.count_modes : 32;
-        cc.modes_ptr = (uintptr_t)modes;
-        cc.count_modes = n;
-        cc.encoders_ptr = (uintptr_t)enc;       /* stale counts with NULL ptrs
-                                                 * = kernel EFAULT */
-        cc.count_encoders = res.count_encoders < 32 ? res.count_encoders : 32;
-        cc.props_ptr = 0;
-        cc.prop_values_ptr = 0;
-        cc.count_props = 0;
-        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &cc) < 0) {
-            drm_dbg("k93ui: getconnector-modes %u: %s\n", con[i], strerror(errno));
-            continue;
-        }
-        mode = modes[0];                        /* first mode = preferred */
-        /* requested mode from display.conf / cmdline: pick matching entry */
-        char want[32], orient[32];
-        display_conf(want, sizeof want, orient, sizeof orient);
-        if (strstr(want, "x")) {
-            int w = atoi(want), h = atoi(want + strcspn(want, "x") + 1);
-            for (uint32_t m = 0; m < cc.count_modes && m < 32; m++)
-                if ((int)modes[m].hdisplay == w && (int)modes[m].vdisplay == h) {
-                    mode = modes[m];
-                    break;
-                }
-        }
-        conn_id = con[i];
-        got = 1;
-    }
-    if (!got) {
-        drm_dbg("k93ui: no connected connector with modes\n");
+    /* We render straight into a KMS dumb framebuffer. /dev/fb0 never exists
+     * (kernel is built CONFIG_FB_DEVICE=n so fb_device_create() makes no node),
+     * so fbdev userspace is dead and DRM/KMS is the only path. fbcon owns the
+     * CRTC at boot via its in-kernel fbdev client, so we: SET_MASTER, find the
+     * active primary plane + its current mode, create our OWN dumb buffer at
+     * that mode, and atomically commit it. Using a DIFFERENT fb than fbcon's
+     * forces virtio_gpu_primary_plane_update's set_scanout path (skipped when
+     * the fb is unchanged), which points the host scanout at our pixels;
+     * kms_flip() re-commits then push damage. (Legacy SETCRTC is a state-only
+     * no-op on atomic drivers.) */
+    drm_ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP,
+              &(struct drm_set_client_cap){ DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1 });
+    if (drm_ioctl(fd, DRM_IOCTL_SET_MASTER, NULL) < 0)
+        drm_dbg("k93ui: setmaster: %s\n", strerror(errno));
+
+    struct drm_mode_get_plane_res pr; memset(&pr, 0, sizeof pr);
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr) < 0 || !pr.count_planes) {
+        drm_dbg("k93ui: no planes: %s\n", strerror(errno));
         close(fd);
         return -1;
     }
+    uint32_t pls[32], pn = pr.count_planes < 32 ? pr.count_planes : 32;
+    pr.plane_id_ptr = (uintptr_t)pls; pr.count_planes = pn;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr) < 0) { close(fd); return -1; }
 
-    /* render buffer: 32bpp dumb buffer in the scanout size */
-    struct drm_mode_create_dumb cd = {
-        .width = (uint32_t)mode.hdisplay,
-        .height = (uint32_t)mode.vdisplay,
-        .bpp = 32,
-    };
-    if (drm_ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) { close(fd); return -1; }
+    /* Find the active primary plane + its CRTC. We only need the CRTC (and its
+     * mode, below) — our own dumb buffer replaces scan_fb after ADDFB. */
+    uint32_t scan_fb = 0, scan_crtc = 0, scan_plane = 0;
+    for (uint32_t i = 0; i < pr.count_planes; i++) {
+        struct drm_mode_get_plane pl; memset(&pl, 0, sizeof pl);
+        pl.plane_id = pls[i];
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &pl) < 0) continue;
+        uint64_t ptype = 99;
+        drm_obj_prop_val(fd, pls[i], DRM_MODE_OBJECT_PLANE, "type", &ptype);
+        if (ptype == 1 && pl.fb_id) {           /* DRM_PLANE_TYPE_PRIMARY */
+            scan_fb = pl.fb_id;
+            scan_crtc = pl.crtc_id;
+            scan_plane = pls[i];
+            break;
+        }
+        if (!scan_fb && pl.fb_id) { scan_fb = pl.fb_id; scan_crtc = pl.crtc_id;
+                                    scan_plane = pls[i]; }
+    }
+    if (!scan_fb) { drm_dbg("k93ui: no active plane\n"); close(fd); return -1; }
 
-    struct drm_mode_fb_cmd fb = {
-        .width = cd.width, .height = cd.height,
-        .pitch = cd.pitch, .bpp = 32, .depth = 24, .handle = cd.handle,
-    };
-    if (drm_ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb) < 0) {
-        drm_dbg("k93ui: addfb: %s\n", strerror(errno));
-        struct drm_mode_destroy_dumb dd = { .handle = cd.handle };
-        drm_ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+    /* Get the CRTC's active mode (fbdev set it) so our buffer matches. */
+    struct drm_mode_crtc mc; memset(&mc, 0, sizeof mc);
+    mc.crtc_id = scan_crtc;
+    struct drm_mode_modeinfo amode; memset(&amode, 0, sizeof amode);
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &mc) == 0 && mc.mode_valid)
+        amode = mc.mode;
+    if (!amode.hdisplay || !amode.vdisplay) {
+        drm_dbg("k93ui: no active mode on crtc %u\n", scan_crtc);
         close(fd);
         return -1;
     }
+    unsigned W = amode.hdisplay, H = amode.vdisplay;
+
+    /* Our OWN scanout buffer: a dumb fb at the active mode size. Using a
+     * DIFFERENT fb than fbcon's forces virtio_gpu_primary_plane_update's
+     * set_scanout path (it is skipped when the fb is unchanged), which is what
+     * actually points the QEMU host scanout at our pixels. */
+    struct drm_mode_create_dumb cd = { .width = W, .height = H, .bpp = 32 };
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
+        drm_dbg("k93ui: create_dumb: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    struct drm_mode_fb_cmd2 fb2; memset(&fb2, 0, sizeof fb2);
+    fb2.width = W; fb2.height = H;
+    fb2.pixel_format = DRM_FORMAT_XRGB8888;
+    fb2.handles[0] = cd.handle; fb2.pitches[0] = cd.pitch; fb2.offsets[0] = 0;
+    fb2.modifier[0] = DRM_FORMAT_MOD_LINEAR;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fb2) < 0) {   /* fall back to legacy ADDFB */
+        struct drm_mode_fb_cmd fb1; memset(&fb1, 0, sizeof fb1);
+        fb1.width = W; fb1.height = H; fb1.pitch = cd.pitch;
+        fb1.bpp = 32; fb1.depth = 24; fb1.handle = cd.handle;
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb1) < 0) {
+            drm_dbg("k93ui: addfb: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        fb2.fb_id = fb1.fb_id;
+    }
+    scan_fb = fb2.fb_id;                          /* now OUR framebuffer */
 
     struct drm_mode_map_dumb md = { .handle = cd.handle };
     if (drm_ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
@@ -622,50 +874,50 @@ static int drm_open(void)
         close(fd);
         return -1;
     }
-    uint8_t *m = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, md.offset);
-    if (m == MAP_FAILED) {
-        drm_dbg("k93ui: mmap dumb: %s\n", strerror(errno));
+    size_t alen = cd.size;
+    uint8_t *am = mmap(NULL, alen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, md.offset);
+    if (am == MAP_FAILED) {
+        drm_dbg("k93ui: mmap our fb: %s\n", strerror(errno));
         close(fd);
         return -1;
     }
 
-    struct drm_mode_crtc crtc = {
-        .set_connectors_ptr = (uintptr_t)&conn_id,
-        .count_connectors = 1,
-        .crtc_id = crtc_id,
-        .fb_id = fb.fb_id,
-    };
-    crtc.mode_valid = 1;
-    memcpy(&crtc.mode, &mode, sizeof mode);
-    if (drm_ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc) < 0) {
-        drm_dbg("k93ui: setcrtc: %s\n", strerror(errno));
-        munmap(m, cd.size);
-        close(fd);
-        return -1;
+    /* freeze fbcon (KD_GRAPHICS) so it stops drawing over the shared crtc */
+    for (int vt = 1; vt <= 12; vt++) {
+        char vtdev[16];
+        snprintf(vtdev, sizeof vtdev, "/dev/tty%d", vt);
+        int vtr = open(vtdev, O_RDWR | O_NOCTTY);
+        if (vtr < 0) continue;
+        ioctl(vtr, KDSETMODE, KD_GRAPHICS);
+        close(vtr);
     }
-    drm_dbg("k93ui: DRM/KMS scanout %dx%d pitch=%u on crtc %u\n",
-            cd.width, cd.height, cd.pitch, crtc_id);
-    G.drmfb = fb.fb_id;
 
+    G.drmfb = scan_fb;                   /* DIRTYFB / kms_flip target */
     char orient[32], mode_req[32];
     display_conf(mode_req, sizeof mode_req, orient, sizeof orient);
     G.rot90 = !strcmp(orient, "portrait");
-    G.sx = (int)cd.width;                  /* physical scanout */
-    G.sy = (int)cd.height;
+    G.sx = (int)W;                       /* physical scanout */
+    G.sy = (int)H;
     if (G.rot90) { G.fbw_px = G.sy; G.fbh_px = G.sx; }   /* logical canvas */
     else         { G.fbw_px = G.sx; G.fbh_px = G.sy; }
-    G.fbr = m; G.fblen = cd.size;
-    G.wline = G.fbw_px * 4;                /* shadow stride = logical width */
+    G.fbr = am; G.fblen = alen;
+    G.fbline = (int)cd.pitch;
+    G.fbbpp = 32;
+    G.wline = G.fbw_px * 4;              /* shadow stride = logical width */
     G.wlen = (size_t)G.wline * (size_t)G.fbh_px;
     G.fbw = k93_xmalloc(G.wlen);
     memset(G.fbw, 0, G.wlen);
     G.fbfd = fd;
-    G.fbline = (int)cd.pitch;
-    G.fbbpp = 32;
     G.cols = G.fbw_px / 8;
     G.rows = G.fbh_px / 16;
-    drm_dbg("k93ui: canvas %dx%d orientation=%s\n",
-            G.fbw_px, G.fbh_px, G.rot90 ? "portrait" : "landscape");
+
+    /* Atomically commit OUR buffer. A DIFFERENT fb than fbcon's forces the
+     * driver's set_scanout (skipped when fb is unchanged), pointing the QEMU
+     * host scanout at our pixels. Uses the CRTC's current mode. */
+    G.planeid = scan_plane;
+    G.drmcrtc = scan_crtc;
+    G.drmconn = con[0];
+    drm_atomic_scanout(fd, scan_crtc, con[0], scan_fb, &amode);
     G.backend = BACK_FB;
     return 0;
 }
