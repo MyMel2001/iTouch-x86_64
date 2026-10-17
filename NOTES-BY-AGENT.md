@@ -104,6 +104,10 @@ Formats: `.ipa` = ZIP (inflate + XML plist parse + optional CMS/sig check) and
   on this Linux host only `open_binary` works (identity: Mach-O arm,
   sha256 recorded for SpringBoard `3dde3c75...`). Ghidra headless is the
   upgrade path for decompilation-level findings.
+* [x] Ghidra headless Mach-O inspection of SpringBoard (armv7): 310 own
+  classes recovered from `__objc_classlist`; icon model, UIKit-owned
+  statusbar, SBAway lock layer, SBWiFiManager/SBMediaController confirmed
+  (see section 5). Method-level metadata + decompilation passes pending.
 * [x] Repo skeleton, submodules, busybox static base.
 * [x] Clean-room userspace: init/launchd, libk93, springboard.
 * [x] Apps: all 20 ported (settings incl. HTTP proxy pane, files, terminal,
@@ -218,3 +222,37 @@ Known ceilings (documented, not bugs):
   `controlC0 hwC0D0 pcmC0D0c pcmC0D0p timer`) + **GRAPHICS TEST PASS**
   (2026-10-17); host selfcheck 44 checks green (host ALSA negotiated
   44100 Hz/2ch — real hardware path works).
+
+### Ghidra headless Mach-O inspection (2026-10-17)
+
+Replaces the REA `inspect_macho` ceiling (macOS-only provider). Tooling:
+Ghidra 12.1.4 `support/analyzeHeadless` (Java 27), project in
+`/tmp/opencode/ghidra-k93`, analysis scripts `k93_dump.java`
+(inventory) + `k93_objc_classes.java` (own-class recovery). Note: headless
+has no PyGhidra ("Python is not available") — scripts must be Java.
+
+Target: `SpringBoard.app/SpringBoard` (Mach-O armv7, v8 base, PIE).
+Findings (behaviour study for clean-room fidelity only):
+* 10679 functions, 516 referenced ObjC classes (imports), 310 OWN classes
+  recovered by walking `__DATA,__objc_classlist` (armv7: `class_t.data`
+  at +16, `class_ro_t.name` at +16).
+* Icon system: `SBIconModel` + `SBIconController` + `SBIconScrollView`
+  (paged grid) + `SBIconListView`/`SBDockIconListView` + `SBApplicationIcon`
+  + `SBIconImageView` + `SBBadgeLabel`/`SBIconBadge` — confirms K93OS
+  SpringBoard's modelled layout (icon grid + dock + badges).
+* Statusbar is UIKit-owned in the original (`UIStatusBar`,
+  `UIStatusBarWindow`, `UIStatusBarServer` are imports, no `SBStatusBar`
+  class) — matches our choice to draw the bar in libk93 `ui_statusbar`.
+* Lock/away layer: `SBAwayController`/`SBAwayModel`/`SBAwayView`/
+  `SBAwayDateView` + `SBDeviceLockKeypad` (with `...Wildcat` iPad variant)
+  + `SBSIMLockManager`. K93OS boots straight to SpringBoard — no lock
+  screen by design (root tablet OS), documented divergence.
+* Networking/media state lives inside SpringBoard: `SBWiFiManager`,
+  `SBWiFiSignalStrength`, `SBMediaController`, `SBNowPlayingAlertItem`,
+  `SBAwayMediaControlsView`; alerts are an `SBAlertItem` class family.
+  K93OS models network state in the statusbar and audio via the ALSA path.
+* Ceilings: ObjC METHOD names were not recovered (Ghidra's method-level
+  objc metadata was not materialised — class-pointer level only); no
+  decompilation pass over selected functions yet (rerun headless against
+  the saved project to extend); `fairplayd.K93` was not found under
+  `/usr/libexec` on this rootfs.
