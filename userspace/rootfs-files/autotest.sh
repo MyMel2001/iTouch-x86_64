@@ -33,6 +33,7 @@ run ca-store           sh -c 'grep -q "BEGIN CERTIFICATE" /etc/ssl/certs/ca-cert
 run proxy-conf         sh -c 'grep -q PROXY_ENABLE /etc/k93/proxy.conf'
 run proxy-write        sh -c 'printf "PROXY_ENABLE=1\nPROXY_HOST=10.0.2.2\nPROXY_PORT=8080\n" > /etc/k93/proxy.conf && grep -q 10.0.2.2 /etc/k93/proxy.conf'
 run proxy-restore      sh -c 'printf "PROXY_ENABLE=0\nPROXY_HOST=\nPROXY_PORT=0\n" > /etc/k93/proxy.conf'
+run display-conf       sh -c 'grep -q "^MODE=" /etc/k93/display.conf && grep -q "^ORIENTATION=" /etc/k93/display.conf'
 run apps-present       sh -c 'test -x /Applications/SpringBoard.app/SpringBoard && test -x /Applications/Files.app/Files && test -x /Applications/Settings.app/Settings'
 run app-plists-parse   sh -c 'for p in /Applications/*.app/Info.plist; do grep -q CFBundleIdentifier "$p" || exit 1; done'
 run gpt-file           sh -c '/usr/bin/k93selfcheck /opt/k93/fixtures | grep -q "gpt write"'

@@ -78,7 +78,47 @@ if grep -q "SpringBoard - .* apps" "$GLOG" 2>/dev/null; then
 fi
 if [ "$grc" = 0 ]; then
     echo "GRAPHICS TEST PASS (DRM/KMS + SpringBoard rendered: $PPM)"
+else
+    echo "GRAPHICS TEST FAIL (springboard_seen=$ok_wait, log: $GLOG)"
+    exit 1
+fi
+
+# ------------------------------------------- phase 3: display orientation
+# Boot with k93.orientation=portrait (the same override Settings writes to
+# /etc/k93/display.conf): k93ui must build a swapped logical canvas and
+# rotate-blit it into the landscape scanout.
+PLOG="$BUILD/serial-portrait.log"
+PSOCK="$BUILD/qmp-portrait.sock"
+PPM2="$BUILD/screen-portrait.ppm"
+rm -f "$PLOG" "$PSOCK" "$PPM2"
+qemu-system-x86_64 \
+    -m 1536 -smp 1 -machine pc "${ACCEL[@]}" \
+    -kernel "$KERNEL" \
+    -initrd "$BUILD/initrd.cpio.gz" \
+    -append "console=ttyS0,115200 loglevel=4 k93.orientation=portrait" \
+    -drive "file=$BUILD/hdd16.img,if=virtio,format=raw" \
+    -vga none -device virtio-gpu-pci -display vnc=127.0.0.1:79 \
+    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+    -qmp "unix:$PSOCK,server,nowait" \
+    -serial "file:$PLOG" -monitor none -no-reboot &
+QPID3=$!
+portrait_seen=0
+for _ in $(seq 1 90); do
+    if grep -q "orientation=portrait" "$PLOG" 2>/dev/null; then portrait_seen=1; break; fi
+    kill -0 $QPID3 2>/dev/null || break
+    sleep 1
+done
+prc=1
+if [ "$portrait_seen" = 1 ]; then
+    sleep 3
+    python3 "$TOP/tools/qmp-screendump.py" "$PSOCK" "$PPM2" && prc=0
+fi
+kill $QPID3 2>/dev/null || true
+wait $QPID3 2>/dev/null || true
+if [ "$prc" = 0 ] && grep -q "canvas .*x.* orientation=portrait" "$PLOG" && \
+   [ -s "$PPM2" ] && [ "$(stat -c%s "$PPM2")" -gt 100000 ]; then
+    echo "PORTRAIT TEST PASS (rotated canvas: $PPM2)"
     exit 0
 fi
-echo "GRAPHICS TEST FAIL (springboard_seen=$ok_wait, log: $GLOG)"
+echo "PORTRAIT TEST FAIL (portrait_seen=$portrait_seen, log: $PLOG)"
 exit 1

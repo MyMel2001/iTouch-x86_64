@@ -210,44 +210,116 @@ static void pane_root(void)
               "does not implement the restrictions that iOS 4.3.4 had.");
 }
 
+#define DISPLAY_CONF "/etc/k93/display.conf"
+
+static void display_conf_save(const char *mode, const char *orient)
+{
+    char buf[256];
+    snprintf(buf, sizeof buf,
+             "# K93OS display configuration (read by every graphical app)\n"
+             "MODE=%s\nORIENTATION=%s\n", mode, orient);
+    k93_mkdir_p("/etc/k93", 0755);
+    k93_write_file(DISPLAY_CONF, buf, strlen(buf), 0);
+}
+
+static void display_conf_load(char *mode, size_t mlen, char *orient, size_t olen)
+{
+    k93_strlcpy(mode, "auto", mlen);
+    k93_strlcpy(orient, "landscape", olen);
+    size_t len = 0;
+    char *c = k93_read_file(DISPLAY_CONF, &len);
+    if (!c) return;
+    for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *k = k93_trim(line), *v = k93_trim(eq + 1);
+        if (!strcmp(k, "MODE")) k93_strlcpy(mode, v, mlen);
+        else if (!strcmp(k, "ORIENTATION")) k93_strlcpy(orient, v, olen);
+    }
+    free(c);
+}
+
+/* find a process by /proc/<pid>/comm and signal it (restart helpers) */
+static int signal_comm(const char *name, int sig)
+{
+    DIR *d = opendir("/proc");
+    struct dirent *e;
+    int hit = 0;
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        char p[64], comm[64] = "";
+        snprintf(p, sizeof p, "/proc/%s/comm", e->d_name);
+        size_t l = 0;
+        char *c = k93_read_file(p, &l);
+        if (c) { k93_strlcpy(comm, c, sizeof comm); free(c); }
+        if (!strncmp(comm, name, strlen(name))) {
+            if (kill(atoi(e->d_name), sig) == 0) hit = 1;
+        }
+    }
+    if (d) closedir(d);
+    return hit;
+}
+
+static void pane_display(void)
+{
+    char mode[32], orient[32];
+    for (;;) {
+        display_conf_load(mode, sizeof mode, orient, sizeof orient);
+        char modes[32][32];
+        int nm = ui_display_modes(modes, 32);
+        const char *items[] = {
+            "Resolution: current, pick another",
+            "Orientation: landscape",
+            "Orientation: portrait",
+            "Restart SpringBoard (apply now)",
+            "Back"
+        };
+        char title[96];
+        snprintf(title, sizeof title, "Display  %s  %s", mode, orient);
+        int sel = ui_menu(title, items, 5, 0);
+        if (sel < 0 || sel == 4) return;
+        if (sel == 0) {
+            const char *opts[33];
+            int n = 0;
+            if (nm == 0) opts[n++] = "auto";
+            for (int i = 0; i < nm && n < 32; i++) opts[n] = modes[i], n++;
+            opts[n] = "auto"; n++;            /* always allow driver default */
+            int pick = ui_menu("Resolution", opts, n, 0);
+            if (pick >= 0) { display_conf_save(opts[pick], orient); }
+        } else if (sel == 1) {
+            display_conf_save(mode, "landscape");
+        } else if (sel == 2) {
+            display_conf_save(mode, "portrait");
+        } else if (sel == 3) {
+            int hit = signal_comm("springboard", SIGTERM);
+            ui_msgbox("Display", hit
+                      ? "SpringBoard restarted; new display settings apply\n"
+                        "to every app that launches after it."
+                      : "SpringBoard not found running.");
+        }
+    }
+}
+
 int main(void)
 {
     if (ui_init("Settings") < 0) return 1;
     const char *items[] = {
-        "Network", "HTTP Proxy", "Certificates", "About", "Storage",
+        "Network", "HTTP Proxy", "Display", "Certificates", "About", "Storage",
         "Root Access", "Restart services (SIGHUP launchd)", "Back"
     };
     for (;;) {
-        int sel = ui_menu("Settings", items, 8, 0);
+        int sel = ui_menu("Settings", items, 9, 0);
         switch (sel) {
         case 0: pane_network(); break;
         case 1: pane_proxy(); break;
-        case 2: pane_certs(); break;
-        case 3: pane_about(); break;
-        case 4: pane_storage(); break;
-        case 5: pane_root(); break;
-        case 6:
-            if (kill(1, 0) == 0) {
-                /* launchd is pid 2 under our init; ask init's child directly */
-            }
-            {
-                /* find launchd by name via /proc scan */
-                DIR *d = opendir("/proc");
-                struct dirent *e;
-                while (d && (e = readdir(d))) {
-                    if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
-                    char p[64], comm[64] = "";
-                    snprintf(p, sizeof p, "/proc/%s/comm", e->d_name);
-                    size_t l = 0;
-                    char *c = k93_read_file(p, &l);
-                    if (c) { k93_strlcpy(comm, c, sizeof comm); free(c); }
-                    if (!strncmp(comm, "launchd", 7)) {
-                        kill(atoi(e->d_name), SIGHUP);
-                        break;
-                    }
-                }
-                if (d) closedir(d);
-            }
+        case 2: pane_display(); break;
+        case 3: pane_certs(); break;
+        case 4: pane_about(); break;
+        case 5: pane_storage(); break;
+        case 6: pane_root(); break;
+        case 7:
+            signal_comm("launchd", SIGHUP);
             ui_msgbox("Settings", "SIGHUP delivered to launchd.");
             break;
         default:

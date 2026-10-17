@@ -195,6 +195,14 @@ PROXY_HOST=
 PROXY_PORT=0
 EOF
 
+# display: landscape default (spare-PC monitor stays physically landscape);
+# static orientation - no auto-rotate. Settable in Settings > Display.
+cat > "$ROOT/etc/k93/display.conf" <<'EOF'
+# K93OS display configuration (read by every graphical app)
+MODE=auto
+ORIENTATION=landscape
+EOF
+
 cat > "$ROOT/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
 mobile:x:501:501:mobile user:/var/mobile:/bin/sh

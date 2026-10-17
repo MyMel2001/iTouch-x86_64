@@ -12,6 +12,7 @@ void ui_shutdown(void);
 int  ui_width(void);                     /* columns */
 int  ui_height(void);                    /* rows */
 int  ui_is_graphical(void);
+int  ui_display_modes(char out[][32], int max);  /* connector modes "WxH" */
 void ui_clear(void);
 void ui_flush(void);
 void ui_puts(int x, int y, const char *s);              /* white on default bg */

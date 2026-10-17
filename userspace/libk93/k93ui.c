@@ -48,10 +48,14 @@ static struct {
     int cols, rows;
     int fbfd;
     int drmfb;                           /* DRM fb id (KMS backend) */
-    uint8_t *fbr;                        /* mmapped framebuffer */
-    uint8_t *fbw;                        /* shadow buffer */
-    size_t fblen;
-    int fbline, fbbpp, fbw_px, fbh_px;
+    uint8_t *fbr;                        /* mmapped framebuffer (physical) */
+    uint8_t *fbw;                        /* shadow buffer (logical) */
+    size_t fblen, wlen;
+    int fbline, fbbpp, fbw_px, fbh_px;   /* fbline = physical pitch;
+                                            fbw_px/fbh_px = logical dims */
+    int wline;                           /* shadow buffer line stride */
+    int sx, sy;                          /* physical scanout dims */
+    int rot90;                           /* 1 = portrait (rotate blit) */
     int outfd;                           /* text backend output */
     struct termios saved;
     int tty_raw;
@@ -234,7 +238,7 @@ static void fb_draw_glyph_col(int x, int y, char ch, int inverted)
     int bpp = G.fbbpp / 8;
     for (int row = 0; row < 16; row++) {
         uint8_t bits = g[row];
-        uint8_t *line = G.fbw + (size_t)(y * 16 + row) * (size_t)G.fbline;
+        uint8_t *line = G.fbw + (size_t)(y * 16 + row) * (size_t)G.wline;
         for (int col = 0; col < 8; col++) {
             int on = (bits >> (7 - col)) & 1;
             if (inverted) on = !on;
@@ -250,16 +254,67 @@ static void fb_draw_glyph_col(int x, int y, char ch, int inverted)
     }
 }
 
+/* display configuration: /etc/k93/display.conf (MODE=auto|<W>x<H>,
+ * ORIENTATION=landscape|portrait), overridable per-boot from the kernel
+ * command line (k93.mode= k93.orientation=) for tests. Landscape is the
+ * default; orientation is static (no accelerometer/auto-rotate). */
+static void display_conf(char *mode, size_t mlen, char *orient, size_t olen)
+{
+    k93_strlcpy(mode, "auto", mlen);
+    k93_strlcpy(orient, "landscape", olen);
+    size_t len = 0;
+    char *c = k93_read_file("/etc/k93/display.conf", &len);
+    if (c) {
+        for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            if (!strcmp(line, "MODE") && eq[1]) k93_strlcpy(mode, eq + 1, mlen);
+            if (!strcmp(line, "ORIENTATION") && eq[1]) k93_strlcpy(orient, eq + 1, olen);
+        }
+        free(c);
+    }
+    /* kernel command line overrides (qemu-test) */
+    size_t cl = 0;
+    char *cmd = k93_read_file("/proc/cmdline", &cl);
+    if (cmd) {
+        for (char *tok = strtok(cmd, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
+            if (!strncmp(tok, "k93.mode=", 9)) k93_strlcpy(mode, tok + 9, mlen);
+            if (!strncmp(tok, "k93.orientation=", 16)) k93_strlcpy(orient, tok + 16, olen);
+        }
+        free(cmd);
+    }
+}
+
 static void fb_render_all(void)
 {
     if (G.backend != BACK_FB || !G.fbw) return;
-    memcpy(G.fbr, G.fbw, G.fblen);
+    int bpp = G.fbbpp / 8;
+    if (G.rot90) {
+        /* portrait: rotate the logical buffer 90 degrees clockwise into the
+         * landscape scanout: logical (x,y) -> physical (sx-1-y, x).
+         * Static rotation; the monitor stays physically landscape. */
+        for (int y = 0; y < G.fbh_px; y++) {
+            const uint8_t *src = G.fbw + (size_t)y * (size_t)G.wline;
+            uint8_t *dst = G.fbr + (size_t)(G.sx - 1 - y) * (size_t)bpp;
+            for (int x = 0; x < G.fbw_px; x++) {
+                memcpy(dst + (size_t)x * (size_t)G.fbline,
+                       src + (size_t)x * (size_t)bpp, (size_t)bpp);
+            }
+        }
+    } else {
+        int rows = G.fbh_px < G.sy ? G.fbh_px : G.sy;
+        int bytes = G.fbw_px * bpp < G.fbline ? G.fbw_px * bpp : G.fbline;
+        for (int y = 0; y < rows; y++)
+            memcpy(G.fbr + (size_t)y * (size_t)G.fbline,
+                   G.fbw + (size_t)y * (size_t)G.wline, (size_t)bytes);
+    }
     if (G.drmfb > 0 && G.fbfd >= 0) {
         /* KMS (DRM) scanout: drivers with shadow planes (bochs-drm) only
          * copy our mmap'd buffer to real VRAM on damage notification -
          * tell the kernel the whole screen changed after each flush. */
         struct drm_clip_rect clip = {
-            0, 0, (uint16_t)G.fbw_px, (uint16_t)G.fbh_px,
+            0, 0, (uint16_t)G.sx, (uint16_t)G.sy,
         };
         struct drm_mode_fb_dirty_cmd d = {
             .fb_id = (uint32_t)G.drmfb,
@@ -316,7 +371,7 @@ void ui_hline(int y, int attr)
 void ui_clear(void)
 {
     if (G.backend == BACK_FB) {
-        memset(G.fbw, 0, G.fblen);
+        memset(G.fbw, 0, G.wlen);
     } else if (G.backend == BACK_TEXT) {
         const char *seq = "\033[2J\033[H\033[0m";
         write(G.outfd, seq, strlen(seq));
@@ -421,6 +476,10 @@ static int fb_open(void)
     G.fbbpp = (int)vi.bits_per_pixel;
     G.fbw_px = (int)vi.xres;
     G.fbh_px = (int)vi.yres;
+    G.sx = G.fbw_px; G.sy = G.fbh_px;      /* fbdev: landscape only */
+    G.rot90 = 0;
+    G.wline = G.fbline;
+    G.wlen = len;
     G.cols = G.fbw_px / 8;
     G.rows = G.fbh_px / 16;
     G.backend = BACK_FB;
@@ -517,6 +576,17 @@ static int drm_open(void)
             continue;
         }
         mode = modes[0];                        /* first mode = preferred */
+        /* requested mode from display.conf / cmdline: pick matching entry */
+        char want[32], orient[32];
+        display_conf(want, sizeof want, orient, sizeof orient);
+        if (strstr(want, "x")) {
+            int w = atoi(want), h = atoi(want + strcspn(want, "x") + 1);
+            for (uint32_t m = 0; m < cc.count_modes && m < 32; m++)
+                if ((int)modes[m].hdisplay == w && (int)modes[m].vdisplay == h) {
+                    mode = modes[m];
+                    break;
+                }
+        }
         conn_id = con[i];
         got = 1;
     }
@@ -577,18 +647,77 @@ static int drm_open(void)
             cd.width, cd.height, cd.pitch, crtc_id);
     G.drmfb = fb.fb_id;
 
+    char orient[32], mode_req[32];
+    display_conf(mode_req, sizeof mode_req, orient, sizeof orient);
+    G.rot90 = !strcmp(orient, "portrait");
+    G.sx = (int)cd.width;                  /* physical scanout */
+    G.sy = (int)cd.height;
+    if (G.rot90) { G.fbw_px = G.sy; G.fbh_px = G.sx; }   /* logical canvas */
+    else         { G.fbw_px = G.sx; G.fbh_px = G.sy; }
     G.fbr = m; G.fblen = cd.size;
-    G.fbw = k93_xmalloc(cd.size);
-    memset(G.fbw, 0, cd.size);
+    G.wline = G.fbw_px * 4;                /* shadow stride = logical width */
+    G.wlen = (size_t)G.wline * (size_t)G.fbh_px;
+    G.fbw = k93_xmalloc(G.wlen);
+    memset(G.fbw, 0, G.wlen);
     G.fbfd = fd;
     G.fbline = (int)cd.pitch;
     G.fbbpp = 32;
-    G.fbw_px = (int)cd.width;
-    G.fbh_px = (int)cd.height;
     G.cols = G.fbw_px / 8;
     G.rows = G.fbh_px / 16;
+    drm_dbg("k93ui: canvas %dx%d orientation=%s\n",
+            G.fbw_px, G.fbh_px, G.rot90 ? "portrait" : "landscape");
     G.backend = BACK_FB;
     return 0;
+}
+
+/* list the current connector's modes as "WxH" strings for the Settings
+ * Display pane (independent of ui_init - Settings may call this any time) */
+int ui_display_modes(char out[][32], int max)
+{
+    if (max <= 0) return 0;
+    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct drm_mode_card_res res;
+    memset(&res, 0, sizeof res);
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0 || !res.count_connectors) {
+        close(fd);
+        return 0;
+    }
+    uint32_t con[32], crt[32], enc[32];
+    uint32_t nc = res.count_connectors < 32 ? res.count_connectors : 32;
+    res.connector_id_ptr = (uintptr_t)con;
+    res.crtc_id_ptr = (uintptr_t)crt;
+    res.encoder_id_ptr = (uintptr_t)enc;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) { close(fd); return 0; }
+    int n = 0;
+    for (uint32_t i = 0; i < nc && n < max; i++) {
+        struct drm_mode_get_connector cc;
+        memset(&cc, 0, sizeof cc);
+        cc.connector_id = con[i];
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &cc) < 0 || !cc.count_modes)
+            continue;
+        struct drm_mode_modeinfo modes[32];
+        uint32_t nm = cc.count_modes < 32 ? cc.count_modes : 32;
+        cc.modes_ptr = (uintptr_t)modes;
+        cc.count_modes = nm;
+        cc.encoders_ptr = (uintptr_t)enc;
+        cc.count_encoders = res.count_encoders < 32 ? res.count_encoders : 32;
+        cc.props_ptr = 0;
+        cc.prop_values_ptr = 0;
+        cc.count_props = 0;
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &cc) < 0) continue;
+        for (uint32_t m = 0; m < nm && n < max; m++) {
+            snprintf(out[n], 32, "%dx%d", modes[m].hdisplay, modes[m].vdisplay);
+            /* de-duplicate refresh variants (mode lists repeat WxH) */
+            int dup = 0;
+            for (int k = 0; k < n; k++)
+                if (!strcmp(out[k], out[n])) { dup = 1; break; }
+            if (!dup) n++;
+        }
+        if (n) break;
+    }
+    close(fd);
+    return n;
 }
 
 static int open_console(void)
