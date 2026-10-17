@@ -1,0 +1,260 @@
+#!/bin/sh
+# k93sdk - K93OS-x86 application SDK (POSIX sh; runs on Linux, macOS,
+# Haiku, Windows-WSL). Builds native x86_64 app bundles (.ipa) and Debian
+# packages (.deb) against the clean-room libk93 UI toolkit.
+#
+# Toolchain: prefers `zig cc` (same cross-compiler from every host OS),
+# falls back to the host C compiler on Linux x86_64. Go apps build with the
+# standard Go toolchain (GOOS=linux GOARCH=amd64, CGO off - terminal apps).
+set -e
+
+die() { echo "k93sdk: $*" >&2; exit 1; }
+
+# locate the SDK home: env override, else walk up from this script
+find_home() {
+    [ -n "${K93_HOME:-}" ] && { echo "$K93_HOME"; return; }
+    d=$(cd "$(dirname "$0")/../.." && pwd)
+    [ -d "$d/userspace/libk93" ] && { echo "$d"; return; }
+    die "K93_HOME not set and this script is not inside a K93OS checkout"
+}
+K93_HOME=$(find_home)
+export K93_HOME
+INC="$K93_HOME/userspace/include"
+LIBSRC="$K93_HOME/userspace/libk93"
+UAPI="$K93_HOME/build/uapi"
+
+# libk93 subset every graphical app links (POSIX + kernel uapi only,
+# no zlib/mbedtls - those stay in the OS build for Files/Safari)
+LIBC_SRC="$LIBSRC/k93ui.c $LIBSRC/k93util.c"
+
+ensure_uapi() {
+    [ -f "$UAPI/linux/drm.h" ] && return
+    command -v make >/dev/null 2>&1 || die "run 'make uapi' in the K93OS checkout once"
+    make -C "$K93_HOME" uapi >/dev/null
+}
+
+ensure_font() {
+    FONT="$K93_HOME/build/gen/font8x16.c"
+    [ -f "$FONT" ] && return
+    command -v python3 >/dev/null 2>&1 || die "python3 required to generate the font"
+    mkdir -p "$(dirname "$FONT")"
+    python3 "$K93_HOME/tools/genfont.py" \
+        "$K93_HOME/third_party/linux/lib/fonts/font_8x16.c" "$FONT"
+}
+
+pick_cc() {
+    if command -v zig >/dev/null 2>&1; then
+        echo "zig cc -target x86_64-linux-musl"
+    elif [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
+        echo "cc"
+    else
+        die "no cross-compiler: install zig (brew/ZigLang) or build on Linux x86_64"
+    fi
+}
+
+conf_get() { sed -n "s/^$1=//p" "$APPDIR/app.conf" | head -1; }
+
+read_conf() {
+    [ -f "$APPDIR/app.conf" ] || die "no app.conf in $APPDIR (see: k93sdk new)"
+    APPNAME=$(conf_get NAME)
+    IDENT=$(conf_get IDENT)
+    VERSION=$(conf_get VERSION)
+    EXEC=$(conf_get EXECUTABLE)
+    [ -n "$APPNAME" ] && [ -n "$IDENT" ] && [ -n "$EXEC" ] \
+        || die "app.conf needs NAME, IDENT, EXECUTABLE"
+    [ -n "$VERSION" ] || VERSION=1.0
+}
+
+write_manifest() {
+    # clean-room Info.plist: same keys the OS registry reads
+    cat > "$APPDIR/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key><string>$APPNAME</string>
+	<key>CFBundleDisplayName</key><string>$APPNAME</string>
+	<key>CFBundleIdentifier</key><string>$IDENT</string>
+	<key>CFBundleExecutable</key><string>$EXEC</string>
+	<key>CFBundleShortVersionString</key><string>$VERSION</string>
+	<key>CFBundleVersion</key><string>$VERSION</string>
+</dict>
+</plist>
+EOF
+}
+
+cmd_new() {
+    name="$1"
+    [ -n "$name" ] || die "usage: k93sdk new <App Name>"
+    dir="$PWD/$name"
+    [ -e "$dir" ] && die "$dir already exists"
+    mkdir -p "$dir"
+    ident=$(echo "$name" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')
+    exec_name=$(echo "$name" | tr -cd 'A-Za-z0-9')
+    cat > "$dir/app.conf" <<EOF
+NAME=$name
+IDENT=com.k93.$ident
+VERSION=1.0
+EXECUTABLE=$exec_name
+EOF
+    cat > "$dir/main.c" <<EOF
+/* $name - K93OS-x86 app (built with: k93sdk build . && k93sdk bundle .) */
+#include "k93ui.h"
+
+int main(void)
+{
+    if (ui_init("$name") < 0) return 1;
+    const char *items[] = { "Say hello", "Quit" };
+    for (;;) {
+        int sel = ui_menu("$name", items, 2, 0);
+        if (sel < 0 || sel == 1) break;
+        ui_msgbox("$name", "Hello from a native K93OS app!");
+    }
+    ui_shutdown();
+    return 0;
+}
+EOF
+    echo "created $dir"
+    echo "next: cd '$name' && k93sdk build . && k93sdk bundle ."
+}
+
+cmd_build() {
+    APPDIR=$(cd "${1:-.}" && pwd)
+    read_conf
+    ensure_uapi
+    ensure_font
+    CC=$(pick_cc)
+    out="$APPDIR/$EXEC"
+    src=""
+    for f in main.go main.zig main.cpp main.c; do
+        [ -f "$APPDIR/$f" ] && { src="$f"; break; }
+    done
+    case "$src" in
+    main.go)
+        command -v go >/dev/null 2>&1 || die "go not installed"
+        (cd "$APPDIR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$EXEC" main.go)
+        ;;
+    main.zig)
+        command -v zig >/dev/null 2>&1 || die "zig not installed"
+        objs=""
+        for s in $LIBC_SRC "$FONT"; do
+            o="$APPDIR/.k93sdk/$(basename "$s" .c).o"
+            mkdir -p "$APPDIR/.k93sdk"
+            zig cc -target x86_64-linux-musl -Os -I"$INC" -I"$UAPI" -c "$s" -o "$o"
+            objs="$objs $o"
+        done
+        zig build-exe "$APPDIR/main.zig" $objs -lc \
+            -target x86_64-linux-musl -O ReleaseSmall --name "$EXEC" \
+            -femit-bin="$APPDIR/$EXEC"
+        ;;
+    main.cpp)
+        objs=""
+        for s in $LIBC_SRC "$FONT"; do
+            o="$APPDIR/.k93sdk/$(basename "$s" .c).o"
+            mkdir -p "$APPDIR/.k93sdk"
+            $CC -Os -I"$INC" -I"$UAPI" -c "$s" -o "$o"
+            objs="$objs $o"
+        done
+        if command -v zig >/dev/null 2>&1; then
+            zig c++ -target x86_64-linux-musl -Os -I"$INC" -static \
+                -o "$out" "$APPDIR/main.cpp" $objs
+        else
+            CXX=$(command -v g++ >/dev/null 2>&1 && echo g++ || echo clang++)
+            $CXX -Os -I"$INC" -static -o "$out" "$APPDIR/main.cpp" $objs
+        fi
+        ;;
+    main.c)
+        objs=""
+        for s in $LIBC_SRC "$FONT"; do
+            o="$APPDIR/.k93sdk/$(basename "$s" .c).o"
+            mkdir -p "$APPDIR/.k93sdk"
+            $CC -Os -I"$INC" -I"$UAPI" -c "$s" -o "$o"
+            objs="$objs $o"
+        done
+        $CC -Os -I"$INC" -static -o "$out" "$APPDIR/main.c" $objs
+        ;;
+    *) die "no main.c/main.cpp/main.go/main.zig in $APPDIR" ;;
+    esac
+    file "$out" 2>/dev/null || true
+    echo "built $out"
+}
+
+zip_dir() {
+    # zip with the system tool, python3 fallback (macOS/Linux/Haiku/WSL)
+    if command -v zip >/dev/null 2>&1; then
+        (cd "$1" && zip -qr "$2" "$3")
+    else
+        python3 - "$1" "$2" "$3" <<'EOF'
+import os, sys, zipfile
+root, out, top = sys.argv[1:4]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for d, _, fs in os.walk(os.path.join(root, top)):
+        for f in fs:
+            p = os.path.join(d, f)
+            z.write(p, os.path.relpath(p, root))
+EOF
+    fi
+}
+
+ar_member() { # name file
+    printf '%-16s%-12d%-6d%-6d%-8o%-10d`\n' \
+        "$1" 0 0 0 100644 "$(wc -c < "$2")" >> "$3"
+    cat "$2" >> "$3"
+    if [ $(( $(wc -c < "$2") % 2 )) -eq 1 ]; then printf '\n' >> "$3"; fi
+}
+
+cmd_bundle() {
+    APPDIR=$(cd "${1:-.}" && pwd)
+    read_conf
+    [ -x "$APPDIR/$EXEC" ] || die "no built binary ($EXEC) - run: k93sdk build $APPDIR"
+    write_manifest
+    dist="$APPDIR/dist"
+    mkdir -p "$dist"
+
+    # .ipa: Payload/<App>.app/{Info.plist,<Executable>}
+    stage=$(mktemp -d)
+    mkdir -p "$stage/Payload/$APPNAME.app"
+    cp "$APPDIR/Info.plist" "$APPDIR/$EXEC" "$stage/Payload/$APPNAME.app/"
+    zip_dir "$stage" "$dist/$APPNAME.ipa" "Payload"
+    rm -rf "$stage"
+
+    # .deb: data tree with the app bundle under /Applications
+    stage=$(mktemp -d)
+    mkdir -p "$stage/Applications/$APPNAME.app"
+    cp "$APPDIR/Info.plist" "$APPDIR/$EXEC" "$stage/Applications/$APPNAME.app/"
+    mkdir -p "$stage/DEBIAN"
+    printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nDescription: %s (K93OS app)\n' \
+        "$IDENT" "$VERSION" "$APPNAME" > "$stage/DEBIAN/control"
+    (cd "$stage" && tar czf data.tar.gz Applications)
+    printf '2.0\n' > "$stage/debian-binary"
+    printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nDescription: %s\n' \
+        "$IDENT" "$VERSION" "$APPNAME" > "$stage/control"
+    (cd "$stage" && tar czf control.tar.gz control)
+    printf '!<arch>\n' > "$dist/$APPNAME.deb"
+    ar_member debian-binary "$stage/debian-binary" "$dist/$APPNAME.deb"
+    ar_member control.tar.gz "$stage/control.tar.gz" "$dist/$APPNAME.deb"
+    ar_member data.tar.gz "$stage/data.tar.gz" "$dist/$APPNAME.deb"
+    rm -rf "$stage"
+
+    echo "bundled:"
+    echo "  $dist/$APPNAME.ipa  (install with Files.app or Safari)"
+    echo "  $dist/$APPNAME.deb  (install with Files.app or Safari)"
+}
+
+cmd_usage() {
+    cat <<EOF
+usage: k93sdk new <App Name>       scaffold a C app in ./<App Name>/
+       k93sdk build [dir]          compile main.{c,cpp,zig,go} for K93OS
+       k93sdk bundle [dir]         make dist/<App>.ipa and dist/<App>.deb
+env:   K93_HOME   K93OS checkout (auto-detected inside the repo)
+toolchain: zig cc (any host OS) or host cc on Linux x86_64; Go apps use GOOS=linux
+EOF
+    exit 2
+}
+
+case "${1:-}" in
+new)     cmd_new "$2";;
+build)   cmd_build "$2";;
+bundle)  cmd_bundle "$2";;
+*)       cmd_usage;;
+esac

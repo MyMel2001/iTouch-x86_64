@@ -240,6 +240,16 @@ if [ ! -f "$TOP/fixtures/test.ipa" ]; then
 fi
 install -m 0644 "$TOP/fixtures/"*.ipa "$TOP/fixtures/"*.dmg "$TOP/fixtures/"*.deb "$ROOT/opt/k93/fixtures/"
 
+# SDK smoke artifact: build + bundle the C example so the guest autotest can
+# sideload a real app-sdk product (skip gracefully without zig/cc)
+if "$TOP/app-sdk/bin/k93sdk" build "$TOP/app-sdk/examples/c-hello" >/dev/null 2>&1 && \
+   "$TOP/app-sdk/bin/k93sdk" bundle "$TOP/app-sdk/examples/c-hello" >/dev/null 2>&1; then
+    install -m 0644 "$TOP/app-sdk/examples/c-hello/dist/Hello.ipa" "$ROOT/opt/k93/fixtures/"
+    install -m 0644 "$TOP/app-sdk/examples/c-hello/dist/Hello.deb" "$ROOT/opt/k93/fixtures/hello-sdk.deb"
+else
+    echo "mkrootfs: SDK example build skipped (no toolchain)"
+fi
+
 # runtime placeholder dirs (also created by init at boot)
 touch "$ROOT/var/db/k93/apps.log"
 

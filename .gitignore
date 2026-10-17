@@ -6,3 +6,9 @@
 /fixtures/
 *.o
 *.a
+
+# SDK build artifacts
+app-sdk/examples/*/Hello*
+app-sdk/examples/*/dist/
+app-sdk/examples/*/.k93sdk/
+app-sdk/examples/*/Info.plist
