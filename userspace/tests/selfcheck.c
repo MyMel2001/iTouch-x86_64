@@ -9,6 +9,7 @@
 #include "k93dmg.h"
 #include "k93app.h"
 #include "k93gpt.h"
+#include "k93snd.h"
 #include <linux/fb.h>
 #ifndef __user
 #define __user
@@ -251,6 +252,19 @@ int main(int argc, char **argv)
             struct drm_mode_destroy_dumb dd = { .handle = cd.handle };
             ioctl(drif, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
             close(drif);
+        }
+    }
+
+    /* --- ALSA PCM (QEMU intel-hda / real-hardware HDA sound) --- */
+    {
+        int rate = 44100, chans = 2;
+        if (k93_snd_open(NULL, &rate, &chans) < 0) {
+            printf("skip - no /dev/snd PCM device (no sound card)\n");
+        } else {
+            printf("info - alsa pcm negotiated %d Hz, %d ch\n", rate, chans);
+            static int16_t silence[4096 * 2];   /* .bss = zeros: no audible noise */
+            chk(k93_snd_play(silence, 4096) == 0, "alsa pcm write");
+            k93_snd_close();
         }
     }
 

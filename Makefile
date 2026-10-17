@@ -47,6 +47,8 @@ $(UAPI)/.stamp:
 	mkdir -p $(UAPI)/linux
 	cp $(TOP)/third_party/linux/include/uapi/drm/drm.h \
 	   $(TOP)/third_party/linux/include/uapi/drm/drm_mode.h $(UAPI)/linux/
+	# ALSA PCM UAPI (for the clean-room sound client)
+	cp $(TOP)/third_party/linux/include/uapi/sound/asound.h $(UAPI)/linux/
 	@touch $@
 
 # ---------------------------------------------------------------- deps

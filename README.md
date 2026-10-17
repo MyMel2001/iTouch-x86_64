@@ -31,10 +31,20 @@ explanation (K93OS runs native x86_64 ELF only).
   original rootfs are not used)
 * Serial-console-first UI toolkit. Graphics stack is DRM/KMS (clean-room
   client in `libk93/k93ui.c`): init waits for `/dev/dri/card0`, loads
-  `bochs-drm` (QEMU stdvga) or `virtio-gpu`, SpringBoard creates a dumb
-  buffer, maps it, sets a mode and notifies damage via `DIRTYFB`. ANSI
-  text console is the fallback when no KMS device appears. evdev + tty
-  input, embedded GPL font
+  `bochs-drm` (QEMU stdvga), `virtio-gpu`, or `i915` (real Intel GPUs),
+  SpringBoard creates a dumb buffer, maps it, sets a mode and notifies
+  damage via `DIRTYFB`. ANSI text console is the fallback when no KMS
+  device appears. evdev + tty input, embedded GPL font
+* Guest networking: virtio-net (QEMU) plus common real-hardware wired NIC
+  drivers in the initrd (`e1000`, `e1000e`, `r8169`, `8139too`/`8139cp`);
+  init auto-loads them and DHCPs the first interface via busybox udhcpc.
+  In QEMU user-mode networking the host is reachable at `10.0.2.2`
+  (Safari's proxy/TLS path is live-testable)
+* Sound: Intel HDA through the kernel ALSA stack (`snd-hda-intel` +
+  generic/Realtek/HDMI codec drivers; QEMU `intel-hda`/`hda-duplex`
+  tested). `libk93/k93snd.c` is a clean-room PCM playback client speaking
+  the kernel UAPI directly (no libasound); Music.app plays PCM WAV via
+  OSS `/dev/dsp` when present, else via ALSA
 
 ## Layout
 
@@ -103,8 +113,15 @@ x86_64 ELF executable. ARM Mach-O payloads are refused with an explanation.
 
 ## Known ceilings
 
-* No guest networking in the test VM yet (virtio-net is a kernel module,
-  not in the initrd); Safari's proxy/TLS path is config-validated only.
+* Real-hardware graphics covers Intel (`i915` is packaged and loaded by
+  init), but Intel GPU firmware blobs (`/lib/firmware/i915/*.bin` from the
+  `linux-firmware` package) are not redistributed here — some generations
+  want DMC/GuC firmware for full display; copy them onto the target machine
+  if the probe complains. AMD (`amdgpu`) / NVIDIA (`nouveau`) drivers are
+  not packaged (large dependency trees).
+* Sound covers HDA only (Intel controller + common Realtek/HDMI codecs);
+  no USB audio. Wireless NICs are not packaged (USB input works once the
+  kernel's usbhid probes).
 * DMG: UDZO/UDIF only (no sparse bundles, no encryption) — rejected
   clearly otherwise.
 * VM boots via QEMU `-kernel`/`-initrd`; bare-metal boot would need a

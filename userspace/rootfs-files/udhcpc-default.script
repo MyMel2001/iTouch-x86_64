@@ -1,0 +1,22 @@
+#!/bin/sh
+# busybox udhcpc lease hook for K93OS-x86 (clean-room, original).
+# $1 = deconfig | bound | renew | leasefail | nak
+case "$1" in
+deconfig)
+    ifconfig "$interface" 0.0.0.0
+    ;;
+bound|renew)
+    ifconfig "$interface" "$ip" netmask "${mask:-255.255.255.0}" up
+    if [ -n "$router" ]; then
+        for r in $router; do
+            route add default gw "$r" dev "$interface" 2>/dev/null
+        done
+    fi
+    : > /etc/resolv.conf
+    [ -n "$domain" ] && echo "search $domain" >> /etc/resolv.conf
+    for d in $dns; do
+        echo "nameserver $d" >> /etc/resolv.conf
+    done
+    ;;
+esac
+exit 0

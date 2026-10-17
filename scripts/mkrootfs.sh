@@ -32,23 +32,54 @@ install -m 0755 "$GBIN/init"    "$ROOT/sbin/init"
 install -m 0755 "$GBIN/launchd" "$ROOT/sbin/launchd"
 ln -sfn sbin/init "$ROOT/init"      # kernel looks for /init inside an initramfs
 
-# graphics: QEMU DRM backends (kernel has DRM+fbdev emulation built in; the
-# device drivers are modules). virtio-gpu is the primary display in the test
-# VMs, bochs covers stdvga. Loaded by init when no KMS device appears.
+# Kernel device drivers are modules; the initramfs must carry them plus their
+# transitive dependencies. install_module() walks modules.dep so nothing has to
+# be hand-listed twice (missing deps previously broke virtio_gpu silently).
+# Output is always /lib/modules/<underscore-name>.ko - the exact paths init
+# insmods. modules.dep keys use dashes for some files (snd-hda-intel.ko), so
+# matching is dash-insensitive on the basename.
 mkdir -p "$ROOT/lib/modules"
-for M in virtio_gpu:virtio-gpu bochs:bochs virtio_dma_buf:virtio_dma_buf; do
-    NAME="${M%%:*}"
-    KO="$(find /usr/lib/modules/*/kernel/drivers -name "${M##*:}.ko*" 2>/dev/null | head -1 || true)"
-    M="$NAME"
-    if [ -n "$KO" ]; then
-        case "$KO" in
-            *.xz)  xz -dc "$KO" > "$ROOT/lib/modules/$M.ko" ;;
-            *.zst) zstd -dc "$KO" > "$ROOT/lib/modules/$M.ko" ;;
-            *)     cp "$KO" "$ROOT/lib/modules/$M.ko" ;;
-        esac
-        chmod 0644 "$ROOT/lib/modules/$M.ko"
+DEPFILE="$(echo /usr/lib/modules/*/modules.dep | awk '{print $1}')"
+: > "$ROOT/.modstamps"
+
+install_module() {           # install_module <module name, dashes or underscores>
+    local want dep key src out
+    want="$(echo "$1" | tr - _)"
+    [ -n "$DEPFILE" ] || return 0
+    grep -qx "$want" "$ROOT/.modstamps" 2>/dev/null && return 0
+    echo "$want" >> "$ROOT/.modstamps"
+    key="$(awk -F: -v w="$want" \
+        '{n=$1; sub(/.*\//,"",n); sub(/\.ko$/,"",n); gsub(/-/,"_",n);
+          if (n==w) {print $1; exit}}' "$DEPFILE")"
+    if [ -z "$key" ]; then
+        echo "  (module $1 not in kernel; skipped)" >&2
+        return 0
     fi
-done
+    for dep in $(awk -F: -v k="$key" '$1==k {print $2}' "$DEPFILE"); do
+        install_module "$(basename "$dep" .ko)"
+    done
+    src="$(ls /usr/lib/modules/*/"$key" 2>/dev/null | head -1)"
+    [ -n "$src" ] || { echo "  ($1 missing on disk; skipped)" >&2; return 0; }
+    out="$ROOT/lib/modules/$want.ko"
+    case "$src" in
+        *.xz)  xz -dc "$src" > "$out" ;;
+        *.zst) zstd -dc "$src" > "$out" ;;
+        *)     cp "$src" "$out" ;;
+    esac
+    chmod 0644 "$out"
+}
+
+# graphics: virtio-gpu + bochs (test VMs), i915 (real Intel GPUs)
+for M in virtio-gpu bochs i915; do install_module "$M"; done
+# networking: virtio-net (test VMs) + common real-hardware wired NICs
+for M in virtio_net e1000 e1000e r8169 8139too 8139cp; do install_module "$M"; done
+# sound: Intel HDA codecs first, controller LAST - the controller probes and
+# configures codecs synchronously during insmod, so every codec driver must
+# already be registered (the guest has no modprobe to resolve aliases).
+for M in snd-hda-codec-generic snd-hda-codec-hdmi snd-hda-codec-realtek-lib \
+         snd-hda-scodec-component snd-hda-codec-alc662 snd-hda-codec-alc269 \
+         snd-hda-codec-alc882 snd-hda-intel; do install_module "$M"; done
+rm -f "$ROOT/.modstamps"
 for t in k93selfcheck k93dmgtool k93ipatool k93smc; do
     install -m 0755 "$GBIN/$t" "$ROOT/usr/bin/$t"
 done
@@ -123,6 +154,11 @@ EOF
 chmod 0755 "$ROOT/etc/k93/launchdfallback.sh"
 
 install -m 0755 "$TOP/userspace/rootfs-files/autotest.sh" "$ROOT/system/bin/autotest.sh"
+
+# DHCP lease hook used by busybox udhcpc (invoked by init on eth0)
+mkdir -p "$ROOT/usr/share/udhcpc"
+install -m 0755 "$TOP/userspace/rootfs-files/udhcpc-default.script" \
+    "$ROOT/usr/share/udhcpc/default.script"
 
 # ------------------------------------------------------------- config
 cat > "$ROOT/etc/k93/proxy.conf" <<'EOF'

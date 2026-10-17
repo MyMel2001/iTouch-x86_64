@@ -1,10 +1,11 @@
 /* Music.app - clean-room counterpart of MobileMusicPlayer.app.
  * The VM has no audio device; this app browses /var/mobile/Media/Music,
- * shows metadata-ish info (size, name) and "plays" by streaming to the
- * optional /dev/dsp or by reporting no device. Ceiling: no audio output in
- * the QEMU test VM; WAV playback is wired to a device node if present. */
+ * shows metadata-ish info (size, name) and "plays" by streaming to OSS
+ * /dev/dsp when present, else to the ALSA PCM node via k93snd (real
+ * hardware sound cards). Ceiling: no audio in the QEMU test VM. */
 #define _GNU_SOURCE
 #include "k93ui.h"
+#include "k93snd.h"
 #include "k93util.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,10 +13,35 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 
 #define DIRN "/var/mobile/Media/Music"
+
+/* ALSA playback fallback: modern kernels have no OSS (/dev/dsp), only the
+ * ALSA PCM node. Negotiate the WAV's own rate/channels, then stream frames. */
+static int play_alsa(int fd, unsigned rate, unsigned chans)
+{
+    int r = (int)rate, c = (int)chans;
+    if (k93_snd_open(NULL, &r, &c) < 0) return -1;
+    if (r != (int)rate || c != (int)chans) {
+        /* file rate differs from what the device gave us; the client does no
+         * resampling, so tell the user rather than play at the wrong pitch */
+        k93_snd_close();
+        errno = EINVAL;
+        return -1;
+    }
+    char buf[8192];
+    size_t frame = 2u * (unsigned)c;   /* S16 = 2 bytes/sample */
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof buf)) > 0) {
+        if (k93_snd_play(buf, (size_t)n / frame) < 0) break;
+        if (ui_getkey(0) == UI_KEY_ESC) break;
+    }
+    k93_snd_close();
+    return 0;
+}
 
 static void play_wav(const char *path)
 {
@@ -28,17 +54,29 @@ static void play_wav(const char *path)
                            "This build has no decoder for MP3/AAC (clean-room scope).");
         return;
     }
+    /* canonical WAV: "fmt " at 12, PCM tag at 20, channels at 22, rate at 24 */
+    if (memcmp(hdr + 12, "fmt ", 4) != 0 || hdr[20] != 1) {
+        close(fd);
+        ui_msgbox("Music", "Only uncompressed PCM WAV files can be played.");
+        return;
+    }
+    unsigned chans = hdr[22] | (hdr[23] << 8);
+    unsigned rate  = hdr[24] | (hdr[25] << 8) | (hdr[26] << 16) | (hdr[27] << 24);
     int dsp = open("/dev/dsp", O_WRONLY);
     if (dsp < 0) dsp = open("/dev/dsp0", O_WRONLY);
     if (dsp < 0) {
-        char msg[256];
-        snprintf(msg, sizeof msg,
-                 "No audio device in this machine.\n\n"
-                 "File is a valid WAV: %s\n"
-                 "On hardware with /dev/dsp or ALSA, playback works.",
-                 strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
-        ui_msgbox("Music", msg);
+        /* no OSS emulation in this kernel: try the ALSA PCM node instead */
+        ui_statusmsg("Playing (ALSA) ...");
+        if (play_alsa(fd, rate, chans) < 0) {
+            char msg[256];
+            snprintf(msg, sizeof msg,
+                     "Valid WAV (%u Hz, %u ch) but no sound device.\n\n"
+                     "Needs a kernel sound card (e.g. snd-hda-intel).",
+                     rate, chans);
+            ui_msgbox("Music", msg);
+        }
         close(fd);
+        ui_statusmsg("Stopped");
         return;
     }
     /* trivial "now playing": stream raw samples, no resampling */

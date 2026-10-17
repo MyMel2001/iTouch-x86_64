@@ -118,6 +118,14 @@ Formats: `.ipa` = ZIP (inflate + XML plist parse + optional CMS/sig check) and
   dumb buffer, damage via `DIRTYFB`. `make qemu-test` phase 2
   (QMP screendump of the SpringBoard framebuffer) — **GRAPHICS TEST PASS**
   (2026-10-17).
+* [x] Guest networking: udhcpc + clean-room hook; virtio-net (QEMU) and
+  real-hardware wired NIC drivers (`e1000`/`e1000e`/`r8169`/
+  `8139too`/`8139cp`) in the initrd.
+* [x] Real-hardware support wired up: ALSA Intel HDA sound (initrd codec
+  chain + clean-room PCM client `libk93/k93snd.c` + Music.app playback),
+  `i915` GPU driver chain, NIC drivers above. Phase-1 autotest VM now runs
+  `-device e1000 -device intel-hda -device hda-duplex` — **AUTOTEST PASS**
+  with `alsa-pcm-write ok` (2026-10-17).
 * [x] README.md.
 
 ## 5. Build/validation log (2026-10-16/17)
@@ -147,9 +155,10 @@ Bugs found and fixed during validation (clean-room code, our own):
   detached by launchd take input from the serial console (`infd`).
 
 Known ceilings (documented, not bugs):
-* No guest networking in the test VM (VIRTIO_NET=m, not in initrd);
-  Safari proxy path is config-validated only. Add the virtio_net module
-  to the initrd for live proxy tests.
+* Real-hardware graphics = Intel only (`i915` packaged; Intel GPU firmware
+  blobs from `linux-firmware` not redistributed — add `/lib/firmware/i915`
+  on the target if probe asks; `amdgpu`/`nouveau` not packaged). Sound =
+  HDA only (no USB audio). Wired NICs only (no wireless drivers).
 * DMG: UDZO/koly/mish only; sparse bundles + encrypted images rejected
   with clear errors. Binary plists rejected with clear errors.
 * VM boots via QEMU `-kernel`/`-initrd`; `osdisk.img` (ext4, populated
@@ -166,3 +175,46 @@ Known ceilings (documented, not bugs):
   Ceiling: single dumb buffer, no compositor, no GPU accel, no vsync/page
   flip. Text-console fallback when no KMS device probes. Validated by a
   QMP-screendump graphics test (SpringBoard rendered, `nonblack_px>500`).
+
+### Networking + real-hardware support (2026-10-17)
+
+* Networking: udhcpc hook `userspace/rootfs-files/udhcpc-default.script`
+  (ifconfig + default route + resolv.conf, installed to
+  `/usr/share/udhcpc/default.script`); init loads the NIC driver chain and
+  DHCPs the first interface. QEMU user-mode netdev: gw `10.0.2.2`.
+* initrd module packaging refactored: `install_module()` in
+  `scripts/mkrootfs.sh` walks `modules.dep` and installs each module with
+  its transitive deps to `/lib/modules/<underscore-name>.ko` (the exact
+  paths init insmods). modules.dep keys are matched by basename with
+  dash-insensitive compare — some files are `snd-hda-intel.ko` (dashes)
+  while others are `virtio-gpu.ko`; both install as `<name>.ko`.
+* Real-hardware drivers in the initrd: NICs `e1000`/`e1000e`/`r8169`/
+  `8139too`/`8139cp` (+`mii`); GPU `i915` (+`wmi`/`video`/`i2c-algo-bit`/
+  `cec`/`ttm`/`drm_buddy`/`drm_display_helper`, loaded as a dep group
+  before the probe loop); sound `snd-hda-intel` + generic/Realtek
+  (alc269/alc662/alc882)/HDMI codecs.
+* Gotcha (sound): there is no modprobe/udev in the guest, and
+  `insmod snd-hda-intel.ko` probes AND configures codecs synchronously —
+  the codec drivers (`snd-hda-codec-generic`, realtek-lib, alc*, ...) must
+  be insmod'd BEFORE the controller, or `azx_codec_configure()` fails
+  every codec and the driver gives up with "Cannot probe codecs, giving
+  up" (reproduced with QEMU `intel-hda` + `hda-duplex`).
+* Gotcha: `alc269` uniquely depends on `snd-hda-scodec-component.ko`.
+* `userspace/libk93/k93snd.c`: clean-room ALSA PCM playback client (S16_LE
+  interleaved, kernel UAPI ioctls via vendored `linux/asound.h`; this
+  kernel has no OSS emulation — `CONFIG_SND_OSSEMUL=n`, so `/dev/dsp`
+  does not exist). Trap: in `hw_params`, an all-zero `snd_interval` means
+  "must equal 0" — every unset parameter must be `[0, UINT_MAX]` or
+  `SNDRV_PCM_IOCTL_HW_PARAMS` refines to `-EINVAL`.
+* Wiring: Music.app plays PCM WAV through OSS `/dev/dsp` when present,
+  else through `k93_snd_*` (negotiates the file's rate/channels, no
+  resampling; mismatched rates refuse rather than play at wrong pitch).
+* Validation: selfcheck gained "alsa pcm write" (open + 4096 silent
+  frames); autotest gained `alsa-pcm-write` and reports the bound NIC
+  driver (`eth0 present (driver: e1000)`). Phase-1 QEMU now runs
+  `-netdev user -device e1000` + `-device intel-hda -device hda-duplex`
+  (real-hardware drivers, same as on bare metal; virtio-net/gpu stay in
+  phase 2 + `qemu-run.sh`). Result: **AUTOTEST PASS** (alsa pcm
+  `controlC0 hwC0D0 pcmC0D0c pcmC0D0p timer`) + **GRAPHICS TEST PASS**
+  (2026-10-17); host selfcheck 44 checks green (host ALSA negotiated
+  44100 Hz/2ch — real hardware path works).

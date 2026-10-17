@@ -36,6 +36,15 @@ run gpt-file           sh -c '/usr/bin/k93selfcheck /opt/k93/fixtures | grep -q 
 run launchd-jobs       sh -c 'test -f /etc/launchd/com.k93.springboard.plist'
 run shell-present      sh -c '/bin/sh -c "echo busybox-ok" | grep -q busybox-ok'
 
+# networking: kernel NIC driver + udhcpc (QEMU user-mode netdev: gw 10.0.2.2)
+if [ -e /sys/class/net/eth0 ]; then
+    step "eth0 present (driver: $(sed -n 's/^DRIVER=//p' /sys/class/net/eth0/device/uevent 2>/dev/null))"
+    run net-lease       sh -c 'ifconfig eth0 | grep -q "inet addr"'
+    run net-ping-gw     sh -c 'ping -c 2 -W 2 10.0.2.2 >/dev/null'
+else
+    step "no eth0 (net test skipped - VM has no NIC)"
+fi
+
 # graphics stack: fbdev (legacy) or DRM/KMS (modern kernels, no CONFIG_FB_DEVICE)
 if [ -e /dev/fb0 ]; then
     step "framebuffer present: $(cat /sys/class/graphics/fb0/name 2>/dev/null)"
@@ -46,6 +55,14 @@ elif [ -e /dev/dri/card0 ]; then
     run kms-draw-verify sh -c '/usr/bin/k93selfcheck /opt/k93/fixtures | grep -q "kms dumb buffer write/readback"'
 else
     step "no display device (headless text VM)"
+fi
+
+# sound: ALSA PCM from the kernel snd stack (QEMU intel-hda / real hardware)
+if [ -e /dev/snd/pcmC0D0p ]; then
+    step "ALSA PCM device present: $(ls /dev/snd 2>/dev/null | tr '\n' ' ')"
+    run alsa-pcm-write  sh -c '/usr/bin/k93selfcheck /opt/k93/fixtures | grep -q "alsa pcm write"'
+else
+    step "no ALSA PCM device (VM has no sound card)"
 fi
 
 # block device present? (InstallToHD target; only when a second disk is attached)

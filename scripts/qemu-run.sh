@@ -23,5 +23,7 @@ exec qemu-system-x86_64 \
     -append "console=ttyS0,115200 loglevel=4" \
     -drive "file=$BUILD/hdd16.img,if=virtio,format=raw" \
     -vga std \
+    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+    -device intel-hda -device hda-duplex \
     -display "vnc=127.0.0.1:${K93_VNC_DISPLAY:-77}" \
     -serial mon:stdio -no-reboot

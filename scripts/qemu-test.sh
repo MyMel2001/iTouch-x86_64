@@ -22,6 +22,8 @@ timeout 240 qemu-system-x86_64 \
     -initrd "$BUILD/initrd.cpio.gz" \
     -append "console=ttyS0,115200 autotest loglevel=4" \
     -drive "file=$BUILD/hdd16.img,if=virtio,format=raw" \
+    -netdev user,id=net0 -device e1000,netdev=net0 \
+    -device intel-hda -device hda-duplex \
     -display none -serial "file:$LOG" -monitor none -no-reboot
 qrc=$?
 set -e
@@ -50,6 +52,7 @@ qemu-system-x86_64 \
     -append "console=ttyS0,115200 loglevel=4" \
     -drive "file=$BUILD/hdd16.img,if=virtio,format=raw" \
     -vga none -device virtio-gpu-pci -display vnc=127.0.0.1:78 \
+    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
     -qmp "unix:$SOCK,server,nowait" \
     -serial "file:$GLOG" -monitor none -no-reboot &
 QPID=$!
