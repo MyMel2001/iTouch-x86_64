@@ -21,6 +21,8 @@ int  k93_app_scan(k93_app *out, int max);
 int  k93_app_launch(const k93_app *a);
 /* install a .ipa (K93-compatible zip bundle) into /Applications; 0 on success */
 int  k93_app_install_ipa(const char *ipapath, char *err, size_t errlen);
+/* install a .deb (extract payload into / via busybox dpkg-deb); 0 on success */
+int  k93_app_install_deb(const char *debpath, char *err, size_t errlen);
 /* uninstall by bundle identifier */
 int  k93_app_unregister(const char *ident);
 /* path of the app's Info.plist */

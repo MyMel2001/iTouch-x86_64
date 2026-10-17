@@ -22,6 +22,8 @@ run ipa-list           /usr/bin/k93ipatool list /opt/k93/fixtures/test.ipa
 run ipa-install        /usr/bin/k93ipatool inst /opt/k93/fixtures/test.ipa
 run ipa-app-registered sh -c '/usr/bin/k93ipatool apps | grep -q com.k93.fixture'
 run ipa-arm-rejected   sh -c '! /usr/bin/k93ipatool inst /opt/k93/fixtures/arm.ipa'
+run deb-install        sh -c '/usr/bin/k93ipatool deb /opt/k93/fixtures/test.deb && grep -q "K93 DEB FIXTURE OK" /usr/lib/k93/deb-fixture.txt'
+run deb-rejected       sh -c '! /usr/bin/k93ipatool deb /opt/k93/fixtures/test.ipa'
 run dmg-probe          /usr/bin/k93dmgtool probe /opt/k93/fixtures/test.dmg
 run dmg-extract        sh -c '/usr/bin/k93dmgtool x /opt/k93/fixtures/test.dmg /tmp/out.raw'
 run dmg-payload        sh -c 'dd if=/tmp/out.raw bs=1 count=10 2>/dev/null | grep -q K93DMGTEST'

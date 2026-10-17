@@ -238,7 +238,7 @@ install -m 0644 "$CABUNDLE" "$ROOT/etc/ssl/certs/ca-certificates.crt"
 if [ ! -f "$TOP/fixtures/test.ipa" ]; then
     python3 "$TOP/tools/mkfixtures.py" "$TOP/fixtures"
 fi
-install -m 0644 "$TOP/fixtures/"*.ipa "$TOP/fixtures/"*.dmg "$ROOT/opt/k93/fixtures/"
+install -m 0644 "$TOP/fixtures/"*.ipa "$TOP/fixtures/"*.dmg "$TOP/fixtures/"*.deb "$ROOT/opt/k93/fixtures/"
 
 # runtime placeholder dirs (also created by init at boot)
 touch "$ROOT/var/db/k93/apps.log"

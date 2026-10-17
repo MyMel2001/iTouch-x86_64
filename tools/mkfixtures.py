@@ -8,6 +8,7 @@ import io
 import plistlib
 import struct
 import sys
+import tarfile
 import zipfile
 import zlib
 import os
@@ -108,4 +109,46 @@ with open(f"{out}/test.dmg", "wb") as f:
     f.write(xml)
     f.write(koly)
 
-print(f"fixtures in {out}: test.ipa, arm.ipa, test.dmg")
+# ------------------------------------------------------------------ test.deb
+# minimal Debian binary package: ar with debian-binary + control.tar.gz +
+# data.tar.gz; installs usr/lib/k93/deb-fixture.txt into /
+def ar_member(name, data):
+    hdr = (name.encode().ljust(16) + b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6)
+           + b"100644".ljust(8) + str(len(data)).encode().ljust(10) + b"`\n")
+    assert len(hdr) == 60
+    return hdr + data + (b"\n" if len(data) % 2 else b"")
+
+def tgz_tree(files):
+    """real debs list every parent dir entry (busybox dpkg-deb relies on it)"""
+    buf = io.BytesIO()
+    dirs = set()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        for name, data in files.items():
+            parts = name.split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                d = "/".join(parts[:i])
+                if d in dirs:
+                    continue
+                dirs.add(d)
+                ti = tarfile.TarInfo(d)
+                ti.type = tarfile.DIRTYPE
+                ti.mode = 0o755
+                ti.mtime = 0
+                t.addfile(ti)
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            ti.mtime = 0
+            t.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+control = b"Package: k93-fixture\nVersion: 1.0\nArchitecture: all\nDescription: K93 test fixture\n"
+deb = b"!<arch>\n"
+deb += ar_member("debian-binary", b"2.0\n")
+deb += ar_member("control.tar.gz", tgz_tree({"control": control}))
+deb += ar_member("data.tar.gz", tgz_tree({
+    "usr/lib/k93/deb-fixture.txt": b"K93 DEB FIXTURE OK\n",
+}))
+with open(f"{out}/test.deb", "wb") as f:
+    f.write(deb)
+
+print(f"fixtures in {out}: test.ipa, arm.ipa, test.dmg, test.deb")

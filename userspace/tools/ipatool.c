@@ -13,6 +13,7 @@ static int usage(void)
     fprintf(stderr,
         "usage: k93ipatool list  <file.ipa>      show bundle metadata\n"
         "       k93ipatool inst  <file.ipa>      install into /Applications\n"
+        "       k93ipatool deb   <file.deb>      extract Debian package into /\n"
         "       k93ipatool apps                   list installed bundles\n");
     return 2;
 }
@@ -68,6 +69,15 @@ int main(int argc, char **argv)
             return 1;
         }
         printf("installed %s\n", argv[2]);
+        return 0;
+    }
+    if (!strcmp(argv[1], "deb") && argc == 3) {
+        char err[256] = "";
+        if (k93_app_install_deb(argv[2], err, sizeof(err)) != 0) {
+            fprintf(stderr, "k93ipatool: deb install failed: %s\n", err[0] ? err : "unknown error");
+            return 1;
+        }
+        printf("installed deb %s\n", argv[2]);
         return 0;
     }
     if (!strcmp(argv[1], "apps")) {

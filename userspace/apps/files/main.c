@@ -87,6 +87,24 @@ static void install_ipa_ui(const char *path)
     else ui_msgbox("Installer failed", err);
 }
 
+static void install_deb_ui(const char *path)
+{
+    ui_statusmsg("Installing deb ...");
+    char err[256] = "";
+    int rc = k93_app_install_deb(path, err, sizeof err);
+    if (rc == 0) ui_msgbox("Installer", "Debian package extracted into /.\nFiles land where the package places them.");
+    else ui_msgbox("Installer failed", err);
+}
+
+/* dispatch on extension: .ipa -> app bundle install, .deb -> package extract */
+static void install_ui(const char *path)
+{
+    size_t l = strlen(path);
+    if (l > 4 && !strcasecmp(path + l - 4, ".ipa")) install_ipa_ui(path);
+    else if (l > 4 && !strcasecmp(path + l - 4, ".deb")) install_deb_ui(path);
+    else ui_msgbox("Installer", "Unknown package type.\nSupported: .ipa (app), .deb (package)");
+}
+
 static void install_dmg_ui(const char *path)
 {
     char out[1024];
@@ -184,10 +202,10 @@ int main(int argc, char **argv)
             continue;
         }
         /* file action menu */
-        const char *fa[] = { "Open / View", "Install (ipa)", "Convert (dmg)", "Delete", "Cancel" };
+        const char *fa[] = { "Open / View", "Install (ipa/deb)", "Convert (dmg)", "Delete", "Cancel" };
         int f = ui_menu(ents[sel].name, fa, 5, 0);
         if (f == 0) view_file(full);
-        else if (f == 1) install_ipa_ui(full);
+        else if (f == 1) install_ui(full);
         else if (f == 2) install_dmg_ui(full);
         else if (f == 3) {
             char q[512];

@@ -228,3 +228,48 @@ int k93_app_install_ipa(const char *ipapath, char *err, size_t errlen)
     k93_log("installer", "installed %s (%s) from %s", info.name, info.ident, ipapath);
     return 0;
 }
+
+/* install a Debian binary package: validate the ar archive, extract the
+ * payload into a staging dir, then merge into / - the open-by-design model
+ * as .ipa sideloading (no maintainer scripts, no signature checks).
+ * Staging also sidesteps busybox dpkg-deb quirks (no parent-dir creation,
+ * "./"-prefixed members). */
+int k93_app_install_deb(const char *debpath, char *err, size_t errlen)
+{
+    /* validate ar magic before touching the fs */
+    int fd = open(debpath, O_RDONLY);
+    if (fd < 0) { snprintf(err, errlen, "cannot open %s", debpath); return -1; }
+    char hdr[8] = {0};
+    ssize_t r = read(fd, hdr, 8);
+    close(fd);
+    if (r < 8 || memcmp(hdr, "!<arch>\n", 8)) {
+        snprintf(err, errlen, "not a Debian archive (missing ar magic)");
+        return -1;
+    }
+    const char *stage = "/var/db/k93/debstaging";
+    k93_rm_tree(stage);
+    k93_mkdir_p(stage, 0755);
+    pid_t pid = fork();
+    if (pid < 0) { snprintf(err, errlen, "fork failed"); return -1; }
+    if (pid == 0) {
+        execl("/bin/busybox", "busybox", "dpkg-deb", "-x", debpath, stage, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) ;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(err, errlen, "dpkg-deb extraction failed (corrupt package?)");
+        k93_rm_tree(stage);
+        return -1;
+    }
+    if (k93_copy_tree(stage, "/") < 0) {
+        snprintf(err, errlen, "cannot merge package into / (read-only root?)");
+        k93_rm_tree(stage);
+        return -1;
+    }
+    k93_rm_tree(stage);
+    FILE *f = fopen(K93_REGISTRY, "a");
+    if (f) { fprintf(f, "<!-- deb installed from %s -->\n", debpath); fclose(f); }
+    k93_log("installer", "installed deb %s", debpath);
+    return 0;
+}

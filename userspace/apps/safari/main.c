@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "k93ui.h"
 #include "k93util.h"
+#include "k93app.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,9 @@
 #define MAXPAGE (512 * 1024)
 
 struct url { char scheme[8]; char host[256]; int port; char path[1024]; };
+
+static size_t http_body_len;             /* body bytes of last http_get
+                                            (binary bodies may contain NUL) */
 
 static struct {
     char proxy_host[128];
@@ -342,6 +346,7 @@ static char *http_get(struct conn *c, const struct url *u, int *status, char *er
         len = o;
     }
     (void)len;
+    http_body_len = len;
     return buf;
 }
 
@@ -523,6 +528,44 @@ static int browse(const char *url_in)
         char m[128];
         snprintf(m, sizeof m, "Server returned HTTP %d", status);
         ui_msgbox("Safari", m);
+    }
+
+    /* package download: .ipa/.deb links save to Downloads and offer install
+     * (same clean-room path as Files.app; no signature checks exist here) */
+    {
+        size_t pl = strlen(u.path);
+        const char *base = strrchr(u.path, '/');
+        base = base ? base + 1 : u.path;
+        int ispkg = (pl > 4 && (!strcasecmp(u.path + pl - 4, ".ipa") ||
+                                !strcasecmp(u.path + pl - 4, ".deb")));
+        if (ispkg && base[0]) {
+            char dest[1200], q[1400];
+            k93_mkdir_p(K93_DOWNLOADS_DIR, 0755);
+            snprintf(dest, sizeof dest, "%s/%s", K93_DOWNLOADS_DIR, base);
+            snprintf(q, sizeof q,
+                     "Download package?\n\n%s\n\nSave to %s and install?",
+                     u.path, K93_DOWNLOADS_DIR);
+            if (ui_confirm("Safari", q)) {
+                if (k93_write_file(dest, raw, http_body_len, 0) < 0) {
+                    ui_msgbox("Safari", "Cannot write download (disk full?)");
+                } else {
+                    ui_statusmsg("Installing package ...");
+                    char err[256] = "";
+                    int rc = (pl > 4 && !strcasecmp(u.path + pl - 4, ".ipa"))
+                             ? k93_app_install_ipa(dest, err, sizeof err)
+                             : k93_app_install_deb(dest, err, sizeof err);
+                    if (rc == 0) {
+                        char m[1400];
+                        snprintf(m, sizeof m, "Installed %s\n(copy kept in Downloads)", base);
+                        ui_msgbox("Safari", m);
+                    } else {
+                        ui_msgbox("Install failed", err);
+                    }
+                }
+            }
+            free(raw);
+            return 0;
+        }
     }
 
     char title[96] = "";
