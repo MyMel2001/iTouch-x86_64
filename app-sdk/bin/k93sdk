@@ -211,10 +211,11 @@ cmd_bundle() {
     dist="$APPDIR/dist"
     mkdir -p "$dist"
 
-    # .ipa: Payload/<App>.app/{Info.plist,<Executable>}
+    # .ipa: Payload/<App>.app/{Info.plist,<Executable,www/...>}
     stage=$(mktemp -d)
     mkdir -p "$stage/Payload/$APPNAME.app"
     cp "$APPDIR/Info.plist" "$APPDIR/$EXEC" "$stage/Payload/$APPNAME.app/"
+    if [ -d "$APPDIR/www" ]; then cp -R "$APPDIR/www" "$stage/Payload/$APPNAME.app/"; fi
     zip_dir "$stage" "$dist/$APPNAME.ipa" "Payload"
     rm -rf "$stage"
 
@@ -222,6 +223,7 @@ cmd_bundle() {
     stage=$(mktemp -d)
     mkdir -p "$stage/Applications/$APPNAME.app"
     cp "$APPDIR/Info.plist" "$APPDIR/$EXEC" "$stage/Applications/$APPNAME.app/"
+    if [ -d "$APPDIR/www" ]; then cp -R "$APPDIR/www" "$stage/Applications/$APPNAME.app/"; fi
     mkdir -p "$stage/DEBIAN"
     printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nDescription: %s (K93OS app)\n' \
         "$IDENT" "$VERSION" "$APPNAME" > "$stage/DEBIAN/control"

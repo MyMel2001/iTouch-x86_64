@@ -1,0 +1,233 @@
+#!/bin/sh
+# touchdova - HTML-app scaffolder for K93OS-x86 (clean-room Cordova
+# counterpart): generates a native container app that renders a local
+# www/index.html (HTML subset: text markup + links) with a k93:// bridge
+# for native actions. Built and bundled by the app-sdk (k93sdk).
+set -e
+
+die() { echo "touchdova: $*" >&2; exit 1; }
+
+find_home() {
+    [ -n "${K93_HOME:-}" ] && { echo "$K93_HOME"; return; }
+    d=$(cd "$(dirname "$0")/../.." && pwd)
+    [ -d "$d/app-sdk" ] && { echo "$d"; return; }
+    die "K93_HOME not set and this script is not inside a K93OS checkout"
+}
+K93_HOME=$(find_home)
+K93SDK="$K93_HOME/app-sdk/bin/k93sdk"
+
+cmd_new() {
+    name="$1"
+    [ -n "$name" ] || die "usage: touchdova new <App Name>"
+    dir="$PWD/$name"
+    [ -e "$dir" ] && die "$dir already exists"
+    exec_name=$(echo "$name" | tr -cd 'A-Za-z0-9')
+    ident=$(echo "$name" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')
+    mkdir -p "$dir/www"
+
+    cat > "$dir/app.conf" <<EOF
+NAME=$name
+IDENT=com.k93.dova.$ident
+VERSION=1.0
+EXECUTABLE=$exec_name
+EOF
+
+    cat > "$dir/www/index.html" <<EOF
+<html>
+<title>$name</title>
+<h1>$name</h1>
+<p>This page is bundled with the app and rendered by the touchdova
+container - no network needed.</p>
+<h2>Native bridge</h2>
+<ul>
+<li><a href="k93://alert/Hello%20from%20HTML!">k93://alert</a> - native message box</li>
+<li><a href="k93://quit">k93://quit</a> - close the app</li>
+</ul>
+<h2>Web links</h2>
+<p><a href="https://example.com/">example.com</a> opens in Safari.</p>
+</html>
+EOF
+
+    # container main.c: HTML-subset renderer + k93:// bridge. Kept in the
+    # generated app (single file, no extra libraries) so k93sdk builds it
+    # as-is on any host.
+    cat > "$dir/main.c" <<'EOF'
+/* touchdova container - renders www/index.html (bundled next to the
+ * executable) with the libk93 text UI. HTML subset: <title>, <h1..h3>,
+ * <p>, <ul>/<li>, <br>, <b>/<i>/<a href>. Links starting with k93:// are
+ * native bridge actions (alert, quit); http(s) links open in Safari. */
+#define _GNU_SOURCE
+#include "k93ui.h"
+#include "k93util.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <unistd.h>
+
+#define MAXLINKS 64
+static struct { char href[512]; char text[96]; } links[MAXLINKS];
+static int nlinks;
+
+/* crude HTML -> readable text; collects <a href> into links[] */
+static char *render(const char *html, size_t cap)
+{
+    char *out = k93_xmalloc(cap);
+    size_t o = 0;
+    int skip = 0, in_a = 0;
+    char curhref[512] = "", curtext[96] = "";
+    const char *p = html;
+    while (*p && o + 8 < cap) {
+        if (*p == '<') {
+            const char *e = strchr(p, '>');
+            if (!e) break;
+            char tag[128];
+            size_t tl = (size_t)(e - p) + 1;
+            if (tl >= sizeof tag) tl = sizeof tag - 1;
+            memcpy(tag, p, tl); tag[tl] = 0;
+            for (char *q = tag; *q; q++) *q = (char)tolower((unsigned char)*q);
+            if (!strncmp(tag, "<script", 7) || !strncmp(tag, "<style", 6)) skip = 1;
+            if (!strncmp(tag, "</script", 8) || !strncmp(tag, "</style", 7)) skip = 0;
+            if (!strncmp(tag, "<br", 3) || !strncmp(tag, "<p", 2) ||
+                !strncmp(tag, "<li", 3) || !strncmp(tag, "<h1", 3) ||
+                !strncmp(tag, "<h2", 3) || !strncmp(tag, "<h3", 3)) {
+                if (o && out[o - 1] != '\n') out[o++] = '\n';
+                if (!strncmp(tag, "<li", 3) && o + 2 < cap) { out[o++] = ' '; out[o++] = '-'; }
+            }
+            if (!strncmp(tag, "<a ", 3)) {
+                const char *h = strstr(tag, "href=\"");
+                if (h && nlinks < MAXLINKS) {
+                    k93_strlcpy(curhref, h + 6, sizeof curhref);
+                    char *q = strchr(curhref, '"'); if (q) *q = 0;
+                    curtext[0] = 0; in_a = 1;
+                }
+            }
+            if (!strncmp(tag, "</a", 3) && in_a) {
+                if (curhref[0]) {
+                    k93_strlcpy(links[nlinks].href, curhref, sizeof links[0].href);
+                    k93_strlcpy(links[nlinks].text, curtext[0] ? curtext : curhref,
+                                sizeof links[0].text);
+                    nlinks++;
+                }
+                in_a = 0; curhref[0] = 0;
+            }
+            p = e + 1;
+            continue;
+        }
+        if (!skip) {
+            char c = *p;
+            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            out[o++] = c;
+            if (in_a && strlen(curtext) < sizeof curtext - 1 && c != ' ') {
+                size_t l = strlen(curtext);
+                curtext[l] = c; curtext[l + 1] = 0;
+            }
+        }
+        p++;
+    }
+    out[o] = 0;
+    /* collapse runs of spaces/blank lines */
+    char *clean = k93_xmalloc(cap);
+    size_t co = 0; int lastsp = 1, lastnl = 1;
+    for (size_t i = 0; out[i] && co + 1 < cap; i++) {
+        char c = out[i];
+        if (c == ' ') { if (lastsp) continue; lastsp = 1; } else lastsp = 0;
+        if (c == '\n') { if (lastnl) continue; lastnl = 1; } else lastnl = 0;
+        clean[co++] = c;
+    }
+    clean[co] = 0;
+    free(out);
+    return clean;
+}
+
+static void bridge(const char *href)
+{
+    if (!strncmp(href, "k93://alert/", 12)) {
+        char msg[256];
+        k93_strlcpy(msg, href + 12, sizeof msg);
+        for (char *q = msg; *q; q++) { if (*q == '%') *q = ' '; if (*q == '+') *q = ' '; }
+        ui_msgbox("touchdova", msg);
+    } else if (!strcmp(href, "k93://quit")) {
+        ui_shutdown();
+        exit(0);
+    } else {
+        ui_msgbox("touchdova", "Unknown bridge action.\nSupported: k93://alert/<msg>, k93://quit");
+    }
+}
+
+int main(void)
+{
+    if (ui_init("touchdova") < 0) return 1;
+    /* www/ lives next to the executable (bundle dir) */
+    char self[512] = "", page[600] = "";
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n > 0) self[n] = 0;
+    char *slash = strrchr(self, '/');
+    if (slash) *slash = 0;
+    snprintf(page, sizeof page, "%s/www/index.html", self[0] ? self : ".");
+    size_t len = 0;
+    char *html = k93_read_file(page, &len);
+    if (!html) {
+        ui_msgbox("touchdova", "www/index.html not found next to the app");
+        ui_shutdown();
+        return 1;
+    }
+    char title[96] = "touchdova";
+    const char *t = strcasestr(html, "<title>");
+    if (t && t < html + len) {
+        const char *e = strchr(t + 7, '<');
+        if (e && (size_t)(e - t) < sizeof title) {
+            memcpy(title, t + 7, (size_t)(e - t - 7));
+            title[e - t - 7] = 0;
+        }
+    }
+    char *text = render(html, len * 4 + 4096);
+    free(html);
+    char header[160];
+    snprintf(header, sizeof header, "%s\n\n", page);
+    char *doc = k93_xmalloc(strlen(header) + strlen(text) + 1);
+    sprintf(doc, "%s%s", header, text);
+    free(text);
+    ui_textview(title, doc);
+    free(doc);
+
+    for (;;) {
+        const char *items[MAXLINKS + 1];
+        int n2 = 0;
+        for (int i = 0; i < nlinks; i++) items[n2++] = links[i].text;
+        items[n2] = "Close";
+        int sel = ui_menu("Links", items, n2 + 1, 0);
+        if (sel < 0 || sel == n2) break;
+        if (!strncmp(links[sel].href, "k93://", 6)) {
+            bridge(links[sel].href);
+        } else {
+            /* hand web links to Safari (the OS browser) */
+            char cmd[1600];
+            snprintf(cmd, sizeof cmd, "/Applications/Safari.app/Safari '%s'",
+                     links[sel].href);
+            if (system(cmd) != 0)
+                ui_msgbox("touchdova", "Could not open Safari");
+        }
+    }
+    ui_shutdown();
+    return 0;
+}
+EOF
+
+    echo "created $dir (touchdova HTML app)"
+    echo "next: cd '$name' && $K93SDK build . && $K93SDK bundle ."
+}
+
+case "${1:-}" in
+new) cmd_new "$2";;
+*)
+    cat <<EOF
+usage: touchdova new <App Name>   scaffold an HTML app (www/index.html +
+                                  native container) buildable with k93sdk
+bridge: k93://alert/<msg>   native message box
+        k93://quit          close the app
+        https?://...        opens in Safari
+ceiling: HTML subset (text + links), no JavaScript engine - see README
+EOF
+    exit 2;;
+esac

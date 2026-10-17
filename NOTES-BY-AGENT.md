@@ -130,7 +130,51 @@ Formats: `.ipa` = ZIP (inflate + XML plist parse + optional CMS/sig check) and
   `i915` GPU driver chain, NIC drivers above. Phase-1 autotest VM now runs
   `-device e1000 -device intel-hda -device hda-duplex` — **AUTOTEST PASS**
   with `alsa-pcm-write ok` (2026-10-17).
-* [x] README.md.
+* [x] Hardware drivers (TODO 1+2): AMD (`amdgpu`, `radeon`), NVIDIA
+  (`nouveau`), `igb` ethernet, and Wi-Fi (`iwlwifi`, `rtl8xxxu`, `rtl8187`,
+  `ath9k`, `ath5k`, `brcmfmac`, `mwifiex`) modules + firmware packaged;
+  init now loads modules from a generated dependency-ordered
+  `/lib/modules/loadlist` (replacing hand-coded arrays); firmware copied at
+  build time from the host (`cp -aL` — symlink deref mattered: dangling
+  iwlwifi/rtlwifi symlinks broke guest stat); DHCP lease wait fixes the
+  autotest race. Autotest steps `hw-modules`/`hw-driver-set`/`hw-firmware`.
+  Ceiling: no wpa_supplicant (open/manual Wi-Fi association); firmware not
+  redistributed. Commit `2611f61`.
+* [x] Display orientation + resolution (TODO 3+4): `/etc/k93/display.conf`
+  (`MODE=auto|WxH`, `ORIENTATION=landscape|portrait`; `k93.mode=`,
+  `k93.orientation=` cmdline overrides for tests), landscape default,
+  static orientation (no auto-rotate). Portrait = swapped logical canvas +
+  90°-CW rotate-blit into the landscape scanout (DIRTYFB clip fixed to
+  physical dims); `ui_display_modes()` API; Settings > Display pane
+  (resolution picker, orientation, restart SpringBoard). `make qemu-test`
+  phase 3 boots `k93.orientation=portrait` and verifies the rotated canvas
+  over the serial log + QMP screendump — **PORTRAIT TEST PASS**. Gotcha:
+  bash `PPID` is readonly — orphaned QEMU held the serial pipe and hung
+  the harness until timeout. Commit `796acc0`.
+* [x] Package install from Files + Safari (TODO 5+6): `k93_app_install_deb`
+  (ar-magic validation, busybox `dpkg-deb -x` to staging, merge into `/`;
+  no maintainer scripts), Files.app install action dispatches on extension
+  (.ipa/.deb), Safari downloads package links to `Media/Downloads` and
+  offers install (binary-safe body length). Audit confirmed **no
+  code-signing/signature checks exist anywhere in userspace** — item 6 is
+  a design statement, documented in README + Settings Root Access pane.
+  Fixture `test.deb` (ar + control/data tar.gz with parent dir entries —
+  busybox needs them). Commit `f148a22`.
+* [x] App SDK (TODO 7): `app-sdk/bin/k93sdk` (POSIX sh) new/build/bundle;
+  `zig cc -target x86_64-linux-musl` preferred (cross from Linux/macOS/
+  Haiku/WSL), host cc fallback; Go via `CGO_ENABLED=0 GOOS=linux
+  GOARCH=amd64`; manifest generated from `app.conf`; bundler emits .ipa and
+  .deb using zip/tar/ar (python3 fallback). Examples in C, C++ (`extern
+  "C"`), Zig (`extern fn` bindings), Go (console backend). mkrootfs builds
+  the C example; autotest `sdk-ipa-install`/`sdk-deb-install` sideload the
+  real SDK product in the guest. Commit `684cb32`.
+* [x] touchdova (TODO 8): `touchdova/bin/touchdova new` scaffolds an HTML
+  app — `www/index.html` + generated native container (`main.c`, ~120
+  lines: HTML-subset renderer, link menu, `k93://alert/`, `k93://quit`
+  bridge, http(s) links open in Safari). `k93sdk bundle` carries `www/`
+  into the bundle. Ceiling: no JS engine (documented upgrade path).
+* [x] README.md updated (drivers, display config, SDK, touchdova,
+  package install, ceilings).
 
 ## 5. Build/validation log (2026-10-16/17)
 
