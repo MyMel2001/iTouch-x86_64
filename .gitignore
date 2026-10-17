@@ -1,0 +1,8 @@
+# build outputs
+/build/
+# vendored dependency build trees (cloned by scripts/build-deps.sh)
+/third_party/_build/
+# generated fixtures
+/fixtures/
+*.o
+*.a
