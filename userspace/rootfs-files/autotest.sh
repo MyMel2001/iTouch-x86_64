@@ -26,6 +26,9 @@ run dmg-probe          /usr/bin/k93dmgtool probe /opt/k93/fixtures/test.dmg
 run dmg-extract        sh -c '/usr/bin/k93dmgtool x /opt/k93/fixtures/test.dmg /tmp/out.raw'
 run dmg-payload        sh -c 'dd if=/tmp/out.raw bs=1 count=10 2>/dev/null | grep -q K93DMGTEST'
 run hw-status          /usr/bin/k93smc
+run hw-modules         sh -c 'test -s /lib/modules/loadlist && test $(wc -l < /lib/modules/loadlist) -ge 40'
+run hw-driver-set      sh -c 'for m in amdgpu nouveau i915 r8169 iwlwifi ath9k snd_hda_intel; do grep -qx "$m" /lib/modules/loadlist || exit 1; done'
+run hw-firmware        sh -c 'test -s /lib/firmware/regulatory.db && test -s /lib/firmware/iwlwifi-100-5.ucode.xz && test -d /lib/firmware/amdgpu'
 run ca-store           sh -c 'grep -q "BEGIN CERTIFICATE" /etc/ssl/certs/ca-certificates.crt'
 run proxy-conf         sh -c 'grep -q PROXY_ENABLE /etc/k93/proxy.conf'
 run proxy-write        sh -c 'printf "PROXY_ENABLE=1\nPROXY_HOST=10.0.2.2\nPROXY_PORT=8080\n" > /etc/k93/proxy.conf && grep -q 10.0.2.2 /etc/k93/proxy.conf'

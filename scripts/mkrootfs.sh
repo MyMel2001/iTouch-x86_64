@@ -37,10 +37,14 @@ ln -sfn sbin/init "$ROOT/init"      # kernel looks for /init inside an initramfs
 # be hand-listed twice (missing deps previously broke virtio_gpu silently).
 # Output is always /lib/modules/<underscore-name>.ko - the exact paths init
 # insmods. modules.dep keys use dashes for some files (snd-hda-intel.ko), so
-# matching is dash-insensitive on the basename.
+# matching is dash-insensitive on the basename. Each installed module is also
+# appended to /lib/modules/loadlist in dependency order (deps before
+# dependents), so init does a single ordered insmod pass instead of
+# hard-coding per-subsystem lists.
 mkdir -p "$ROOT/lib/modules"
 DEPFILE="$(echo /usr/lib/modules/*/modules.dep | awk '{print $1}')"
 : > "$ROOT/.modstamps"
+: > "$ROOT/.mods.loaded"
 
 install_module() {           # install_module <module name, dashes or underscores>
     local want dep key src out
@@ -67,19 +71,42 @@ install_module() {           # install_module <module name, dashes or underscore
         *)     cp "$src" "$out" ;;
     esac
     chmod 0644 "$out"
+    echo "$want" >> "$ROOT/.mods.loaded"
 }
 
-# graphics: virtio-gpu + bochs (test VMs), i915 (real Intel GPUs)
-for M in virtio-gpu bochs i915; do install_module "$M"; done
-# networking: virtio-net (test VMs) + common real-hardware wired NICs
-for M in virtio_net e1000 e1000e r8169 8139too 8139cp; do install_module "$M"; done
+# graphics: virtio-gpu + bochs (test VMs), i915 (Intel), amdgpu + radeon (AMD),
+# nouveau (NVIDIA - kernel side of NVK; NVK/Zinc themselves are Mesa userspace)
+for M in virtio-gpu bochs i915 amdgpu radeon nouveau; do install_module "$M"; done
+# wired NICs: virtio-net (test VMs), Intel e1000/e1000e/igb, RealTek r8169 + 8139
+for M in virtio_net e1000 e1000e igb r8169 8139too 8139cp; do install_module "$M"; done
+# Wi-Fi: Intel iwlwifi, RealTek rtl8xxxu (USB) + rtl8187, Atheros ath9k/ath5k,
+# Broadcom brcmfmac, Marvell mwifiex (all kernel-native drivers)
+for M in iwlwifi rtl8xxxu rtl8187 ath9k ath5k brcmfmac mwifiex; do install_module "$M"; done
 # sound: Intel HDA codecs first, controller LAST - the controller probes and
 # configures codecs synchronously during insmod, so every codec driver must
 # already be registered (the guest has no modprobe to resolve aliases).
 for M in snd-hda-codec-generic snd-hda-codec-hdmi snd-hda-codec-realtek-lib \
          snd-hda-scodec-component snd-hda-codec-alc662 snd-hda-codec-alc269 \
          snd-hda-codec-alc882 snd-hda-intel; do install_module "$M"; done
+mv "$ROOT/.mods.loaded" "$ROOT/lib/modules/loadlist"
 rm -f "$ROOT/.modstamps"
+
+# ---------------------------------------------------------- device firmware
+# Real-hardware drivers (iwlwifi, rtl8xxxu, amdgpu, brcmfmac, mwifiex, ...)
+# need firmware blobs. Copied from the host's linux-firmware tree at build
+# time (never stored in git), the same policy as the CA bundle. The kernel
+# firmware loader transparently decompresses .xz/.zst files (FW_LOADER_COMPRESS).
+FW=/usr/lib/firmware
+mkdir -p "$ROOT/lib/firmware"
+# -L dereferences: iwlwifi-*/brcm/mrvl entries are symlinks into intel/,
+# cypress/, libertas/ trees that are not copied wholesale.
+for pat in "$FW"/iwlwifi-* "$FW"/regulatory.db "$FW"/regulatory.db.p7s; do
+    [ -e "$pat" ] && cp -aL "$pat" "$ROOT/lib/firmware/"
+done
+for d in rtlwifi amdgpu radeon brcm mrvl; do
+    [ -d "$FW/$d" ] && cp -aL "$FW/$d" "$ROOT/lib/firmware/"
+done
+echo "firmware: $(du -sh "$ROOT/lib/firmware" 2>/dev/null | cut -f1)"
 for t in k93selfcheck k93dmgtool k93ipatool k93smc; do
     install -m 0755 "$GBIN/$t" "$ROOT/usr/bin/$t"
 done

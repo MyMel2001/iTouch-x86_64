@@ -134,29 +134,38 @@ int main(void)
     printf("%s", banner);
     k93_log("init", "PID 1 starting, pid=%d", getpid());
 
-    /* network: loopback always; first ethernet up + DHCP when a cable exists.
-     * Load the virtio chain (test VMs) and the common real-hardware wired NIC
-     * drivers; insmod of a driver whose device is absent is harmless. mii must
-     * precede the 8139 drivers (insmod resolves no dependencies). */
+    /* network: loopback always; first ethernet up + DHCP when a cable exists */
     ifup("lo", "127.0.0.1", "255.0.0.0");
-    if (access("/sys/class/net/eth0", F_OK) != 0) {
-        const char *netmods[] = { "/lib/modules/failover.ko",
-                                  "/lib/modules/net_failover.ko",
-                                  "/lib/modules/virtio_net.ko",
-                                  "/lib/modules/e1000.ko",
-                                  "/lib/modules/e1000e.ko",
-                                  "/lib/modules/r8169.ko",
-                                  "/lib/modules/mii.ko",
-                                  "/lib/modules/8139too.ko",
-                                  "/lib/modules/8139cp.ko", NULL };
-        for (int i = 0; netmods[i]; i++) {
-            if (access(netmods[i], F_OK) != 0) continue;
-            char *na[] = { "/bin/busybox", "insmod", (char *)netmods[i], NULL };
-            run_cmd(na);
+
+    /* kernel modules: mkrootfs writes /lib/modules/loadlist in dependency
+     * order (graphics drivers, wired + Wi-Fi NICs, HDA codec chain with the
+     * controller last). One ordered insmod pass replaces hard-coded lists;
+     * a driver whose device is absent binds nothing and is harmless. */
+    {
+        FILE *lf = fopen("/lib/modules/loadlist", "r");
+        if (lf) {
+            char line[128];
+            int n = 0;
+            while (fgets(line, sizeof line, lf)) {
+                char *nl = strchr(line, '\n');
+                if (nl) *nl = 0;
+                if (!line[0] || line[0] == '#') continue;
+                char path[192];
+                snprintf(path, sizeof path, "/lib/modules/%s.ko", line);
+                if (access(path, F_OK) != 0) continue;
+                char *ma[] = { "/bin/busybox", "insmod", path, NULL };
+                if (run_cmd(ma) == 0) n++;
+            }
+            fclose(lf);
+            k93_log("init", "loaded %d kernel modules (loadlist)", n);
         }
-        for (int j = 0; j < 30 && access("/sys/class/net/eth0", F_OK) != 0; j++)
-            usleep(100000);
     }
+
+    /* wait for the wired NIC the loadlist just probed, then DHCP. Hold boot
+     * until the lease lands (udhcpc exits after -q) so services and autotest
+     * see a configured interface. */
+    for (int j = 0; j < 30 && access("/sys/class/net/eth0", F_OK) != 0; j++)
+        usleep(100000);
     {
         const char *devs[] = { "eth0", "enp0s3", "ens3", NULL };
         for (int i = 0; devs[i]; i++) {
@@ -169,42 +178,31 @@ int main(void)
                                  "/usr/share/udhcpc/default.script", NULL };
                 pid_t p2 = fork();
                 if (p2 == 0) { execvp(argv[0], argv); _exit(127); }
+                /* wait for the hook script to set an address (max 5s) */
+                for (int j = 0; j < 50; j++) {
+                    int s = socket(AF_INET, SOCK_DGRAM, 0);
+                    struct ifreq ifr;
+                    memset(&ifr, 0, sizeof ifr);
+                    k93_strlcpy(ifr.ifr_name, devs[i], IFNAMSIZ);
+                    int got = 0;
+                    if (s >= 0) {
+                        if (ioctl(s, SIOCGIFADDR, &ifr) == 0) {
+                            struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+                            if (sin->sin_addr.s_addr != 0) got = 1;
+                        }
+                        close(s);
+                    }
+                    if (got) break;
+                    usleep(100000);
+                }
                 break;
             }
         }
     }
 
-    /* graphics bring-up: kernels without CONFIG_FB_DEVICE (e.g. Fedora's 7.2
-     * config) never create /dev/fb0; the UI then uses DRM/KMS through
-     * /dev/dri/card0. Deps first (insmod resolves nothing), then the actual
-     * device drivers: virtio-gpu + bochs for the test VMs, i915 for real
-     * Intel GPUs. A driver whose device is absent binds nothing and is harmless. */
-    if (access("/dev/dri/card0", F_OK) != 0) {
-        static const char *drmdeps[] = { "/lib/modules/virtio_dma_buf.ko",
-                                         "/lib/modules/wmi.ko",
-                                         "/lib/modules/video.ko",
-                                         "/lib/modules/i2c_algo_bit.ko",
-                                         "/lib/modules/cec.ko",
-                                         "/lib/modules/ttm.ko",
-                                         "/lib/modules/drm_buddy.ko",
-                                         "/lib/modules/drm_display_helper.ko",
-                                         NULL };
-        for (int i = 0; drmdeps[i]; i++) {
-            if (access(drmdeps[i], F_OK) != 0) continue;
-            char *da[] = { "/bin/busybox", "insmod", (char *)drmdeps[i], NULL };
-            run_cmd(da);
-        }
-        const char *mods[] = { "/lib/modules/virtio_gpu.ko",
-                               "/lib/modules/bochs.ko",
-                               "/lib/modules/i915.ko", NULL };
-        for (int i = 0; mods[i] && access("/dev/dri/card0", F_OK) != 0; i++) {
-            if (access(mods[i], F_OK) != 0) continue;
-            char *insargv[] = { "/bin/busybox", "insmod", (char *)mods[i], NULL };
-            run_cmd(insargv);
-            for (int j = 0; j < 30 && access("/dev/dri/card0", F_OK) != 0; j++)
-                usleep(100000);
-        }
-    }
+    /* graphics: kernels without CONFIG_FB_DEVICE (e.g. Fedora's 7.2 config)
+     * never create /dev/fb0; the UI then uses DRM/KMS through /dev/dri/card0.
+     * The loadlist brought up virtio-gpu/bochs/i915/amdgpu/radeon/nouveau. */
     for (int i = 0; i < 150 && access("/dev/dri/card0", F_OK) != 0; i++)
         usleep(100000);
     k93_log("init", "graphics: %s",
@@ -212,42 +210,16 @@ int main(void)
                 ? "DRM device ready (/dev/dri/card0)"
                 : "no display (serial text UI)");
 
-    /* sound: Intel HDA codec drivers FIRST, controller LAST. snd-hda-intel
-     * probes and configures codecs synchronously during insmod, so the codec
-     * drivers must be registered before it loads (there is no modprobe in the
-     * guest to resolve codec aliases). QEMU's intel-hda and real hardware
-     * both expose the ALSA nodes under /dev/snd; Music.app plays via them. */
-    {
-        static const char *sndmods[] = { "/lib/modules/soundcore.ko",
-                                         "/lib/modules/snd.ko",
-                                         "/lib/modules/snd_timer.ko",
-                                         "/lib/modules/snd_pcm.ko",
-                                         "/lib/modules/snd_hwdep.ko",
-                                         "/lib/modules/snd_hda_core.ko",
-                                         "/lib/modules/snd_intel_sdw_acpi.ko",
-                                         "/lib/modules/snd_intel_dspcfg.ko",
-                                         "/lib/modules/snd_hda_codec.ko",
-                                         "/lib/modules/snd_hda_codec_generic.ko",
-                                         "/lib/modules/snd_hda_codec_hdmi.ko",
-                                         "/lib/modules/snd_hda_codec_realtek_lib.ko",
-                                         "/lib/modules/snd_hda_scodec_component.ko",
-                                         "/lib/modules/snd_hda_codec_alc662.ko",
-                                         "/lib/modules/snd_hda_codec_alc269.ko",
-                                         "/lib/modules/snd_hda_codec_alc882.ko",
-                                         "/lib/modules/snd_hda_intel.ko",
-                                         NULL };
-        for (int i = 0; sndmods[i]; i++) {
-            if (access(sndmods[i], F_OK) != 0) continue;
-            char *sa[] = { "/bin/busybox", "insmod", (char *)sndmods[i], NULL };
-            run_cmd(sa);
-        }
-        for (int j = 0; j < 30 && access("/dev/snd/controlC0", F_OK) != 0; j++)
-            usleep(100000);
-        k93_log("init", "sound: %s",
-                access("/dev/snd/controlC0", F_OK) == 0
-                    ? "ALSA device ready (/dev/snd)"
-                    : "no sound card");
-    }
+    /* sound: the loadlist ordered the HDA codec drivers before snd-hda-intel
+     * (the controller probes and configures codecs synchronously during
+     * insmod). QEMU's intel-hda and real hardware both expose /dev/snd;
+     * Music.app plays via the ALSA nodes. */
+    for (int j = 0; j < 30 && access("/dev/snd/controlC0", F_OK) != 0; j++)
+        usleep(100000);
+    k93_log("init", "sound: %s",
+            access("/dev/snd/controlC0", F_OK) == 0
+                ? "ALSA device ready (/dev/snd)"
+                : "no sound card");
 
     if (k93_cmdline_flag("autotest")) {
         /* skip UI services entirely in test mode */
