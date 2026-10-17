@@ -23,6 +23,16 @@
 #include <poll.h>
 #include <signal.h>
 #include <linux/fb.h>
+#ifndef __user
+#define __user
+#endif
+#include <linux/drm.h>
+#include <linux/drm_mode.h>
+#ifndef DRM_MODE_CONNECTED           /* removed from v7.2 uapi (kernel enum) */
+#define DRM_MODE_UNKNOWN    0
+#define DRM_MODE_CONNECTED  1
+#define DRM_MODE_DISCONNECTED 2
+#endif
 #include <linux/input.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -31,10 +41,13 @@ extern const uint8_t k93_font8x16[4096];
 
 enum { BACK_NONE, BACK_FB, BACK_TEXT };
 
+static int drm_ioctl(int fd, unsigned long req, void *arg);
+
 static struct {
     int backend;
     int cols, rows;
     int fbfd;
+    int drmfb;                           /* DRM fb id (KMS backend) */
     uint8_t *fbr;                        /* mmapped framebuffer */
     uint8_t *fbw;                        /* shadow buffer */
     size_t fblen;
@@ -241,6 +254,20 @@ static void fb_render_all(void)
 {
     if (G.backend != BACK_FB || !G.fbw) return;
     memcpy(G.fbr, G.fbw, G.fblen);
+    if (G.drmfb > 0 && G.fbfd >= 0) {
+        /* KMS (DRM) scanout: drivers with shadow planes (bochs-drm) only
+         * copy our mmap'd buffer to real VRAM on damage notification -
+         * tell the kernel the whole screen changed after each flush. */
+        struct drm_clip_rect clip = {
+            0, 0, (uint16_t)G.fbw_px, (uint16_t)G.fbh_px,
+        };
+        struct drm_mode_fb_dirty_cmd d = {
+            .fb_id = (uint32_t)G.drmfb,
+            .num_clips = 1,
+            .clips_ptr = (uintptr_t)&clip,
+        };
+        drm_ioctl(G.fbfd, DRM_IOCTL_MODE_DIRTYFB, &d);
+    }
 }
 
 void ui_puts(int x, int y, const char *s)
@@ -400,6 +427,170 @@ static int fb_open(void)
     return 0;
 }
 
+/* --- DRM/KMS backend -----------------------------------------------------
+ * Modern kernels (e.g. Fedora's 7.2 config) ship CONFIG_FB_DEVICE off: the
+ * fbdev core keeps framebuffers kernel-internal (fbcon only) and never
+ * creates /dev/fb0. The userspace graphics path is then DRM/KMS: we become
+ * DRM master, create a dumb buffer, add it as a framebuffer and scan it out
+ * via SETCRTC. Render target is the mmap'd dumb buffer, so the rest of the
+ * toolkit (shadow buffer + 8x16 font) is unchanged. */
+
+static int drm_ioctl(int fd, unsigned long req, void *arg)
+{
+    int r;
+    do { r = ioctl(fd, req, arg); } while (r < 0 && errno == EINTR);
+    return r;
+}
+
+/* diagnostics go to the console device: when spawned by launchd our stderr
+ * is /dev/null, so fprintf would vanish */
+static void drm_dbg(const char *fmt, ...)
+{
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    int c = open("/dev/console", O_WRONLY | O_NOCTTY);
+    if (c >= 0) { ssize_t w = write(c, line, strlen(line)); (void)w; close(c); }
+}
+
+static int drm_open(void)
+{
+    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) { drm_dbg("k93ui: open card0: %s\n", strerror(errno)); return -1; }
+
+    struct drm_mode_card_res res;
+    memset(&res, 0, sizeof res);
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0 ||
+        res.count_connectors == 0 || res.count_crtcs == 0) {
+        drm_dbg("k93ui: getresources: %s (con=%u crtc=%u)\n",
+                strerror(errno), res.count_connectors, res.count_crtcs);
+        close(fd);
+        return -1;
+    }
+    uint32_t con[32], crt[32], enc[32];
+    if (res.count_connectors > 32 || res.count_crtcs > 32 || res.count_encoders > 32) {
+        close(fd);
+        return -1;
+    }
+    res.connector_id_ptr = (uintptr_t)con;
+    res.crtc_id_ptr = (uintptr_t)crt;
+    res.encoder_id_ptr = (uintptr_t)enc;
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
+        drm_dbg("k93ui: getresources(2): %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    /* first connected connector with a mode list */
+    uint32_t conn_id = 0, crtc_id = crt[0];
+    struct drm_mode_modeinfo mode;
+    memset(&mode, 0, sizeof mode);
+    int got = 0;
+    drm_dbg("k93ui: %u connectors, %u crtcs, first mode %dx%d\n",
+            res.count_connectors, res.count_crtcs, mode.hdisplay, mode.vdisplay);
+    for (uint32_t i = 0; i < res.count_connectors && !got; i++) {
+        struct drm_mode_get_connector cc;
+        memset(&cc, 0, sizeof cc);
+        cc.connector_id = con[i];
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &cc) < 0) {
+            drm_dbg("k93ui: getconnector %u: %s\n", con[i], strerror(errno));
+            continue;
+        }
+        if (cc.count_modes == 0) {
+            drm_dbg("k93ui: connector %u status=%u has no modes\n", con[i], cc.connection);
+            continue;
+        }
+        struct drm_mode_modeinfo modes[32];
+        uint32_t n = cc.count_modes < 32 ? cc.count_modes : 32;
+        cc.modes_ptr = (uintptr_t)modes;
+        cc.count_modes = n;
+        cc.encoders_ptr = (uintptr_t)enc;       /* stale counts with NULL ptrs
+                                                 * = kernel EFAULT */
+        cc.count_encoders = res.count_encoders < 32 ? res.count_encoders : 32;
+        cc.props_ptr = 0;
+        cc.prop_values_ptr = 0;
+        cc.count_props = 0;
+        if (drm_ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &cc) < 0) {
+            drm_dbg("k93ui: getconnector-modes %u: %s\n", con[i], strerror(errno));
+            continue;
+        }
+        mode = modes[0];                        /* first mode = preferred */
+        conn_id = con[i];
+        got = 1;
+    }
+    if (!got) {
+        drm_dbg("k93ui: no connected connector with modes\n");
+        close(fd);
+        return -1;
+    }
+
+    /* render buffer: 32bpp dumb buffer in the scanout size */
+    struct drm_mode_create_dumb cd = {
+        .width = (uint32_t)mode.hdisplay,
+        .height = (uint32_t)mode.vdisplay,
+        .bpp = 32,
+    };
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) { close(fd); return -1; }
+
+    struct drm_mode_fb_cmd fb = {
+        .width = cd.width, .height = cd.height,
+        .pitch = cd.pitch, .bpp = 32, .depth = 24, .handle = cd.handle,
+    };
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb) < 0) {
+        drm_dbg("k93ui: addfb: %s\n", strerror(errno));
+        struct drm_mode_destroy_dumb dd = { .handle = cd.handle };
+        drm_ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+        close(fd);
+        return -1;
+    }
+
+    struct drm_mode_map_dumb md = { .handle = cd.handle };
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
+        drm_dbg("k93ui: mapdumb: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    uint8_t *m = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, md.offset);
+    if (m == MAP_FAILED) {
+        drm_dbg("k93ui: mmap dumb: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    struct drm_mode_crtc crtc = {
+        .set_connectors_ptr = (uintptr_t)&conn_id,
+        .count_connectors = 1,
+        .crtc_id = crtc_id,
+        .fb_id = fb.fb_id,
+    };
+    crtc.mode_valid = 1;
+    memcpy(&crtc.mode, &mode, sizeof mode);
+    if (drm_ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc) < 0) {
+        drm_dbg("k93ui: setcrtc: %s\n", strerror(errno));
+        munmap(m, cd.size);
+        close(fd);
+        return -1;
+    }
+    drm_dbg("k93ui: DRM/KMS scanout %dx%d pitch=%u on crtc %u\n",
+            cd.width, cd.height, cd.pitch, crtc_id);
+    G.drmfb = fb.fb_id;
+
+    G.fbr = m; G.fblen = cd.size;
+    G.fbw = k93_xmalloc(cd.size);
+    memset(G.fbw, 0, cd.size);
+    G.fbfd = fd;
+    G.fbline = (int)cd.pitch;
+    G.fbbpp = 32;
+    G.fbw_px = (int)cd.width;
+    G.fbh_px = (int)cd.height;
+    G.cols = G.fbw_px / 8;
+    G.rows = G.fbh_px / 16;
+    G.backend = BACK_FB;
+    return 0;
+}
+
 static int open_console(void)
 {
     /* /dev/console follows the kernel's console= setting (serial when
@@ -428,7 +619,11 @@ int ui_init(const char *appname)
     /* serial-first: if we were started with a controlling serial console, keep
      * using stdin/stdout so QEMU's captured serial shows the UI. */
     int have_fb = 0;
-    if (!k93_cmdline_flag("notui_fb")) have_fb = (fb_open() == 0);
+    if (!k93_cmdline_flag("notui_fb")) {
+        have_fb = (fb_open() == 0);             /* classic fbdev, if the
+                                                 * kernel exposes /dev/fb0 */
+        if (!have_fb) have_fb = (drm_open() == 0); /* DRM/KMS dumb buffer */
+    }
 
     if (!have_fb) {
         G.backend = BACK_TEXT;

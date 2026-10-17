@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Interactive QEMU run: full boot to SpringBoard on the serial console.
 #   - serial is your terminal (type to the UI)
+#   - graphics: stdvga + bochs-drm (DRM/KMS), viewable with any VNC client at
+#     127.0.0.1:5900+K93_VNC_DISPLAY (default :77 -> port 5977)
 #   - quit QEMU with Ctrl-A then X
 #   - power off from the UI: SpringBoard > Settings > General > Shut Down
 set -euo pipefail
@@ -20,4 +22,6 @@ exec qemu-system-x86_64 \
     -initrd "$BUILD/initrd.cpio.gz" \
     -append "console=ttyS0,115200 loglevel=4" \
     -drive "file=$BUILD/hdd16.img,if=virtio,format=raw" \
-    -display none -serial mon:stdio -no-reboot
+    -vga std \
+    -display "vnc=127.0.0.1:${K93_VNC_DISPLAY:-77}" \
+    -serial mon:stdio -no-reboot

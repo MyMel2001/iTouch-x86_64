@@ -31,6 +31,24 @@ find "$ROOT/bin" -maxdepth 1 -type l | while read -r l; do ln -sfn busybox "$l";
 install -m 0755 "$GBIN/init"    "$ROOT/sbin/init"
 install -m 0755 "$GBIN/launchd" "$ROOT/sbin/launchd"
 ln -sfn sbin/init "$ROOT/init"      # kernel looks for /init inside an initramfs
+
+# graphics: QEMU DRM backends (kernel has DRM+fbdev emulation built in; the
+# device drivers are modules). virtio-gpu is the primary display in the test
+# VMs, bochs covers stdvga. Loaded by init when no KMS device appears.
+mkdir -p "$ROOT/lib/modules"
+for M in virtio_gpu:virtio-gpu bochs:bochs virtio_dma_buf:virtio_dma_buf; do
+    NAME="${M%%:*}"
+    KO="$(find /usr/lib/modules/*/kernel/drivers -name "${M##*:}.ko*" 2>/dev/null | head -1 || true)"
+    M="$NAME"
+    if [ -n "$KO" ]; then
+        case "$KO" in
+            *.xz)  xz -dc "$KO" > "$ROOT/lib/modules/$M.ko" ;;
+            *.zst) zstd -dc "$KO" > "$ROOT/lib/modules/$M.ko" ;;
+            *)     cp "$KO" "$ROOT/lib/modules/$M.ko" ;;
+        esac
+        chmod 0644 "$ROOT/lib/modules/$M.ko"
+    fi
+done
 for t in k93selfcheck k93dmgtool k93ipatool k93smc; do
     install -m 0755 "$GBIN/$t" "$ROOT/usr/bin/$t"
 done

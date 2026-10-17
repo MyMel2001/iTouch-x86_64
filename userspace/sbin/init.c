@@ -152,6 +152,29 @@ int main(void)
         }
     }
 
+    /* graphics bring-up: kernels without CONFIG_FB_DEVICE (e.g. Fedora's 7.2
+     * config) never create /dev/fb0; the UI then uses DRM/KMS through
+     * /dev/dri/card0. QEMU's DRM device drivers are modules - try virtio-gpu
+     * first (the test VMs' display), then bochs (stdvga). */
+    if (access("/dev/dri/card0", F_OK) != 0) {
+        const char *mods[] = { "/lib/modules/virtio_dma_buf.ko",   /* dep first */
+                                "/lib/modules/virtio_gpu.ko",
+                                "/lib/modules/bochs.ko", NULL };
+        for (int i = 0; mods[i] && access("/dev/dri/card0", F_OK) != 0; i++) {
+            if (access(mods[i], F_OK) != 0) continue;
+            char *insargv[] = { "/bin/busybox", "insmod", (char *)mods[i], NULL };
+            run_cmd(insargv);
+            for (int j = 0; j < 30 && access("/dev/dri/card0", F_OK) != 0; j++)
+                usleep(100000);
+        }
+    }
+    for (int i = 0; i < 150 && access("/dev/dri/card0", F_OK) != 0; i++)
+        usleep(100000);
+    k93_log("init", "graphics: %s",
+            access("/dev/dri/card0", F_OK) == 0
+                ? "DRM device ready (/dev/dri/card0)"
+                : "no display (serial text UI)");
+
     if (k93_cmdline_flag("autotest")) {
         /* skip UI services entirely in test mode */
         autotest();

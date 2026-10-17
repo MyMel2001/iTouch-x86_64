@@ -9,10 +9,20 @@
 #include "k93dmg.h"
 #include "k93app.h"
 #include "k93gpt.h"
+#include <linux/fb.h>
+#ifndef __user
+#define __user
+#endif
+#include <linux/drm.h>
+#include <linux/drm_mode.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static int fails = 0;
 
@@ -176,6 +186,71 @@ int main(int argc, char **argv)
             }
             close(gfd);
             unlink(gptfile);
+        }
+    }
+
+    /* --- framebuffer (graphics stack; skipped when headless) --- */
+    {
+        int fbf = open("/dev/fb0", O_RDWR);
+        if (fbf < 0) {
+            printf("skip - no /dev/fb0 (headless text VM)\n");
+        } else {
+            struct fb_fix_screeninfo fi;
+            struct fb_var_screeninfo vi;
+            chk(ioctl(fbf, FBIOGET_FSCREENINFO, &fi) == 0 &&
+                ioctl(fbf, FBIOGET_VSCREENINFO, &vi) == 0, "fb0 fixed+var info");
+            printf("info - fb0 %ux%ux%ubpp line=%u id=%s\n", vi.xres, vi.yres,
+                   vi.bits_per_pixel, fi.line_length, fi.id);
+            chk(vi.bits_per_pixel == 16 || vi.bits_per_pixel == 24 ||
+                vi.bits_per_pixel == 32, "fb0 pixel format supported by k93ui");
+            size_t flen = fi.smem_len ? fi.smem_len
+                                      : (size_t)fi.line_length * vi.yres_virtual;
+            uint8_t *fm = mmap(NULL, flen, PROT_READ | PROT_WRITE, MAP_SHARED, fbf, 0);
+            chk(fm != MAP_FAILED, "fb0 mmap");
+            if (fm != MAP_FAILED) {
+                /* checker write + readback proves the pixel path end-to-end */
+                for (unsigned y = 0; y < 32 && y < vi.yres; y++)
+                    memset(fm + (size_t)y * fi.line_length, (y & 1) ? 0xFF : 0x00,
+                           fi.line_length < 64 ? fi.line_length : 64);
+                volatile uint8_t v0 = fm[0];
+                volatile uint8_t v1 = fm[fi.line_length];
+                chk((v0 == 0x00 || v0 == 0xFF) && (v1 == 0x00 || v1 == 0xFF) && v0 != v1,
+                    "fb pattern write/readback");
+                munmap(fm, flen);
+            }
+            close(fbf);
+        }
+    }
+
+    /* --- DRM/KMS dumb buffer (graphics stack on kernels without fbdev) --- */
+    {
+        int drif = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+        if (drif < 0) {
+            printf("skip - no /dev/dri/card0 (no KMS device)\n");
+        } else {
+            struct drm_mode_create_dumb cd = { .width = 64, .height = 32, .bpp = 32 };
+            chk(ioctl(drif, DRM_IOCTL_MODE_CREATE_DUMB, &cd) == 0 && cd.handle != 0,
+                "kms dumb buffer create");
+            chk(cd.size >= (uint64_t)cd.pitch * 32, "kms dumb buffer geometry");
+            printf("info - kms dumb buffer %ux%u pitch=%u size=%llu\n", cd.width,
+                   cd.height, cd.pitch, (unsigned long long)cd.size);
+            struct drm_mode_map_dumb md = { .handle = cd.handle };
+            chk(ioctl(drif, DRM_IOCTL_MODE_MAP_DUMB, &md) == 0, "kms dumb buffer map");
+            uint8_t *dm = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, drif, md.offset);
+            chk(dm != MAP_FAILED, "kms dumb buffer mmap");
+            if (dm != MAP_FAILED) {
+                for (unsigned y = 0; y < 32; y++)
+                    memset(dm + (size_t)y * cd.pitch, (y & 1) ? 0xAA : 0x55,
+                           cd.pitch < 64 ? cd.pitch : 64);
+                volatile uint8_t d0 = dm[0];
+                volatile uint8_t d1 = dm[cd.pitch];
+                chk((d0 == 0x55 || d0 == 0xAA) && d1 != d0,
+                    "kms dumb buffer write/readback");
+                munmap(dm, cd.size);
+            }
+            struct drm_mode_destroy_dumb dd = { .handle = cd.handle };
+            ioctl(drif, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+            close(drif);
         }
     }
 

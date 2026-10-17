@@ -36,6 +36,18 @@ run gpt-file           sh -c '/usr/bin/k93selfcheck /opt/k93/fixtures | grep -q 
 run launchd-jobs       sh -c 'test -f /etc/launchd/com.k93.springboard.plist'
 run shell-present      sh -c '/bin/sh -c "echo busybox-ok" | grep -q busybox-ok'
 
+# graphics stack: fbdev (legacy) or DRM/KMS (modern kernels, no CONFIG_FB_DEVICE)
+if [ -e /dev/fb0 ]; then
+    step "framebuffer present: $(cat /sys/class/graphics/fb0/name 2>/dev/null)"
+    run fb-info         sh -c 'grep -q . /sys/class/graphics/fb0/bits_per_pixel'
+    run fb-draw-verify  sh -c '/usr/bin/k93selfcheck /opt/k93/fixtures | grep -q "fb pattern write/readback"'
+elif [ -e /dev/dri/card0 ]; then
+    step "DRM/KMS device present: $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
+    run kms-draw-verify sh -c '/usr/bin/k93selfcheck /opt/k93/fixtures | grep -q "kms dumb buffer write/readback"'
+else
+    step "no display device (headless text VM)"
+fi
+
 # block device present? (InstallToHD target; only when a second disk is attached)
 if [ -b /dev/vdb ]; then
     step "second disk /dev/vdb present - InstallToHD can target it"

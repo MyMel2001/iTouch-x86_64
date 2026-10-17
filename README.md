@@ -29,8 +29,12 @@ explanation (K93OS runs native x86_64 ELF only).
 * Modern CA store: `/etc/ssl/certs/ca-certificates.crt` copied from the
   host's maintained bundle at build time (the 2011-era roots in the
   original rootfs are not used)
-* Serial-console-first UI toolkit (framebuffer `/dev/fb0` when present,
-  ANSI text otherwise), evdev + tty input, embedded GPL font
+* Serial-console-first UI toolkit. Graphics stack is DRM/KMS (clean-room
+  client in `libk93/k93ui.c`): init waits for `/dev/dri/card0`, loads
+  `bochs-drm` (QEMU stdvga) or `virtio-gpu`, SpringBoard creates a dumb
+  buffer, maps it, sets a mode and notifies damage via `DIRTYFB`. ANSI
+  text console is the fallback when no KMS device appears. evdev + tty
+  input, embedded GPL font
 
 ## Layout
 

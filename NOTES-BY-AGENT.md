@@ -112,6 +112,12 @@ Formats: `.ipa` = ZIP (inflate + XML plist parse + optional CMS/sig check) and
   gamecenter, trustme, adsheet).
 * [x] ipa + dmg installers, root access, HTTP proxy settings, modern CA bundle.
 * [x] QEMU image + serial autotest — **AUTOTEST PASS** (2026-10-16).
+* [x] Graphics stack: DRM/KMS dumb-buffer backend in `libk93/k93ui.c`
+  (`/dev/fb0` unavailable on this kernel — `CONFIG_FB_DEVICE=n`); init waits
+  for `/dev/dri/card0` + loads `bochs-drm`; SpringBoard renders to a mapped
+  dumb buffer, damage via `DIRTYFB`. `make qemu-test` phase 2
+  (QMP screendump of the SpringBoard framebuffer) — **GRAPHICS TEST PASS**
+  (2026-10-17).
 * [x] README.md.
 
 ## 5. Build/validation log (2026-10-16/17)
@@ -150,3 +156,13 @@ Known ceilings (documented, not bugs):
   offline with `mke2fs -d`) is the installable OS disk artifact — a
   bootloader (grub/syslinux) would be needed for bare-metal boot.
 * REA Mach-O deep inspection needs macOS or Ghidra headless (see above).
+* Graphics stack is DRM/KMS, not fbdev: this kernel is built with
+  `CONFIG_FB_DEVICE=n` (`/dev/fb0` + `/sys/class/graphics/fb0` never exist —
+  the fbdev core keeps framebuffers kernel-internal, fbcon-only). The UI
+  therefore renders through `/dev/dri/card0` (clean-room KMS client in
+  `libk93/k93ui.c`): dumb buffer + `mmap` + `SETCRTC`, damage notified via
+  `DIRTYFB`. `bochs-drm` (QEMU stdvga) is the primary display;
+  `virtio-gpu-pci` also works (needs `virtio_dma_buf.ko` + `virtio_gpu.ko`).
+  Ceiling: single dumb buffer, no compositor, no GPU accel, no vsync/page
+  flip. Text-console fallback when no KMS device probes. Validated by a
+  QMP-screendump graphics test (SpringBoard rendered, `nonblack_px>500`).

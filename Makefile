@@ -43,6 +43,10 @@ $(UAPI)/.stamp:
 	@mkdir -p $(UAPI)
 	cp -r /usr/include/linux /usr/include/asm /usr/include/asm-generic $(UAPI)/
 	ln -sfn /usr/include/mtd $(UAPI)/mtd
+	# DRM/KMS uapi (Fedora's kernel-headers package omits it; vendor headers)
+	mkdir -p $(UAPI)/linux
+	cp $(TOP)/third_party/linux/include/uapi/drm/drm.h \
+	   $(TOP)/third_party/linux/include/uapi/drm/drm_mode.h $(UAPI)/linux/
 	@touch $@
 
 # ---------------------------------------------------------------- deps
