@@ -1,4 +1,7 @@
-/* K93OS AdSheet - renders local static ads from /var/k93/ads (webview stub). */
+/* K93OS AdSheet - renders local static ads from /var/k93/ads (webview stub).
+ * DELIBERATELY a stub: if an app developer wants ads, they pick and implement
+ * their own provider. This OS must not be the one controlling ad delivery -
+ * no network client ships here by design. */
 #include <k93ui.h>
 #include <k93util.h>
 #include <dirent.h>

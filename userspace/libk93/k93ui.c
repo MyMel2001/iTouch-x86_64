@@ -1390,7 +1390,10 @@ static int open_console(void)
 int ui_init(const char *appname)
 {
     signal(SIGPIPE, SIG_IGN);
-    k93_strlcpy(G.appname, appname ? appname : "K93OS", sizeof G.appname);
+    if (appname && *appname)
+        k93_strlcpy(G.appname, appname, sizeof G.appname);
+    else if (!G.appname[0])
+        k93_strlcpy(G.appname, "K93OS", sizeof G.appname);
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -1442,6 +1445,7 @@ void ui_shutdown(void)
     if (G.fbw) { free(G.fbw); G.fbw = NULL; }
     if (G.fbr) { munmap(G.fbr, G.fblen); G.fbr = NULL; }
     if (G.fbfd > 0) { close(G.fbfd); G.fbfd = -1; }
+    if (evfd >= 0) { close(evfd); evfd = -1; shift_down = 0; }
     if (infd > 2 && infd != G.outfd) close(infd);
     infd = 0;
     if (G.outfd > 2) close(G.outfd);

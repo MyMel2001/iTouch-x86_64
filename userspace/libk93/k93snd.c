@@ -106,3 +106,67 @@ void k93_snd_close(void)
 {
     if (snd_fd >= 0) { close(snd_fd); snd_fd = -1; }
 }
+
+/* --- capture (Camera.app): same negotiation on a pcmC*D*c node ---------- */
+
+static int cap_fd = -1;
+
+int k93_snd_cap_open(const char *pcmdev, int *rate, int *channels)
+{
+    if (cap_fd >= 0) return 0;
+    int fd = open(pcmdev ? pcmdev : "/dev/snd/pcmC0D0c",
+                  O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return -1;
+
+    struct snd_pcm_hw_params hp;
+    memset(&hp, 0, sizeof hp);
+    memset(hp.masks, 0xff, sizeof hp.masks);
+    for (size_t i = 0; i < sizeof hp.intervals / sizeof hp.intervals[0]; i++)
+        hp.intervals[i].max = ~0u;
+    hp.rmask = ~0u;
+    hp.info = ~0u;
+
+    hw_set_mask(&hp, SNDRV_PCM_HW_PARAM_ACCESS,
+                SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+    hw_set_mask(&hp, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+
+    struct snd_interval *iv;
+    iv = hw_interval(&hp, SNDRV_PCM_HW_PARAM_CHANNELS);
+    iv->min = iv->max = (channels && *channels > 0) ? (unsigned)*channels : 2;
+    iv->integer = 1;
+
+    iv = hw_interval(&hp, SNDRV_PCM_HW_PARAM_RATE);
+    iv->min = iv->max = (rate && *rate > 0) ? (unsigned)*rate : 44100;
+    iv->integer = 1;
+
+    if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) < 0) { close(fd); return -1; }
+
+    if (rate)
+        *rate = (int)hw_interval(&hp, SNDRV_PCM_HW_PARAM_RATE)->max;
+    if (channels)
+        *channels = (int)hw_interval(&hp, SNDRV_PCM_HW_PARAM_CHANNELS)->max;
+
+    if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE) < 0) { close(fd); return -1; }
+    cap_fd = fd;
+    return 0;
+}
+
+/* Read S16_LE interleaved frames without blocking the caller's UI loop:
+ * nonblocking fd, short reads are the caller's problem to pad. Returns the
+ * number of frames read, 0 on would-block, -1 on error. */
+ssize_t k93_snd_cap_read(void *s16le, size_t frames)
+{
+    if (cap_fd < 0) return -1;
+    struct snd_xferi x;
+    memset(&x, 0, sizeof x);
+    x.buf = s16le;
+    x.frames = frames;
+    if (ioctl(cap_fd, SNDRV_PCM_IOCTL_READI_FRAMES, &x) < 0)
+        return (errno == EAGAIN || errno == ESTRPIPE) ? 0 : -1;
+    return (ssize_t)x.frames;
+}
+
+void k93_snd_cap_close(void)
+{
+    if (cap_fd >= 0) { close(cap_fd); cap_fd = -1; }
+}

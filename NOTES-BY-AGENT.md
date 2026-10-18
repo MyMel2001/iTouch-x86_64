@@ -87,7 +87,7 @@ of the iOS 4.3.4 iPad *user experience* on Linux:
 | MobileStore / AppStore          | `apps/installer/` — **third-party .ipa sideloader** (App Store itself deliberately NOT ported) |
 | MobileNotes, MobileCal, Contacts| `apps/notes`, `apps/calendar`, `apps/contacts` |
 | MobileMusicPlayer, MobileSlideShow, Photo Booth | `apps/music`, `apps/photos` |
-| Camera                          | `apps/camera` (no capture hw in VM → documented stub) |
+| Camera                          | `apps/camera` (V4L2 YUYV capture, zoom/AF/snapshot/AVI video+audio; synthetic test pattern when no `/dev/video*`) |
 | FieldTest, iOS Diagnostics, TrustMe | `apps/diagnostics` (root shell / sysinfo) |
 | hdiutil/InstallToHD             | `apps/installtohd` (format drive + install OS, 1 GiB swap, rest rootfs) |
 | lockdown / MobileStorageMounter | `userspace/mounter.c` (mounts .dmg/.ipa, block devices) |
@@ -350,3 +350,42 @@ without touching the serial paths that autotest greps.
   SDK (`k93sdk new` template) and `touchdova new` scaffolds build
   against the new toolkit; touchdova pages get the GUI document skin
   via `ui_textview` with no app-side change.
+
+## 7. Real apps pass (2026-10-17)
+
+Goal: turn the Maps/YouTube/Camera/Photos stubs into real apps while
+keeping AdSheet provider-neutral.
+
+* `k93_app_open_url()` (`libk93/k93app.c`): fork/execl `com.k93.safari`
+  with the URL, waitpid, re-init. It does `ui_shutdown()` before the
+  fork and `ui_init(NULL)` after — the display/input must be released
+  by the caller or Safari's `drmSetMaster`/fb0 open fails and it renders
+  blind (validated live: without the dance, Safari gets
+  "setmaster: Resource busy" and never becomes visible).
+  `ui_init(NULL)` now keeps the previous app name, so the caller's next
+  draw shows its own statusbar title again.
+* Safari handoff: `if (argc > 1) browse(url)` before the address loop.
+  Redirects were dead (headers were stripped before the `Location:`
+  branch could see them) — `http_get` now saves `Location:` into
+  `http_location` and `browse_d(url, depth)` follows it with a depth-8
+  guard. Verified live: `maps.google.com` -> 302 -> `www.google.com/maps`
+  renders its no-JS text; `yewtu.be/trending` fetched and linked.
+* Maps menu: "Google Maps (web)", "Custom map URL…", "Offline tiles
+  (local)" info. YouTube menu: Browse/Trending/Search/Change
+  instance/About, instance from `/etc/k93/youtube.conf`
+  (`INSTANCE=`, default `https://yewtu.be`) — all server-rendered HTML
+  through Safari (ceiling: no JS engine, no in-app video decode).
+* Camera: V4L2 mmap streaming, YUYV-only (MJPEG rejected, documented),
+  digital zoom 1/2/4/8 (crop + nearest), AF via `V4L2_CID_FOCUS_AUTO`,
+  `C` cycles cameras, ENTER snapshots PPM to `/var/mobile/Media/Photos`,
+  `R` records AVI (YUY2 video + ALSA PCM capture in a hand-written
+  RIFF, in-memory idx1, fps patched on close); labeled synthetic
+  640x480 test pattern when no `/dev/video*` so the test VM exercises
+  the full UI/recording path. `k93_snd_cap_open/read/close` added to
+  `k93snd.c` (raw UAPI on `/dev/snd/pcmC0D0c`); video-only fallback.
+* Photos: half-block BMP renderer replaced by `show_generic()` —
+  BMP 24/32 + PPM P6 decode to RGBA, aspect-fit `ui_blit` with
+  letterbox; `describe()` fallback on the text console.
+* Input note: `ui_shutdown()` now closes the evdev fd (it leaked across
+  SpringBoard launches). SpringBoard's `esc` = quit is pre-existing —
+  one key per step with screendumps between when driving via QMP.

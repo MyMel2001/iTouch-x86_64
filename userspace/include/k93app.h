@@ -19,6 +19,8 @@ typedef struct {
 int  k93_app_scan(k93_app *out, int max);
 /* fork/exec the app in the foreground; returns child exit status */
 int  k93_app_launch(const k93_app *a);
+/* open a URL in the system browser (Safari), foreground; -1 if missing */
+int  k93_app_open_url(const char *url);
 /* install a .ipa (K93-compatible zip bundle) into /Applications; 0 on success */
 int  k93_app_install_ipa(const char *ipapath, char *err, size_t errlen);
 /* install a .deb (extract payload into / via busybox dpkg-deb); 0 on success */

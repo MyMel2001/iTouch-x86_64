@@ -35,6 +35,7 @@ struct url { char scheme[8]; char host[256]; int port; char path[1024]; };
 
 static size_t http_body_len;             /* body bytes of last http_get
                                             (binary bodies may contain NUL) */
+static char http_location[1280];         /* Location header of last http_get */
 
 static struct {
     char proxy_host[128];
@@ -272,6 +273,7 @@ static char *http_get(struct conn *c, const struct url *u, int *status, char *er
 {
     char req[2048];
     int n;
+    http_location[0] = 0;
     if (B.proxy_enable && B.proxy_host[0] && !strcmp(u->scheme, "http")) {
         n = snprintf(req, sizeof req,
                      "GET %s://%s:%d%s HTTP/1.0\r\n"
@@ -316,6 +318,14 @@ static char *http_get(struct conn *c, const struct url *u, int *status, char *er
             char *e = strstr(h, "\r\n");
             if (!e) break;
             if (!strncasecmp(h, "Transfer-Encoding:", 18) && strstr(h, "chunked")) chunked = 1;
+            if (!strncasecmp(h, "Location:", 9)) {
+                char *s = h + 9;
+                while (*s == ' ' || *s == '\t') s++;
+                size_t ln = (size_t)(e - s);
+                if (ln >= sizeof http_location) ln = sizeof http_location - 1;
+                memcpy(http_location, s, ln);
+                http_location[ln] = 0;
+            }
             h = e + 2;
         }
         memmove(buf, hdr_end + 4, len - hdr_len);
@@ -471,7 +481,9 @@ static char *html_to_text(const char *html, char *title_out, size_t titlecap)
 
 /* ---------------------------------------------------------------- app */
 
-static int browse(const char *url_in)
+static int browse(const char *url_in);
+
+static int browse_d(const char *url_in, int depth)
 {
     struct url u;
     char url[1280];
@@ -506,23 +518,18 @@ static int browse(const char *url_in)
         ui_msgbox("Safari", m);
         return -1;
     }
-    if (status >= 300 && status < 400) {
-        /* naive redirect support */
-        char *loc = strstr(raw, "\nLocation: ");
-        if (!loc) loc = strstr(raw, "\nlocation: ");
-        if (loc) {
-            char target[1280];
-            char *s = loc + 11;
-            char *e = strstr(s, "\r\n");
-            size_t n = e ? (size_t)(e - s) : strlen(s);
-            if (n >= sizeof target) n = sizeof target - 1;
-            memcpy(target, s, n);
-            target[n] = 0;
+    if (status >= 300 && status < 400 && http_location[0]) {
+        /* naive redirect support (Location captured by http_get before the
+         * header block is stripped) */
+        if (depth >= 8) {
             free(raw);
-            char abs[1280];
-            url_absolutize(url, target, abs, sizeof abs);
-            return browse(abs);
+            ui_msgbox("Safari", "Too many redirects");
+            return -1;
         }
+        char abs[1280];
+        url_absolutize(url, http_location, abs, sizeof abs);
+        free(raw);
+        return browse_d(abs, depth + 1);
     }
     if (status >= 400) {
         char m[128];
@@ -594,6 +601,8 @@ static int browse(const char *url_in)
     return 0;
 }
 
+static int browse(const char *url_in) { return browse_d(url_in, 0); }
+
 int main(int argc, char **argv)
 {
     if (ui_init("Safari") < 0) return 1;
@@ -616,6 +625,10 @@ int main(int argc, char **argv)
             B.proxy_enable = 1;
         }
     }
+
+    /* app-to-app handoff (Maps/YouTube pass a URL): browse it right away,
+     * then fall into the address loop so the user can continue or Esc */
+    if (argc > 1) browse(url);
 
     for (;;) {
         if (ui_input("Address (URL)", url, sizeof url) != 0) break;

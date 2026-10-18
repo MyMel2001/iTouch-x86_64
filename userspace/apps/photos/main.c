@@ -1,6 +1,7 @@
 /* Photos.app - clean-room counterpart of MobileSlideShow.app / Photo Booth.
- * Browses /var/mobile/Media/Photos and renders BMP (24/32bpp) and PPM images
- * on the framebuffer. On the text console it shows image facts instead. */
+ * Browses /var/mobile/Media/Photos and renders BMP (24/32bpp) and PPM (P6)
+ * images as pixels on the graphical backend (DRM dumb-buffer or fb0, whichever
+ * ui_init picked), aspect-fit. On the text console it shows image facts. */
 #define _GNU_SOURCE
 #include "k93ui.h"
 #include "k93util.h"
@@ -29,11 +30,11 @@ static void describe(const char *path)
         uint32_t w = rd32(d + 18), h = rd32(d + 22);
         uint16_t bpp = rd16(d + 28);
         snprintf(body, sizeof body, "BMP image\n%ux%u, %u bpp\n%zu bytes\n\n"
-                 "(framebuffer not available; graphics preview needs /dev/fb0)",
+                 "(text console: no pixel preview here)",
                  w, h, bpp, l);
     } else if (l > 2 && d[0] == 'P' && (d[1] == '6' || d[1] == '3')) {
         snprintf(body, sizeof body, "PPM image\n%zu bytes\n\n"
-                 "(framebuffer not available; graphics preview needs /dev/fb0)", l);
+                 "(text console: no pixel preview here)", l);
     } else {
         snprintf(body, sizeof body, "Unknown format (%zu bytes)", l);
     }
@@ -41,54 +42,105 @@ static void describe(const char *path)
     ui_textview(strrchr(path, '/') ? strrchr(path, '/') + 1 : path, body);
 }
 
-static void show_bmp(const char *path)
+/* ---- pixel preview: decode BMP(24/32) or PPM(P6) to RGBA, aspect-fit ---- */
+/* returns 1 on success. Fits the decoded image into the pixel canvas,
+ * preserving aspect (letterboxed), nearest-neighbour downscale. */
+static int show_generic(const char *path)
 {
     size_t l = 0;
     uint8_t *d = (uint8_t *)k93_read_file(path, &l);
-    if (!d || l < 54 || memcmp(d, "BM", 2)) { free(d); describe(path); return; }
-    uint32_t off = rd32(d + 10);
-    int32_t w = (int32_t)rd32(d + 18);
-    int32_t h = (int32_t)rd32(d + 22);
-    uint16_t bpp = rd16(d + 28);
-    uint32_t comp = rd32(d + 30);
-    if (comp != 0 || (bpp != 24 && bpp != 32) || w <= 0 || h == 0) {
-        free(d);
-        describe(path);
-        return;
-    }
-    int flip = h > 0;
-    if (h < 0) h = -h;
-    uint32_t stride = ((uint32_t)w * (bpp / 8) + 3) & ~3u;
-    if (off + (uint64_t)stride * (uint32_t)h > l) { free(d); describe(path); return; }
-    /* naive nearest-neighbour fit into the console cell grid (8x16 cells) */
-    int cols = ui_width(), rows = ui_height() - 3;
-    ui_clear();
-    ui_statusbar("Photos");
-    /* build a downscaled greyscale map, then draw with half-block characters */
-    int cw = cols, ch = (rows - 1) * 2;
-    if (cw > w) cw = w;
-    if (ch > h) ch = h;
-    for (int cy = 0; cy < rows - 1; cy++) {
-        for (int cx = 0; cx < cols; cx++) {
-            int x0 = cx * w / cols, y0 = (cy * 2) * h / (rows - 1) / 2 * 2;
-            int y1 = (cy * 2 + 1) * h / ((rows - 1) * 2);
-            if (y0 >= h) y0 = h - 1;
-            if (y1 >= h) y1 = h - 1;
-            uint32_t row0 = (uint32_t)y0 * stride, row1 = (uint32_t)y1 * stride;
-            const uint8_t *p0 = d + off + row0 + (uint32_t)x0 * (bpp / 8);
-            const uint8_t *p1 = d + off + row1 + (uint32_t)x0 * (bpp / 8);
-            int g0 = p0[2] * 3 + p0[1] * 6 + p0[0];
-            int g1 = p1[2] * 3 + p1[1] * 6 + p1[0];
-            const char *set = " .:-=+*#%@";
-            char cell[3] = { set[g0 / 300], set[g1 / 300], 0 };
-            if (cell[0] == ' ') cell[0] = '.';
-            ui_puts(cx, cy + 1, cell);
+    if (!d) return 0;
+
+    /* decode -> (w,h,src RGB24 rows top-down) */
+    int w = 0, h = 0;
+    uint8_t *rgb = NULL;                 /* w*h*3 */
+    if (l > 54 && !memcmp(d, "BM", 2)) {
+        uint32_t off = rd32(d + 10);
+        int32_t bw = (int32_t)rd32(d + 18);
+        int32_t bh = (int32_t)rd32(d + 22);
+        uint16_t bpp = rd16(d + 28);
+        uint32_t comp = rd32(d + 30);
+        if (comp == 0 && (bpp == 24 || bpp == 32) && bw > 0 && bh != 0) {
+            int flip = bh > 0;
+            if (bh < 0) bh = -bh;
+            uint32_t stride = ((uint32_t)bw * (bpp / 8) + 3) & ~3u;
+            if (off + (uint64_t)stride * (uint32_t)bh <= l) {
+                w = bw; h = bh;
+                rgb = malloc((size_t)w * h * 3);
+                if (rgb) {
+                    for (int y = 0; y < h; y++) {
+                        int sy = flip ? (h - 1 - y) : y;
+                        const uint8_t *src = d + off + (uint32_t)sy * stride;
+                        uint8_t *dst = rgb + (size_t)y * w * 3;
+                        for (int x = 0; x < w; x++) {
+                            const uint8_t *p = src + (uint32_t)x * (bpp / 8);
+                            dst[x * 3] = p[2];           /* R (BMP is BGRA) */
+                            dst[x * 3 + 1] = p[1];
+                            dst[x * 3 + 2] = p[0];
+                        }
+                    }
+                }
+            }
+        }
+    } else if (l > 2 && d[0] == 'P' && d[1] == '6') {
+        /* header: "P6\n<w> <h>\n<max>\n" then binary RGB */
+        const uint8_t *p = d + 2;
+        const uint8_t *end = d + l;
+        long vals[3];
+        int got = 0;
+        while (p < end && got < 3) {                 /* skip ws, read 3 ints */
+            while (p < end && (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r')) p++;
+            if (p < end && *p == '#') { while (p < end && *p != '\n') p++; continue; }
+            if (p >= end || *p < '0' || *p > '9') break;
+            long v = 0;
+            while (p < end && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+            vals[got++] = v;
+        }
+        while (p < end && (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r')) p++;
+        if (got == 3 && vals[0] > 0 && vals[1] > 0 && vals[2] == 255) {
+            w = (int)vals[0]; h = (int)vals[1];
+            size_t need = (size_t)w * h * 3;
+            if ((size_t)(end - p) >= need) {
+                rgb = malloc(need);
+                if (rgb) memcpy(rgb, p, need);
+            } else { w = h = 0; }
         }
     }
-    ui_statusmsg("Esc back");
-    ui_flush();
-    while (ui_getkey(250) == UI_KEY_NONE) ;
     free(d);
+    if (!rgb || w <= 0 || h <= 0) { free(rgb); return 0; }
+
+    /* aspect-fit into the pixel canvas (leave the status + hint bars) */
+    int CW = ui_px_width(), CH = ui_px_height() - 20 - 24;
+    int dw = CW, dh = (int)((long)CW * h / w);
+    if (dh > CH) { dh = CH; dw = (int)((long)CH * w / h); }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    uint32_t *fb = malloc((size_t)dw * dh * 4);
+    if (!fb) { free(rgb); return 0; }
+    for (int y = 0; y < dh; y++) {
+        int sy = (int)((long)y * h / dh);
+        const uint8_t *src = rgb + (size_t)sy * w * 3;
+        uint32_t *dst = fb + (size_t)y * dw;
+        for (int x = 0; x < dw; x++) {
+            int sx = (int)((long)x * w / dw);
+            const uint8_t *q = src + (size_t)sx * 3;
+            dst[x] = 0xFF000000u | ((uint32_t)q[0] << 16) |
+                     ((uint32_t)q[1] << 8) | q[2];
+        }
+    }
+    free(rgb);
+
+    ui_clear();
+    ui_statusbar("Photos");
+    ui_fill(0, 20, CW, CH, ui_rgb(0x10, 0x14, 0x1C));
+    ui_blit((CW - dw) / 2, 20 + (CH - dh) / 2, dw, dh, fb);
+    char cap[160];
+    snprintf(cap, sizeof cap, "%s  %dx%d", strrchr(path, '/') + 1, w, h);
+    ui_statusmsg(cap);
+    ui_flush();
+    free(fb);
+    while (ui_getkey(250) == UI_KEY_NONE) ;
+    return 1;
 }
 
 int main(void)
@@ -114,8 +166,7 @@ int main(void)
         if (sel < 0 || sel == n) break;
         char path[256];
         snprintf(path, sizeof path, "%s/%s", DIRN, names[sel]);
-        if (ui_is_graphical()) show_bmp(path);
-        else describe(path);
+        if (!show_generic(path)) describe(path);
     }
     ui_shutdown();
     return 0;

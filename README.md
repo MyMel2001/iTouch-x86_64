@@ -200,8 +200,18 @@ console keeps the plain look, so headless autotests are unchanged):
 * No code-signing exists at all (not as a check to bypass — as a design
   choice; see Settings > Root Access).
 * touchdova: no JavaScript engine (static HTML + `k93://` bridge only).
-* Camera/YouTube/Maps/AdSheet are honest local-content stubs (no capture
-  hardware / no tracking clients by design).
+* Maps/YouTube are web handoffs: they open `maps.google.com` / a user-set
+  Invidious instance in Safari, which is a server-rendered HTML text
+  browser — JS-only pages render as their no-JS fallback text (Google
+  Maps' "enable JavaScript" notice), and instance availability (bot
+  challenges, downtime) is up to the remote server.
+* Camera: V4L2 capture is YUYV-only (no MJPEG decode), digital zoom only
+  (crop + nearest-neighbour), autofocus only when the device exposes
+  `V4L2_CID_FOCUS_AUTO`; no `/dev/video*` present (the test VM) →
+  synthetic labeled test pattern, still recordable to AVI. Photos renders
+  BMP (24/32bpp) + PPM only; other formats show as describe-only text.
+* AdSheet remains a provider-neutral stub by design — app developers pick
+  their own ad provider; we do not ship a tracking client.
 
 ## Legal
 

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "k93app.h"
 #include "k93util.h"
+#include "k93ui.h"
 #include "k93plist.h"
 #include "k93zip.h"
 #include <stdint.h>
@@ -93,6 +94,34 @@ int k93_app_launch(const k93_app *a)
     }
     int status = 0;
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) ;
+    return status;
+}
+
+/* open a URL in the system browser (Safari) in the foreground; the one
+ * app-to-app handoff other apps use (Maps, YouTube). Returns the child
+ * exit status, or -1 when Safari is not installed. */
+int k93_app_open_url(const char *url)
+{
+    static k93_app apps[64];
+    int n = k93_app_scan(apps, 64);
+    const k93_app *safari = NULL;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(apps[i].ident, "com.k93.safari")) { safari = &apps[i]; break; }
+    if (!safari || !safari->exe[0]) return -1;
+    /* release display + input so Safari can own them (same dance SpringBoard
+     * does around k93_app_launch); reacquire after it exits */
+    ui_shutdown();
+    pid_t pid = fork();
+    if (pid < 0) { ui_init(NULL); return -1; }
+    if (pid == 0) {
+        setsid();
+        execl(safari->exe, safari->exe, url, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) ;
+    ui_init(NULL);                       /* caller's next draw restores its
+                                            title (ui_init(NULL) keeps it) */
     return status;
 }
 
