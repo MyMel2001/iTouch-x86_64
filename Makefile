@@ -16,9 +16,12 @@ LDFLAGS := -static
 
 ZDIR    := $(TOP)/third_party/_build/zlib
 MDIR    := $(TOP)/third_party/_build/mbedtls
+QDIR    := $(TOP)/third_party/_build/quickjs
+QJSA    := $(QDIR)/libquickjs.a
+SDIR    := $(TOP)/third_party/_build/stb
 ZLIBA   := $(ZDIR)/libz.a
 MBEDLIB := $(MDIR)/build/library
-CFLAGS  += -I$(ZDIR) -I$(MDIR)/include
+CFLAGS  += -I$(ZDIR) -I$(MDIR)/include -I$(QDIR)/quickjs-2025-04-26 -I$(SDIR)
 LDLIBS_Z := $(ZLIBA)
 LDLIBS_TLS := $(MBEDLIB)/libmbedtls.a $(MBEDLIB)/libmbedx509.a $(MBEDLIB)/libmbedcrypto.a
 
@@ -52,7 +55,7 @@ $(UAPI)/.stamp:
 	@touch $@
 
 # ---------------------------------------------------------------- deps
-deps: $(ZLIBA) $(MBEDLIB)/libmbedtls.a
+deps: $(ZLIBA) $(MBEDLIB)/libmbedtls.a $(QJSA) $(SDIR)/stb_image.h
 
 $(ZLIBA):
 	@echo ">> building zlib (static, musl)"
@@ -61,6 +64,14 @@ $(ZLIBA):
 $(MBEDLIB)/libmbedtls.a:
 	@echo ">> building mbedTLS (static, musl)"
 	@bash $(TOP)/scripts/build-deps.sh mbedtls
+
+$(QJSA):
+	@echo ">> building QuickJS (static, musl)"
+	@bash $(TOP)/scripts/build-deps.sh quickjs
+
+$(SDIR)/stb_image.h:
+	@echo ">> fetching stb_image.h"
+	@bash $(TOP)/scripts/build-deps.sh stb
 
 # ---------------------------------------------------------------- objects
 $(GEN)/font8x16.c: $(TOP)/tools/genfont.py $(TOP)/third_party/linux/lib/fonts/font_8x16.c
@@ -117,10 +128,14 @@ $(GBIN)/k93smc: $(TOP)/userspace/tools/smc.c $(LIBK93)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS)
 
-$(GBIN)/safari: LDLIBS_EXTRA := $(LDLIBS_TLS)
-$(GBIN)/safari: $(TOP)/userspace/apps/safari/main.c $(LIBK93) $(LDLIBS_TLS)
+SAFARI_SRC := $(TOP)/userspace/apps/safari/main.c \
+              $(TOP)/userspace/apps/safari/render.c \
+              $(TOP)/userspace/apps/safari/js.c \
+              $(TOP)/userspace/apps/safari/stbi.c
+$(GBIN)/safari: $(SAFARI_SRC) $(LIBK93) $(LDLIBS_TLS) $(QJSA) $(SDIR)/stb_image.h
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS) $(LDLIBS_Z) $(LDLIBS_TLS)
+	$(CC) $(CFLAGS) -o $@ $(SAFARI_SRC) $(LIBK93) $(LDFLAGS) \
+	    $(LDLIBS_Z) $(LDLIBS_TLS) $(QJSA) -lm
 
 # ---------------------------------------------------------------- fixtures/test
 fixtures:

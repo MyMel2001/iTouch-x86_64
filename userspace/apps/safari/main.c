@@ -1,11 +1,16 @@
-/* Safari.app - minimal web browser (clean-room).
+/* Safari.app - web browser (clean-room).
  * iOS 4.3.4 shipped MobileSafari (WebKit). This OS cannot reuse WebKit (ARM,
- * and not clean-room), so Safari here is a small HTTP/HTTPS text browser:
+ * and not clean-room), so Safari here is a small hand-written engine:
  *   - HTTP/1.0 + chunked decoding, HTTPS via mbedTLS with the modern CA store
  *   - honors the HTTP proxy configured in Settings (/etc/k93/proxy.conf)
- *   - renders HTML as readable text, keeps a link list you can follow
- * Ceiling: no JavaScript, no CSS, no images. Text-first web. */
+ *   - HTML tree parser + CSS subset (libk93 k93html), styled line renderer
+ *     with inline links and <img> (stb_image) in k93ui's ui_pageview
+ *   - JavaScript via QuickJS (MIT, vendored): DOM bindings, timers, fetch,
+ *     XHR, events
+ * Ceiling: no canvas/WebGL, no SVG, no frames; ASCII glyphs only; images
+ * fetched synchronously when a page renders. */
 #define _GNU_SOURCE
+#include "safari.h"
 #include "k93ui.h"
 #include "k93util.h"
 #include "k93app.h"
@@ -28,10 +33,7 @@
 #include <mbedtls/error.h>
 
 #define CACERT "/etc/ssl/certs/ca-certificates.crt"
-#define MAXLINKS 64
-#define MAXPAGE (512 * 1024)
-
-struct url { char scheme[8]; char host[256]; int port; char path[1024]; };
+#define MAXPAGE (8 * 1024 * 1024)
 
 static size_t http_body_len;             /* body bytes of last http_get
                                             (binary bodies may contain NUL) */
@@ -41,10 +43,7 @@ static struct {
     char proxy_host[128];
     int proxy_port;
     int proxy_enable;
-    char base[1280];                   /* absolute base for relative links */
-    char links[MAXLINKS][1280];
-    char linktext[MAXLINKS][80];
-    int nlinks;
+    char base[1280];                     /* absolute base for relative links */
 } B;
 
 static void proxy_load(void)
@@ -65,52 +64,59 @@ static void proxy_load(void)
     free(c);
 }
 
-static int url_parse(const char *s, struct url *u)
+/* ------------------------------------------------------------------- urls */
+
+int url_parse(const char *s, struct url *u)
 {
     memset(u, 0, sizeof *u);
-    const char *p = strstr(s, "://");
-    if (p) {
-        size_t n = (size_t)(p - s);
-        if (n >= sizeof u->scheme) return -1;
-        memcpy(u->scheme, s, n);
-        u->scheme[n] = 0;
-        p += 3;
-    } else {
-        k93_strlcpy(u->scheme, "http", sizeof u->scheme);
-        p = s;
-    }
-    /* host[:port][/path] */
+    const char *p = s;
+    if (!strncmp(p, "http://", 7)) { k93_strlcpy(u->scheme, "http", sizeof u->scheme); p += 7; u->port = 80; }
+    else if (!strncmp(p, "https://", 8)) { k93_strlcpy(u->scheme, "https", sizeof u->scheme); p += 8; u->port = 443; }
+    else return -1;
     const char *slash = strchr(p, '/');
-    const char *colon = strchr(p, ':');
+    const char *colon = NULL;
+    if (slash) colon = memchr(p, ':', (size_t)(slash - p));
+    else colon = strchr(p, ':');
     if (colon && (!slash || colon < slash)) {
-        size_t hn = (size_t)(colon - p);
-        if (hn >= sizeof u->host) return -1;
-        memcpy(u->host, p, hn);
-        u->host[hn] = 0;
+        size_t hl = (size_t)(colon - p);
+        if (hl >= sizeof u->host) hl = sizeof u->host - 1;
+        memcpy(u->host, p, hl);
+        u->host[hl] = 0;
         u->port = atoi(colon + 1);
+        if (u->port <= 0 || u->port > 65535) return -1;
     } else {
-        size_t hn = slash ? (size_t)(slash - p) : strlen(p);
-        if (hn >= sizeof u->host) return -1;
-        memcpy(u->host, p, hn);
-        u->host[hn] = 0;
-        u->port = 0;
+        size_t hl = slash ? (size_t)(slash - p) : strlen(p);
+        if (hl >= sizeof u->host) hl = sizeof u->host - 1;
+        memcpy(u->host, p, hl);
+        u->host[hl] = 0;
     }
-    if (!u->port) u->port = strcmp(u->scheme, "https") ? 80 : 443;
+    if (!u->host[0]) return -1;
     if (slash) k93_strlcpy(u->path, slash, sizeof u->path);
     else k93_strlcpy(u->path, "/", sizeof u->path);
-    return u->host[0] ? 0 : -1;
+    return 0;
 }
 
-static void url_absolutize(const char *base, const char *rel, char *out, size_t cap)
+void url_absolutize(const char *base, const char *rel, char *out, size_t cap)
 {
+    while (*rel == ' ') rel++;
     if (!strncmp(rel, "http://", 7) || !strncmp(rel, "https://", 8)) {
+        k93_strlcpy(out, rel, cap);
+        return;
+    }
+    if (!strncmp(rel, "javascript:", 11) || !strncmp(rel, "mailto:", 7) ||
+        !strncmp(rel, "data:", 5)) {
         k93_strlcpy(out, rel, cap);
         return;
     }
     struct url b;
     if (url_parse(base, &b) < 0) { k93_strlcpy(out, rel, cap); return; }
+    char org[320];                        /* origin: scheme://host[:port] */
+    int defport = (!strcmp(b.scheme, "http") && b.port == 80) ||
+                  (!strcmp(b.scheme, "https") && b.port == 443);
+    if (defport) snprintf(org, sizeof org, "%s://%s", b.scheme, b.host);
+    else snprintf(org, sizeof org, "%s://%s:%d", b.scheme, b.host, b.port);
     if (rel[0] == '/') {
-        snprintf(out, cap, "%s://%s%s", b.scheme, b.host, rel);
+        snprintf(out, cap, "%s%s", org, rel);
         return;
     }
     /* relative to current directory */
@@ -119,7 +125,7 @@ static void url_absolutize(const char *base, const char *rel, char *out, size_t 
     char *slash = strrchr(dir, '/');
     if (slash) slash[1] = 0;
     else k93_strlcpy(dir, "/", sizeof dir);
-    snprintf(out, cap, "%s://%s%s%s", b.scheme, b.host, dir, rel);
+    snprintf(out, cap, "%s%s%s", org, dir, rel);
 }
 
 /* ---------------------------------------------------------------- transport */
@@ -277,13 +283,13 @@ static char *http_get(struct conn *c, const struct url *u, int *status, char *er
     if (B.proxy_enable && B.proxy_host[0] && !strcmp(u->scheme, "http")) {
         n = snprintf(req, sizeof req,
                      "GET %s://%s:%d%s HTTP/1.0\r\n"
-                     "Host: %s\r\nUser-Agent: K93Safari/1.0 (clean-room)\r\n"
+                     "Host: %s\r\nUser-Agent: K93Safari/2.0 (clean-room)\r\n"
                      "Accept: text/html,*/*\r\nConnection: close\r\n\r\n",
                      u->scheme, u->host, u->port, u->path, u->host);
     } else {
         n = snprintf(req, sizeof req,
                      "GET %s HTTP/1.0\r\n"
-                     "Host: %s\r\nUser-Agent: K93Safari/1.0 (clean-room)\r\n"
+                     "Host: %s\r\nUser-Agent: K93Safari/2.0 (clean-room)\r\n"
                      "Accept: text/html,*/*\r\nConnection: close\r\n\r\n",
                      u->path, u->host);
     }
@@ -360,123 +366,93 @@ static char *http_get(struct conn *c, const struct url *u, int *status, char *er
     return buf;
 }
 
-/* ---------------------------------------------------------------- html->text */
-
-static void decode_entities_inplace(char *s)
+/* sf_fetch: GET url, follow redirects (capped), body + length */
+char *sf_fetch(const char *url, int *status, char *err, size_t errlen)
 {
-    for (char *p = s; *p; p++) {
-        if (*p != '&') continue;
-        if (!strncmp(p, "&amp;", 5)) { memmove(p, p + 4, strlen(p + 4) + 1); }
-        else if (!strncmp(p, "&lt;", 4)) { memmove(p, p + 3, strlen(p + 3) + 1); }
-        else if (!strncmp(p, "&gt;", 4)) { memmove(p, p + 3, strlen(p + 3) + 1); }
-        else if (!strncmp(p, "&nbsp;", 6)) { memmove(p, p + 5, strlen(p + 5) + 1); }
-        else if (!strncmp(p, "&quot;", 6)) { *p = '"'; memmove(p + 1, p + 6, strlen(p + 6) + 1); }
+    static int depth;
+    struct url u;
+    *status = 0;
+    if (url_parse(url, &u) < 0) {
+        snprintf(err, errlen, "bad url");
+        return NULL;
     }
+    struct conn c;
+    if (conn_open(&c, &u) < 0) {
+        snprintf(err, errlen, "cannot connect");
+        return NULL;
+    }
+    char *raw = http_get(&c, &u, status, err, errlen);
+    conn_close(&c);
+    if (raw && *status >= 300 && *status < 400 && http_location[0] && depth < 8) {
+        char abs[1280];
+        url_absolutize(url, http_location, abs, sizeof abs);
+        free(raw);
+        depth++;
+        raw = sf_fetch(abs, status, err, errlen);
+        depth--;
+        return raw;
+    }
+    return raw;
 }
 
-static char *html_to_text(const char *html, char *title_out, size_t titlecap)
+size_t sf_fetch_len(void) { return http_body_len; }
+
+/* ---------------------------------------------------------------- render */
+
+static int pview_tick(ui_page *pgv, void *vpg)
 {
-    size_t cap = strlen(html) + 1;
-    char *out = k93_xmalloc(cap);
+    (void)pgv;
+    sf_page *p = vpg;
+    if (js_nav_url()) return 2;          /* close view; browse loop navigates */
+    if (js_tick()) {                     /* DOM changed: rebuild + redraw */
+        sf_render(p, p->doc);
+        return 1;
+    }
+    return 0;
+}
+
+/* non-HTML payload -> <pre> document */
+static k93node *doc_from_text(const char *s)
+{
+    size_t cap = strlen(s) * 6 + 32;
+    char *esc = k93_xmalloc(cap);
     size_t o = 0;
-    int skip = 0;                       /* inside script/style */
-    B.nlinks = 0;
-    const char *p = html;
-
-    /* title */
-    if (title_out && titlecap) {
-        title_out[0] = 0;
-        const char *t = strcasestr(html, "<title");
-        if (t) {
-            t = strchr(t, '>');
-            if (t) {
-                const char *e = strchr(t, '<');
-                if (e && (size_t)(e - t) < titlecap - 1) {
-                    memcpy(title_out, t + 1, (size_t)(e - t - 1));
-                    title_out[e - t - 1] = 0;
-                    decode_entities_inplace(title_out);
-                }
-            }
-        }
+    o += (size_t)sprintf(esc + o, "<pre>");
+    for (; *s && o + 8 < cap; s++) {
+        if (*s == '&') o += (size_t)sprintf(esc + o, "&amp;");
+        else if (*s == '<') o += (size_t)sprintf(esc + o, "&lt;");
+        else if (*s == '>') o += (size_t)sprintf(esc + o, "&gt;");
+        else esc[o++] = *s;
     }
+    (void)sprintf(esc + o, "</pre>");
+    k93node *d = k93html_parse(esc);
+    free(esc);
+    return d;
+}
 
-    char curhref[1280] = "";
-    char curlink[80] = "";
-    int in_a = 0;
-
-    while (*p && o + 8 < cap) {
-        if (*p == '<') {
-            const char *e = strchr(p, '>');
-            if (!e) break;
-            size_t taglen = (size_t)(e - p) + 1;
-            char tag[128];
-            size_t tl = taglen < sizeof tag - 1 ? taglen : sizeof tag - 1;
-            memcpy(tag, p, tl);
-            tag[tl] = 0;
-            for (char *q = tag; *q; q++) *q = (char)tolower((unsigned char)*q);
-
-            if (!strncmp(tag, "<script", 7) || !strncmp(tag, "<style", 6)) skip = 1;
-            if (!strncmp(tag, "</script", 8) || !strncmp(tag, "</style", 7)) skip = 0;
-            if (!strncmp(tag, "<br", 3) || !strncmp(tag, "<p", 2) ||
-                !strncmp(tag, "<div", 4) || !strncmp(tag, "<li", 3) ||
-                !strncmp(tag, "<tr", 3) || !strncmp(tag, "<h1", 3) ||
-                !strncmp(tag, "<h2", 3) || !strncmp(tag, "<h3", 3)) {
-                if (o && out[o - 1] != '\n') out[o++] = '\n';
-            }
-            if (!strncmp(tag, "<a ", 3)) {
-                const char *h = strstr(tag, "href=\"");
-                if (h && B.nlinks < MAXLINKS) {
-                    k93_strlcpy(curhref, h + 6, sizeof curhref);
-                    char *q = strchr(curhref, '"');
-                    if (q) *q = 0;
-                    url_absolutize(B.base, curhref, B.links[B.nlinks], sizeof B.links[0]);
-                    B.linktext[B.nlinks][0] = 0;
-                    in_a = 1;
-                }
-            }
-            if (!strncmp(tag, "</a", 3) && in_a) {
-                if (B.nlinks < MAXLINKS) {
-                    if (curlink[0]) {
-                        k93_strlcpy(B.linktext[B.nlinks], curlink, sizeof B.linktext[0]);
-                        B.nlinks++;
-                    }
-                }
-                curlink[0] = 0;
-                in_a = 0;
-            }
-            p = e + 1;
-            continue;
+static void css_collect(k93css *css, k93node *doc)
+{
+    k93node *sty[32];
+    int ns = k93html_query_all(doc, "style", sty, 32);
+    for (int i = 0; i < ns; i++)
+        if (sty[i]->text) k93css_add(css, sty[i]->text);
+    /* linked stylesheets (small; failures ignored) */
+    k93node *lnks[32];
+    int nl = k93html_query_all(doc, "link", lnks, 32);
+    for (int i = 0; i < nl; i++) {
+        const char *rel = k93html_attr(lnks[i], "rel");
+        const char *href = k93html_attr(lnks[i], "href");
+        if (!rel || !strcasestr(rel, "stylesheet") || !href) continue;
+        char abs[1280];
+        int status = 0;
+        char err[64];
+        url_absolutize(B.base, href, abs, sizeof abs);
+        char *css_txt = sf_fetch(abs, &status, err, sizeof err);
+        if (css_txt && status >= 200 && status < 300) {
+            k93css_add(css, css_txt);
         }
-        if (!skip) {
-            char c = *p;
-            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-            out[o++] = c;
-            if (in_a && c != ' ' && strlen(curlink) < sizeof curlink - 1) {
-                size_t l = strlen(curlink);
-                curlink[l] = c;
-                curlink[l + 1] = 0;
-            }
-        }
-        p++;
+        free(css_txt);
     }
-    out[o] = 0;
-    decode_entities_inplace(out);
-
-    /* collapse spaces and blank lines */
-    char *clean = k93_xmalloc(cap);
-    size_t co = 0;
-    int lastsp = 1, lastnl = 1;
-    for (size_t i = 0; out[i] && co + 1 < cap; i++) {
-        char c = out[i];
-        if (c == ' ') { if (lastsp) continue; lastsp = 1; }
-        else lastsp = 0;
-        if (c == '\n') { if (lastnl) continue; lastnl = 1; }
-        else lastnl = 0;
-        clean[co++] = c;
-    }
-    clean[co] = 0;
-    free(out);
-    return clean;
 }
 
 /* ---------------------------------------------------------------- app */
@@ -519,8 +495,6 @@ static int browse_d(const char *url_in, int depth)
         return -1;
     }
     if (status >= 300 && status < 400 && http_location[0]) {
-        /* naive redirect support (Location captured by http_get before the
-         * header block is stripped) */
         if (depth >= 8) {
             free(raw);
             ui_msgbox("Safari", "Too many redirects");
@@ -557,16 +531,16 @@ static int browse_d(const char *url_in, int depth)
                     ui_msgbox("Safari", "Cannot write download (disk full?)");
                 } else {
                     ui_statusmsg("Installing package ...");
-                    char err[256] = "";
+                    char err2[256] = "";
                     int rc = (pl > 4 && !strcasecmp(u.path + pl - 4, ".ipa"))
-                             ? k93_app_install_ipa(dest, err, sizeof err)
-                             : k93_app_install_deb(dest, err, sizeof err);
+                             ? k93_app_install_ipa(dest, err2, sizeof err2)
+                             : k93_app_install_deb(dest, err2, sizeof err2);
                     if (rc == 0) {
                         char m[1400];
                         snprintf(m, sizeof m, "Installed %s\n(copy kept in Downloads)", base);
                         ui_msgbox("Safari", m);
                     } else {
-                        ui_msgbox("Install failed", err);
+                        ui_msgbox("Install failed", err2);
                     }
                 }
             }
@@ -575,33 +549,65 @@ static int browse_d(const char *url_in, int depth)
         }
     }
 
-    char title[96] = "";
-    char *text = html_to_text(raw, title, sizeof title);
+    /* build DOM (HTML or plain text) */
+    const char *b = raw;
+    while (*b == ' ' || *b == '\n' || *b == '\r' || *b == '\t') b++;
+    k93node *doc = (*b && *b != '<') ? doc_from_text(raw) : k93html_parse(raw);
     free(raw);
-
-    char header[256];
-    snprintf(header, sizeof header, "%s\n%s\n\n", url, title[0] ? title : "(no title)");
-    size_t hl = strlen(header), tl = strlen(text);
-    char *page = k93_xmalloc(hl + tl + 1);
-    memcpy(page, header, hl);
-    memcpy(page + hl, text, tl + 1);
-    free(text);
-
-    ui_textview(title[0] ? title : "Safari", page);
-    free(page);
-
-    if (B.nlinks) {
-        const char *litems[MAXLINKS + 2];
-        for (int i = 0; i < B.nlinks; i++)
-            litems[i] = B.linktext[i][0] ? B.linktext[i] : B.links[i];
-        litems[B.nlinks] = "(close)";
-        int sel = ui_menu("Links on this page", litems, B.nlinks + 1, 0);
-        if (sel >= 0 && sel < B.nlinks) return browse(B.links[sel]);
+    if (!doc) {
+        ui_msgbox("Safari", "Out of memory");
+        return -1;
     }
+
+    k93css *css = k93css_new();
+    css_collect(css, doc);
+
+    sf_page pg;
+    sf_page_init(&pg, ui_px_width() - 48 - 28);
+    k93_strlcpy(pg.base, B.base, sizeof pg.base);
+    pg.css = css;
+    pg.doc = doc;
+
+    char title[96];
+    js_open(&pg, doc, B.base);
+    js_run_scripts(doc);
+
+    int nav = 0;
+    char navurl[1280];
+    navurl[0] = 0;
+    for (;;) {
+        sf_title(doc, title, sizeof title);
+        sf_render(&pg, doc);
+        int rv = ui_pageview(title[0] ? title : "Safari", &pg.pg, pview_tick, &pg);
+        if (rv < 0 || rv >= pg.nlinks) break;
+        sf_link *L = &pg.links[rv];
+        int handled = js_click(L);
+        if (js_tick()) continue;         /* DOM changed: re-render, stay */
+        if (js_nav_url()) break;         /* location changed: navigate */
+        if (handled != 2 && L->url[0]) {
+            if (!strncmp(L->url, "javascript:", 11)) continue;
+            k93_strlcpy(navurl, L->url, sizeof navurl);
+            nav = 1;
+            break;
+        }
+    }
+    const char *nu = js_nav_url();
+    if (nu && !navurl[0]) {
+        k93_strlcpy(navurl, nu, sizeof navurl);
+        nav = 1;
+    }
+    js_nav_clear();
+    js_close();
+    sf_page_free(&pg);
+    k93css_free(css);
+    k93html_free(doc);
+    if (nav && depth < 16) return browse_d(navurl, depth + 1);
     return 0;
 }
 
 static int browse(const char *url_in) { return browse_d(url_in, 0); }
+
+static int url_ok(const char *s) { struct url t; return url_parse(s, &t) == 0; }
 
 int main(int argc, char **argv)
 {
@@ -626,14 +632,31 @@ int main(int argc, char **argv)
         }
     }
 
-    /* app-to-app handoff (Maps/YouTube pass a URL): browse it right away,
-     * then fall into the address loop so the user can continue or Esc */
-    if (argc > 1) browse(url);
-
+    char cur[1280];
+    k93_strlcpy(cur, url, sizeof cur);
+    if (argc > 1) {                     /* handed a URL (e.g. Maps handoff) */
+        ui_statusmsg("Loading ...");
+        browse(cur);
+    }
     for (;;) {
-        if (ui_input("Address (URL)", url, sizeof url) != 0) break;
-        browse(url);
-        proxy_load();
+        char input[1280];
+        k93_strlcpy(input, cur, sizeof input);
+        if (ui_input("Address (URL)", input, sizeof input) < 0) break;
+        k93_trim(input);
+        if (!input[0]) continue;
+        if (url_ok(input)) {
+            k93_strlcpy(cur, input, sizeof cur);
+        } else {
+            char abs[1408];
+            snprintf(abs, sizeof abs, "http://%s", input);
+            if (!url_ok(abs)) {
+                ui_msgbox("Safari", "Cannot parse URL");
+                continue;
+            }
+            k93_strlcpy(cur, abs, sizeof cur);
+        }
+        ui_statusmsg("Loading ...");
+        browse(cur);
     }
     ui_shutdown();
     return 0;

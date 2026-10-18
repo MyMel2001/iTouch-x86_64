@@ -10,6 +10,7 @@
 #include "k93app.h"
 #include "k93gpt.h"
 #include "k93snd.h"
+#include "k93html.h"
 #include <linux/fb.h>
 #ifndef __user
 #define __user
@@ -54,6 +55,68 @@ int main(int argc, char **argv)
 {
     const char *fxdir = argc > 1 ? argv[1] : "fixtures";
     char path[512], err[128];
+
+    /* --- html parser + css subset (Safari engine) --- */
+    {
+        const char *H =
+            "<!DOCTYPE html><html><head><title>T &amp; T</title>"
+            "<style>h1{color:#aa0000;} .hid{display:none} p{margin-left:40px}"
+            "</style></head><body><h1 id='hd' class='big'>Hi &#233;there</h1>"
+            "<p class='hid'>HIDDEN</p><p style=\"color:#0000aa\">blue</p>"
+            "<a href='/next'>go</a><ul><li>one<li>two</ul>"
+            "<table><tr><td>a<td>b</tr></table>"
+            "<p>break<br>line &lt;end&gt;</p>"
+            "<script>var x = 1 < 2;</script></body></html>";
+        k93node *hd_doc = k93html_parse(H);
+        char hbuf[256];
+        chk(hd_doc != NULL, "html parses");
+        k93node *hn = k93html_query(hd_doc, "title");
+        k93html_text_content(hn, hbuf, sizeof hbuf);
+        chk(!strcmp(hbuf, "T & T"), "html title entities decoded");
+        k93node *hh = k93html_get_id(hd_doc, "hd");
+        chk(hh && !strcmp(hh->tag, "h1"), "html getElementById");
+        chk(hh && !strcmp(k93html_attr(hh, "class"), "big"), "html attr read");
+        k93node *hout[8];
+        int hn2 = k93html_query_all(hd_doc, "p", hout, 8);
+        chk(hn2 == 3, "html queryAll tag count");
+        k93html_text_content(hout[1], hbuf, sizeof hbuf);
+        chk(!strcmp(hbuf, "blue"), "html text content");
+        k93node *hli = k93html_query(hd_doc, "li");
+        k93html_text_content(hli, hbuf, sizeof hbuf);
+        chk(!strcmp(hbuf, "one"), "html implied li close");
+        k93node *htd = k93html_query(hd_doc, "td");
+        chk(htd && htd->next && !strcmp(htd->next->tag, "td"),
+            "html implied td close");
+        k93node *hsc = k93html_query(hd_doc, "script");
+        k93html_text_content(hsc, hbuf, sizeof hbuf);
+        chk(!strcmp(hbuf, "var x = 1 < 2;"), "html raw script text");
+        chk(k93html_query(hd_doc, ".big") == hh, "css class selector");
+        k93css *hc = k93css_new();
+        k93css_add(hc, "h1 { color: #aa0000; font-weight: bold }\n"
+                       ".hid { display: none }\np { margin-left: 40px }\n"
+                       "@media screen { p { color: red } }\n"
+                       "#hd { text-align: center }");
+        k93cstyle hst;
+        memset(&hst, 0, sizeof hst);
+        k93css_apply(hc, hh, &hst);
+        chk((hst.flags & K93CSS_FG) && hst.fg == 0xaa0000, "css color");
+        chk(hst.bold == 1, "css font-weight bold");
+        chk(hst.center == 1, "css id selector");
+        chk(!(hst.flags & K93CSS_HIDDEN), "css @media skipped");
+        memset(&hst, 0, sizeof hst);
+        k93css_apply(hc, hout[0], &hst);
+        chk((hst.flags & K93CSS_HIDDEN) && hst.hidden, "css display:none");
+        uint32_t hcol = 0;
+        chk(k93css_color("#f00", &hcol) && hcol == 0xff0000, "css #rgb");
+        k93node *hw = k93html_elem("div");
+        k93html_set_inner_html(hw, "<b>bold</b>text");
+        char *hi = k93html_inner_html(hw);
+        chk(hi && !strcmp(hi, "<b>bold</b>text"), "innerHTML set/get");
+        free(hi);
+        k93css_free(hc);
+        k93html_free(hw);
+        k93html_free(hd_doc);
+    }
 
     /* --- plist --- */
     k93_plist *p = k93_plist_parse(SAMPLE, strlen(SAMPLE), err, sizeof err);

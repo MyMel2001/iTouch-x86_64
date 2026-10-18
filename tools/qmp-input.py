@@ -40,8 +40,8 @@ def main():
         raise SystemExit("qmp: bad greeting")
     qmp_cmd(s, "qmp_capabilities")
     for qc in sys.argv[2:]:
-        rec = qmp_cmd(s, "send-key",
-                      {"keys": [{"type": "qcode", "data": qc}]})
+        keys = [{"type": "qcode", "data": part} for part in qc.split("+")]
+        rec = qmp_cmd(s, "send-key", {"keys": keys})
         if "error" in rec:
             print(f"send-key {qc} failed:", rec["error"])
             return 1

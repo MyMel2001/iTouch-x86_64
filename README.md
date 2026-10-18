@@ -34,6 +34,21 @@ explanation (K93OS runs native x86_64 ELF only).
 * Modern CA store: `/etc/ssl/certs/ca-certificates.crt` copied from the
   host's maintained bundle at build time (the 2011-era roots in the
   original rootfs are not used)
+* Safari web engine (clean-room): `libk93/k93html.c` provides a DOM
+  parser (entities incl. numeric, rawtext elements, implied end tags),
+  `querySelector(All)`, innerHTML/clone, and a CSS subset (colors,
+  display:none, text-align, font-weight, margin-left, background-color,
+  font scale; inline `style` wins, later rule wins). Safari renders the
+  DOM to wrapped text lines with per-run color/bold/link runs, fetches
+  and decodes `<img>` (PNG/JPEG/GIF/BMP/... via vendored stb_image v2.30,
+  alt-text fallback, per-page pixel cache), and runs page JavaScript
+  with vendored QuickJS 2025-04-26 (MIT): DOM core, event listeners,
+  `onclick` attributes, buttons, timers, `XMLHttpRequest`, `fetch`,
+  cookies, `document.title`, `preventDefault`; timers and DOM changes
+  re-render in place while browsing. Deps are fetched pinned-sha256 by
+  `scripts/build-deps.sh` into gitignored `third_party/_build/`.
+  Ceilings: no canvas/WebGL/SVG/frames, no CSS specificity, ASCII
+  glyphs only, blocking image fetches, `<pre>` wrap only
 * Serial-console-first UI toolkit. Graphics stack is DRM/KMS (clean-room
   client in `libk93/k93ui.c`): init waits for `/dev/dri/card0`, loads the
   GPU driver, SpringBoard becomes DRM master, creates its own dumb buffer

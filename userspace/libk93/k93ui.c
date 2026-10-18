@@ -1747,6 +1747,158 @@ int ui_textview(const char *title, const char *text)
     }
 }
 
+/* --------------------------------------------------- styled page view */
+
+#define PAGE_SEL  0x3F7FDCu
+#define PAGE_LINK 0x1856B0u
+
+static int page_h(const ui_pline *l, int text_rows)
+{
+    if (l->img) return text_rows ? 1 : l->imgh + 10;
+    if (text_rows) return 1;
+    int sc = l->scale < 1 ? 1 : (l->scale > 2 ? 2 : l->scale);
+    return sc * 16 + (sc > 1 ? 6 : 2);
+}
+
+static void page_render(const char *title, ui_page *p, int top, int sel)
+{
+    if (G.backend == BACK_FB) {
+        int px, py, pw, ph;
+        gui_page(title, G.fbh_px - 64 - 24 - 12, &px, &py, &pw, &ph);
+        int viewh = ph - 8;
+        int y = py + 4;
+        for (int i = top; i < p->n && y < py + ph; i++) {
+            const ui_pline *l = &p->lines[i];
+            int lh = page_h(l, 0);
+            if (lh > viewh) lh = viewh;
+            int issel = (i == sel);
+            if (issel)
+                ui_roundrect(px + 2, y - 1, pw - 4, lh, 4,
+                             ui_tint(GUI_SEL0, 112, 100), GUI_SEL1);
+            if (l->img) {
+                int ix = px + 14 + l->indent;
+                if (l->imgw < pw - 28) ix = px + (pw - l->imgw) / 2;
+                ui_blit(ix, y + 3, l->imgw, l->imgh, l->img);
+            } else {
+                if (l->bg && !issel)
+                    ui_fill(px + 2, y, pw - 4, lh, l->bg);
+                int tw = 0;
+                for (int r = 0; r < l->nruns; r++)
+                    tw += ui_text_width(l->scale > 0 ? l->scale : 1,
+                                        l->runs[r].text);
+                int x = px + 14 + l->indent;
+                if (l->center) {
+                    x = px + (pw - tw) / 2;
+                    if (x < px + 14 + l->indent) x = px + 14 + l->indent;
+                }
+                for (int r = 0; r < l->nruns; r++) {
+                    const ui_prun *rn = &l->runs[r];
+                    uint32_t fg = issel ? GUI_WHITE
+                                : (rn->link >= 0 ? PAGE_LINK : rn->fg);
+                    int sc = l->scale > 0 ? l->scale : 1;
+                    if (rn->bold)
+                        ui_text_bold(x, y + 3, sc, rn->text, fg,
+                                     issel ? PAGE_SEL : 0xEEF1F6u);
+                    else
+                        ui_text_sh(x, y + 3, sc, rn->text, fg,
+                                   issel ? PAGE_SEL : 0xFFFFFFu);
+                    x += ui_text_width(sc, rn->text);
+                }
+            }
+            y += lh;
+        }
+        int has_link = 0;
+        for (int i = 0; i < p->n; i++)
+            if (p->lines[i].link >= 0) { has_link = 1; break; }
+        ui_statusmsg(has_link
+                     ? "Up/Dn scroll   Enter open link   Esc close"
+                     : "Up/Dn scroll   Esc close");
+        ui_flush();
+        return;
+    }
+    /* text backend */
+    ui_clear();
+    ui_statusbar(title);
+    int view = G.rows - 4; if (view < 1) view = 1;
+    for (int i = 0; i < view && top + i < p->n; i++) {
+        const ui_pline *l = &p->lines[top + i];
+        char row[512]; size_t o = 0; row[0] = 0;
+        if (l->img)
+            snprintf(row, sizeof row, "[image %dx%d]", l->imgw, l->imgh);
+        else for (int r = 0; r < l->nruns && o + 1 < sizeof row; r++) {
+            size_t tl = strlen(l->runs[r].text);
+            if (o + tl > sizeof row - 1) tl = sizeof row - 1 - o;
+            memcpy(row + o, l->runs[r].text, tl);
+            o += tl; row[o] = 0;
+        }
+        if (top + i == sel) ui_puts_inv(0, 2 + i, row);
+        else ui_puts(0, 2 + i, row);
+    }
+    ui_flush();
+}
+
+int ui_pageview(const char *title, ui_page *p,
+                int (*tick)(ui_page *p, void *ctx), void *ctx)
+{
+    int sel = p->sel, top = p->top;       /* preserved across re-entries */
+    if (sel >= p->n) sel = p->n - 1;
+    if (sel < 0) sel = 0;
+    if (top < 0 || top > sel) top = 0;
+    if (!p || p->n < 1) return -1;
+    for (;;) {
+        page_render(title, p, top, sel);
+        if (sel >= p->n) sel = p->n - 1;
+        int k = ui_getkey(250);
+        int view, viewh = 0;
+        if (G.backend == BACK_FB) {
+            viewh = (G.fbh_px - 64 - 24 - 12 - 8);
+            int y = 0, i = top;
+            while (i < p->n && y + page_h(&p->lines[i], 0) <= viewh) {
+                y += page_h(&p->lines[i], 0); i++;
+            }
+            view = i - top; if (view < 1) view = 1;
+        } else {
+            view = G.rows - 4; if (view < 1) view = 1;
+        }
+        switch (k) {
+        case UI_KEY_UP: if (sel > 0) sel--; break;
+        case UI_KEY_DOWN: if (sel < p->n - 1) sel++; break;
+        case UI_KEY_PGUP: sel -= view; if (sel < 0) sel = 0; break;
+        case UI_KEY_PGDN: sel += view; if (sel > p->n - 1) sel = p->n - 1; break;
+        case UI_KEY_ENTER:
+            if (p->lines[sel].link >= 0) {
+                p->sel = sel; p->top = top;
+                return p->lines[sel].link;
+            }
+            break;
+        case UI_KEY_ESC: case UI_KEY_CTRL_C:
+            p->sel = sel; p->top = top;
+            return -1;
+        default: break;
+        }
+        p->sel = sel; p->top = top;
+        if (tick && tick(p, ctx) == 2) {
+            p->sel = sel; p->top = top;
+            return -1;
+        }
+        /* keep selection visible */
+        if (sel < top) top = sel;
+        if (G.backend == BACK_FB) {
+            int y = 0, i = top;
+            while (i < sel && y + page_h(&p->lines[i], 0) < viewh) {
+                y += page_h(&p->lines[i], 0); i++;
+            }
+            while (y + page_h(&p->lines[sel], 0) > viewh && top < sel) {
+                y -= page_h(&p->lines[top], 0);
+                if (y < 0) y = 0;
+                top++;
+            }
+        } else {
+            if (sel >= top + view) top = sel - view + 1;
+        }
+    }
+}
+
 /* multiline editor: buffer of lines, char insertion on current line */
 int ui_editbox(const char *title, char *buf, size_t cap)
 {

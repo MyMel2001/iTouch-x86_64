@@ -82,7 +82,7 @@ of the iOS 4.3.4 iPad *user experience* on Linux:
 | launchd + LaunchDaemons plists  | `userspace/launchd.c` (PID 1, socket activation, KeepAlive, plist config) |
 | SpringBoard + SpringBoardPlugins| `apps/springboard/` (framebuffer UI + serial TUI fallback, icon grid, app launcher) |
 | UIKit-ish toolkit               | `userspace/libk93/` (window/list/text widgets, fb + serial backends, 8x16 font) |
-| MobileSafari / WebSheet         | `apps/safari/` (minimal browser shell; modern CA store at /etc/ssl/certs) |
+| MobileSafari / WebSheet         | `apps/safari/` (clean-room DOM/CSS-subset/JS/image engine: libk93 `k93html.c` + QuickJS 2025-04-26 + stb_image v2.30, both fetched pinned by `scripts/build-deps.sh`; mbedTLS + proxy, modern CA store at /etc/ssl/certs) |
 | Preferences.app                 | `apps/settings/` incl. **HTTP Proxy** pane (user requirement NOTE 3) |
 | MobileStore / AppStore          | `apps/installer/` — **third-party .ipa sideloader** (App Store itself deliberately NOT ported) |
 | MobileNotes, MobileCal, Contacts| `apps/notes`, `apps/calendar`, `apps/contacts` |
@@ -370,11 +370,23 @@ keeping AdSheet provider-neutral.
   `http_location` and `browse_d(url, depth)` follows it with a depth-8
   guard. Verified live: `maps.google.com` -> 302 -> `www.google.com/maps`
   renders its no-JS text; `yewtu.be/trending` fetched and linked.
+* Safari engine notes (new-engine pass over `apps/safari/{main,render,
+  js,stbi}.c` + `libk93/k93html.c`): `<title>` is a rawtext element —
+  `document.title=` must clear `node->text` as well as children or
+  `text_content` keeps returning the parsed raw text.
+  `url_absolutize` must keep non-default ports (`scheme://host[:port]`)
+  or relative image/link URLs silently resolve to port 80. The
+  `__k93_click` dispatch must free its JSValue or every click leaks a
+  GC object and `JS_FreeRuntime` asserts (`list_empty(&rt->gc_obj_list)`)
+  at exit. `<button>` renders as a selectable block registered like an
+  anchor with an empty URL so keyboard Enter fires its onclick; line
+  activation picks the first link run on a line.
 * Maps menu: "Google Maps (web)", "Custom map URL…", "Offline tiles
   (local)" info. YouTube menu: Browse/Trending/Search/Change
   instance/About, instance from `/etc/k93/youtube.conf`
   (`INSTANCE=`, default `https://yewtu.be`) — all server-rendered HTML
-  through Safari (ceiling: no JS engine, no in-app video decode).
+  through Safari (which now also runs page JS via QuickJS; ceiling:
+  no in-app video decode).
 * Camera: V4L2 mmap streaming, YUYV-only (MJPEG rejected, documented),
   digital zoom 1/2/4/8 (crop + nearest), AF via `V4L2_CID_FOCUS_AUTO`,
   `C` cycles cameras, ENTER snapshots PPM to `/var/mobile/Media/Photos`,

@@ -55,7 +55,35 @@ int  ui_menu(const char *title, const char *const *items, int n, int sel);
 void ui_msgbox(const char *title, const char *body);    /* any key closes */
 int  ui_confirm(const char *title, const char *body);   /* 1=yes 0=no */
 int  ui_input(const char *prompt, char *buf, size_t cap);
-int  ui_textview(const char *title, const char *text);  /* scrollable */
+int  ui_textview(const char *title, const char *text);
+
+/* --- styled page view (Safari): multi-run lines, colors, images, links ---
+ * One run = one text span with its own color/bold/link. A line can also be
+ * an image line (img != NULL, runs unused). */
+typedef struct {
+    const char *text;                /* NUL-terminated, owned by caller pool */
+    uint32_t fg;
+    int bold;
+    int link;                        /* link index activated by Enter, or -1 */
+} ui_prun;
+
+typedef struct {
+    ui_prun *runs;                   /* text runs (caller-owned) */
+    int nruns;                       /* 0 => image line */
+    uint32_t bg;                     /* band background, 0 = page white */
+    int center, indent, scale;       /* scale 1 or 2 (font is 8x16 per unit) */
+    int link;                        /* line's activatable link, or -1 */
+    const uint32_t *img;             /* RGBA pixels for image lines or NULL */
+    int imgw, imgh;
+} ui_pline;
+
+typedef struct { ui_pline *lines; int n; int cap; int top, sel; } ui_page;
+
+/* Returns >= 0: link index activated with Enter. -1: Esc (close).
+ * tick: called each ~250ms idle; returns 1 = page rebuilt (redraw),
+ * 2 = close now. */
+int  ui_pageview(const char *title, ui_page *p,
+                 int (*tick)(ui_page *p, void *ctx), void *ctx);  /* scrollable */
 int  ui_editbox(const char *title, char *buf, size_t cap); /* multiline editor */
 
 #endif
