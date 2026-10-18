@@ -8,11 +8,82 @@
 #include "k93ui.h"
 #include "k93util.h"
 #include "k93app.h"
+#include "k93icons.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+
+/* ---- GUI home screen ---------------------------------------------------- */
+
+/* glossy backdrop: vertical gradient + faint light bands, all from code */
+static void draw_wallpaper(void)
+{
+    int W = ui_px_width(), H = ui_px_height();
+    uint32_t top = ui_rgb(0x1B, 0x2A, 0x4A), bot = ui_rgb(0x0B, 0x11, 0x20);
+    ui_fill_grad(0, 0, W, H, top, bot);
+    uint32_t sheen = ui_tint(top, 118, 100);
+    for (int y = 0; y < H; y += 8)        /* 3px sheen, 5px gap */
+        ui_fill(0, y, W, 3, sheen);
+}
+
+#define GRID_COLS 4
+#define ICON_PX   80
+
+/* draw one app icon + label at a cell origin */
+static void draw_icon_cell(int cx, int cy, int cw, const k93_app *app, int sel)
+{
+    const uint32_t *img = k93_icon_by_name(app->ident, NULL, NULL);
+    int iw = ICON_PX, ih = ICON_PX;
+    int ix = cx + (cw - ICON_PX) / 2;
+    int iy = cy;
+    ui_blit(ix, iy, iw, ih, img);
+    if (sel) {
+        ui_frame(ix - 3, iy - 3, ICON_PX + 6, ICON_PX + 6, 16, 2, ui_rgb(0xFF, 0xFF, 0xFF));
+        /* label sits in a blue capsule under the selected icon */
+        char lab[48];
+        snprintf(lab, sizeof lab, "%.20s", app->name);
+        int lw = ui_text_width(1, lab) + 16;
+        if (lw > cw - 8) lw = cw - 8;
+        int ly = iy + ICON_PX + 6;
+        ui_roundrect(cx + (cw - lw) / 2, ly, lw, 20, 9,
+                     ui_tint(ui_rgb(0x3B, 0x82, 0xF6), 116, 100), ui_rgb(0x1D, 0x4E, 0xD8));
+        ui_text_bold(cx + (cw - ui_text_width(1, lab)) / 2, ly + 2, 1, lab,
+                     ui_rgb(0xFF, 0xFF, 0xFF), 0x14306A);
+    } else {
+        char lab[48];
+        snprintf(lab, sizeof lab, "%.20s", app->name);
+        ui_text_sh(cx + (cw - ui_text_width(1, lab)) / 2, iy + ICON_PX + 6, 1, lab,
+                   ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+    }
+}
+
+static void draw_home_gui(const k93_app *apps, int n, int sel, const char *hint)
+{
+    int W = ui_px_width(), H = ui_px_height();
+    draw_wallpaper();
+    int cols = GRID_COLS;
+    int cw = W / cols;
+    int top = 28;
+    int rowh = ICON_PX + 40;
+    int view = (H - top - 36) / rowh;
+    if (view < 1) view = 1;
+    int pagesel_row = sel / cols;
+    int trow = 0;
+    if (pagesel_row >= view) trow = pagesel_row - view + 1;
+    for (int i = 0; i < view * cols && trow * cols + i < n; i++) {
+        int idx = trow * cols + i;
+        int cx = (i % cols) * cw;
+        int cy = top + (i / cols) * rowh;
+        draw_icon_cell(cx, cy, cw, &apps[idx], idx == sel);
+    }
+    char title[64];
+    snprintf(title, sizeof title, "SpringBoard");
+    ui_statusbar(title);
+    ui_statusmsg(hint ? hint : "Arrows  Enter launch  F12 shell  Esc exit");
+    ui_flush();
+}
 
 static void draw_home(const k93_app *apps, int n, int sel, const char *hint)
 {
@@ -49,25 +120,42 @@ int main(void)
     char hint[96] = "";
     for (;;) {
         if (n == 0) {
-            ui_clear();
-            ui_statusbar("SpringBoard");
-            ui_puts(2, 3, "No applications installed.");
-            ui_puts(2, 4, "Copy .ipa bundles into /var/mobile/Media/Downloads");
-            ui_puts(2, 5, "and install them with the Installer app.");
-            ui_statusmsg("Esc exit");
-            ui_flush();
+            if (ui_is_graphical()) {
+                draw_wallpaper();
+                int W = ui_px_width(), H = ui_px_height();
+                const char *msg = "No applications installed";
+                ui_text_bold((W - ui_text_width(1, msg)) / 2, H / 2 - 8, 1,
+                             msg, ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+                ui_statusbar("SpringBoard");
+                ui_statusmsg("Esc exit");
+                ui_flush();
+            } else {
+                ui_clear();
+                ui_statusbar("SpringBoard");
+                ui_puts(2, 3, "No applications installed.");
+                ui_puts(2, 4, "Copy .ipa bundles into /var/mobile/Media/Downloads");
+                ui_puts(2, 5, "and install them with the Installer app.");
+                ui_statusmsg("Esc exit");
+                ui_flush();
+            }
             int k = ui_getkey(250);
             if (k == UI_KEY_ESC || k == UI_KEY_CTRL_C) break;
             if (k == UI_KEY_F12) break;
             continue;
         }
-        draw_home(apps, n, sel, hint);
+        if (ui_is_graphical()) draw_home_gui(apps, n, sel, hint);
+        else draw_home(apps, n, sel, hint);
         int k = ui_getkey(250);
         hint[0] = 0;
+        int cols = ui_is_graphical() ? GRID_COLS : 1;
         switch (k) {
-        case UI_KEY_UP: if (sel > 0) sel--; break;
-        case UI_KEY_DOWN: if (sel < n - 1) sel++; break;
+        case UI_KEY_UP:   sel -= cols; if (sel < 0) sel = 0; break;
+        case UI_KEY_DOWN: sel += cols; if (sel >= n) sel = n - 1; break;
+        case UI_KEY_LEFT: if (sel > 0) sel--; break;
+        case UI_KEY_RIGHT:if (sel < n - 1) sel++; break;
         case UI_KEY_HOME: sel = 0; break;
+        case UI_KEY_PGUP: sel -= cols * 4; if (sel < 0) sel = 0; break;
+        case UI_KEY_PGDN: sel += cols * 4; if (sel >= n) sel = n - 1; break;
         case UI_KEY_ESC: case UI_KEY_CTRL_C:
             ui_shutdown();
             return 0;
@@ -85,9 +173,23 @@ int main(void)
             break;
         }
         case UI_KEY_ENTER: {
-            ui_clear();
-            ui_printf(1, 2, "Launching %s ...", apps[sel].name);
-            ui_flush();
+            if (ui_is_graphical()) {
+                draw_wallpaper();
+                int W = ui_px_width();
+                const uint32_t *img = k93_icon_by_name(apps[sel].ident, NULL, NULL);
+                int iw = ICON_PX, ih = ICON_PX;
+                ui_blit((W - iw) / 2, (ui_px_height() - ih) / 2 - 20, iw, ih, img);
+                char msg[64];
+                snprintf(msg, sizeof msg, "Launching %s", apps[sel].name);
+                ui_text_bold((W - ui_text_width(1, msg)) / 2,
+                             (ui_px_height() + ICON_PX) / 2, 1, msg,
+                             ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+                ui_flush();
+            } else {
+                ui_clear();
+                ui_printf(1, 2, "Launching %s ...", apps[sel].name);
+                ui_flush();
+            }
             usleep(150000);
             ui_shutdown();
             int rc = k93_app_launch(&apps[sel]);

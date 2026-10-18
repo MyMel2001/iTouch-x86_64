@@ -244,6 +244,246 @@ int ui_getkey(int timeout_ms)
 
 /* ------------------------------------------------------------------ output */
 
+/* --- pixel primitives (graphical backend; text console no-ops) --------- */
+
+/* per-row page color: the app chrome background under text. ui_clear fills
+ * with this gradient and ui_puts paints each glyph cell with it, so normal
+ * text still erases what was under it while sitting on a shaded page. */
+static uint32_t page_row_color(int y)
+{
+    uint32_t t = ui_rgb(0x0f, 0x13, 0x1b), b = ui_rgb(0x1b, 0x23, 0x31);
+    int h = G.fbh_px > 1 ? G.fbh_px : 1;
+    int d = h - 1 > 0 ? h - 1 : 1;
+    int p = y < 0 ? 0 : (y >= h ? h - 1 : y);
+    int r = (int)((t >> 16) & 255) + ((int)((b >> 16) & 255) - (int)((t >> 16) & 255)) * p / d;
+    int g = (int)((t >> 8) & 255) + ((int)((b >> 8) & 255) - (int)((t >> 8) & 255)) * p / d;
+    int bl = (int)(t & 255) + ((int)(b & 255) - (int)(t & 255)) * p / d;
+    return ui_rgb((uint8_t)r, (uint8_t)g, (uint8_t)bl);
+}
+
+uint32_t ui_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+uint32_t ui_tint(uint32_t c, int num, int den)
+{
+    int r = (int)((c >> 16) & 255) * num / den;
+    int g = (int)((c >> 8) & 255) * num / den;
+    int b = (int)(c & 255) * num / den;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    if (r < 0) r = 0;
+    if (g < 0) g = 0;
+    if (b < 0) b = 0;
+    return ui_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
+}
+
+static inline int px_ok(int x, int y)
+{
+    return (unsigned)x < (unsigned)G.fbw_px && (unsigned)y < (unsigned)G.fbh_px;
+}
+
+static inline void px_put(int x, int y, uint32_t c)   /* caller clips */
+{
+    uint8_t *p = G.fbw + (size_t)y * (size_t)G.wline + (size_t)x * (size_t)(G.fbbpp / 8);
+    if (G.fbbpp == 32) { p[0] = (uint8_t)c; p[1] = (uint8_t)(c >> 8); p[2] = (uint8_t)(c >> 16); p[3] = 0xFF; }
+    else if (G.fbbpp == 24) { p[0] = (uint8_t)c; p[1] = (uint8_t)(c >> 8); p[2] = (uint8_t)(c >> 16); }
+    else {                              /* RGB565 */
+        uint16_t v = (uint16_t)(((c >> 3) & 0x1f) << 11 | ((c >> 2) & 0x3f) << 5 | ((c >> 3) & 0x1f));
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    }
+}
+
+static inline uint32_t px_get(int x, int y)
+{
+    const uint8_t *p = G.fbw + (size_t)y * (size_t)G.wline + (size_t)x * (size_t)(G.fbbpp / 8);
+    if (G.fbbpp == 32) return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16;
+    if (G.fbbpp == 24) return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16;
+    uint16_t v = (uint16_t)(p[0] | (uint16_t)p[1] << 8);
+    return ui_rgb((uint8_t)((v >> 11) << 3), (uint8_t)((v >> 5) << 2), (uint8_t)(v << 3));
+}
+
+/* fill a rect clipped to the logical canvas (any backend-safe; no-op off-FB) */
+static void fill_rect(int x, int y, int w, int h, uint32_t c)
+{
+    if (G.backend != BACK_FB || w <= 0 || h <= 0) return;
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w > G.fbw_px ? G.fbw_px : x + w;
+    int y1 = y + h > G.fbh_px ? G.fbh_px : y + h;
+    for (int yy = y0; yy < y1; yy++) {
+        uint8_t *line = G.fbw + (size_t)yy * (size_t)G.wline;
+        if (G.fbbpp == 32) {
+            uint32_t *row = (uint32_t *)(line + (size_t)x0 * 4);
+            for (int xx = x0; xx < x1; xx++) row[xx - x0] = c;
+        } else {
+            for (int xx = x0; xx < x1; xx++) px_put(xx, yy, c);
+        }
+    }
+}
+
+static int isqrt(int v)
+{
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+/* linear per-channel mix of two colors, p/d of the way from a to b */
+static uint32_t mix(uint32_t a, uint32_t b, int p, int d)
+{
+    if (d <= 0) return a;
+    if (p < 0) p = 0;
+    if (p > d) p = d;
+    int r = (int)((a >> 16) & 255) + ((int)((b >> 16) & 255) - (int)((a >> 16) & 255)) * p / d;
+    int g = (int)((a >> 8) & 255) + ((int)((b >> 8) & 255) - (int)((a >> 8) & 255)) * p / d;
+    int bl = (int)(a & 255) + ((int)(b & 255) - (int)(a & 255)) * p / d;
+    return ui_rgb((uint8_t)r, (uint8_t)g, (uint8_t)bl);
+}
+
+/* rounded-rect corner x-inset for row j within a corner zone of radius r */
+static int rr_inset(int j, int r)
+{
+    if (j >= r) return 0;
+    int dy = r - j - 1;
+    return r - isqrt(r * r - dy * dy);
+}
+
+void ui_fill(int x, int y, int w, int h, uint32_t rgb)
+{
+    fill_rect(x, y, w, h, rgb);
+}
+
+void ui_fill_grad(int x, int y, int w, int h, uint32_t top, uint32_t bot)
+{
+    if (G.backend != BACK_FB || w <= 0 || h <= 0) return;
+    for (int i = 0; i < h; i++) {
+        uint32_t c = h > 1 ? mix(top, bot, i, h - 1) : top;
+        fill_rect(x, y + i, w, 1, c);
+    }
+}
+
+void ui_roundrect(int x, int y, int w, int h, int r, uint32_t top, uint32_t bot)
+{
+    if (G.backend != BACK_FB || w <= 0 || h <= 0) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    if (r <= 0) { ui_fill_grad(x, y, w, h, top, bot); return; }
+    for (int j = 0; j < h; j++) {
+        int jj = h - 1 - j;
+        int a = rr_inset(j, r), b = rr_inset(jj, r);
+        int in = a > b ? a : b;
+        if (in * 2 >= w) continue;
+        uint32_t c = h > 1 ? mix(top, bot, j, h - 1) : top;
+        fill_rect(x + in, y + j, w - 2 * in, 1, c);
+    }
+}
+
+void ui_frame(int x, int y, int w, int h, int r, int thick, uint32_t c)
+{
+    if (G.backend != BACK_FB || w <= 0 || h <= 0 || thick <= 0) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    if (r <= 0) {
+        fill_rect(x, y, w, thick, c);
+        fill_rect(x, y + h - thick, w, thick, c);
+        fill_rect(x, y, thick, h, c);
+        fill_rect(x + w - thick, y, thick, h, c);
+        return;
+    }
+    int ri = r - thick;
+    if (ri < 0) ri = 0;
+    for (int j = 0; j < h; j++) {
+        int jj = h - 1 - j;
+        int o = rr_inset(j, r);
+        int ob = rr_inset(jj, r);
+        if (o < ob) o = ob;
+        int ii = rr_inset(j, ri), ib = rr_inset(jj, ri);
+        int in = ii > ib ? ii : ib;
+        int L = x + o, R = x + w - o;
+        if (R - L <= 0) continue;
+        if (in > o) {   /* fully inside corner band: fill the whole span */
+            fill_rect(L, y + j, R - L, 1, c);
+            continue;
+        }
+        int Li = x + in, Ri = x + w - in;
+        if (Li - L > 0) fill_rect(L, y + j, Li - L, 1, c);
+        if (R - Ri > 0) fill_rect(Ri, y + j, R - Ri, 1, c);
+    }
+}
+
+void ui_blit(int x, int y, int w, int h, const uint32_t *src)
+{
+    if (G.backend != BACK_FB || !src || w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++) {
+        int yy = y + j;
+        if ((unsigned)yy >= (unsigned)G.fbh_px) continue;
+        for (int i = 0; i < w; i++) {
+            int xx = x + i;
+            if ((unsigned)xx >= (unsigned)G.fbw_px) continue;
+            uint32_t c = src[(size_t)j * (size_t)w + (size_t)i];
+            uint32_t a = c >> 24;
+            if (a == 0) continue;
+            if (a >= 255) { px_put(xx, yy, c & 0xFFFFFF); continue; }
+            uint32_t d = px_get(xx, yy);
+            uint32_t r = (((c >> 16) & 255) * a + ((d >> 16) & 255) * (255 - a) + 127) / 255;
+            uint32_t g = (((c >> 8) & 255) * a + ((d >> 8) & 255) * (255 - a) + 127) / 255;
+            uint32_t b = ((c & 255) * a + (d & 255) * (255 - a) + 127) / 255;
+            px_put(xx, yy, ui_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b));
+        }
+    }
+}
+
+/* draw the 8x16 font at a pixel position, scale >= 1, opaque fg */
+static void text_draw(int x, int y, int scale, const char *s, uint32_t fg)
+{
+    if (G.backend != BACK_FB || scale < 1) return;
+    for (int ci = 0; s[ci]; ci++) {
+        const uint8_t *gl = k93_font8x16 + ((unsigned char)s[ci]) * 16;
+        int gx = x + ci * 8 * scale;
+        for (int row = 0; row < 16; row++) {
+            uint8_t bits = gl[row];
+            if (!bits) continue;
+            for (int col = 0; col < 8; col++) {
+                if (!((bits >> (7 - col)) & 1)) continue;
+                fill_rect(gx + col * scale, y + row * scale, scale, scale, fg);
+            }
+        }
+    }
+}
+
+void ui_text(int x, int y, int scale, const char *s, uint32_t fg)
+{
+    text_draw(x, y, scale, s, fg);
+}
+
+void ui_text_sh(int x, int y, int scale, const char *s, uint32_t fg, uint32_t shadow)
+{
+    if (G.backend != BACK_FB || !s || !s[0]) return;
+    int o = scale >= 2 ? 2 : 1;
+    text_draw(x, y + o, scale, s, shadow);
+    text_draw(x, y, scale, s, fg);
+}
+
+void ui_text_bold(int x, int y, int scale, const char *s, uint32_t fg, uint32_t shadow)
+{
+    if (G.backend != BACK_FB || !s || !s[0]) return;
+    int o = scale >= 2 ? 2 : 1;
+    text_draw(x, y + o, scale, s, shadow);
+    text_draw(x, y, scale, s, fg);
+    text_draw(x + 1, y, scale, s, fg);   /* faux bold: overstrike */
+}
+
+int ui_text_width(int scale, const char *s)
+{
+    if (scale < 1) scale = 1;
+    return (int)strlen(s ? s : "") * 8 * scale;
+}
+
+int ui_px_width(void)  { return G.backend == BACK_FB ? G.fbw_px : G.cols * 8; }
+int ui_px_height(void) { return G.backend == BACK_FB ? G.fbh_px : G.rows * 16; }
+
 static void fb_draw_glyph_col(int x, int y, char ch, int inverted)
 {
     const uint8_t *g = k93_font8x16 + ((unsigned char)ch) * 16;
@@ -256,10 +496,17 @@ static void fb_draw_glyph_col(int x, int y, char ch, int inverted)
             if (inverted) on = !on;
             uint8_t *px = line + (size_t)(x * 8 + col) * (size_t)bpp;
             uint8_t v = on ? 0xFF : 0x00;
-            if (bpp == 4) { px[0] = px[1] = px[2] = v; px[3] = 0xFF; }
-            else if (bpp == 3) { px[0] = px[1] = px[2] = v; }
+            uint8_t br, bg, bb;
+            if (inverted) { br = bg = bb = v; }        /* black-on-white cell */
+            else if (on)  { br = bg = bb = 0xFF; }     /* white glyph */
+            else {                                      /* page gradient bg */
+                uint32_t pc = page_row_color(y * 16 + row);
+                br = (uint8_t)(pc >> 16); bg = (uint8_t)(pc >> 8); bb = (uint8_t)pc;
+            }
+            if (bpp == 4) { px[0] = bb; px[1] = bg; px[2] = br; px[3] = 0xFF; }
+            else if (bpp == 3) { px[0] = bb; px[1] = bg; px[2] = br; }
             else if (bpp == 2) {                       /* RGB565 */
-                uint16_t c = on ? 0xFFFF : 0x0000;
+                uint16_t c = (uint16_t)(((br >> 3) << 11) | ((bg >> 2) << 5) | (bb >> 3));
                 px[0] = (uint8_t)c; px[1] = (uint8_t)(c >> 8);
             }
         }
@@ -377,7 +624,10 @@ void ui_hline(int y, int attr)
 void ui_clear(void)
 {
     if (G.backend == BACK_FB) {
-        memset(G.fbw, 0, G.wlen);
+        for (int y = 0; y < G.fbh_px; y++) {
+            uint32_t c = page_row_color(y);
+            fill_rect(0, y, G.fbw_px, 1, c);
+        }
     } else if (G.backend == BACK_TEXT) {
         const char *seq = "\033[2J\033[H\033[0m";
         write(G.outfd, seq, strlen(seq));
@@ -391,8 +641,150 @@ void ui_flush(void)
     }
 }
 
+/* --- GUI widget chrome (graphical backend). Original iOS-4-*era* look:
+ * dark gradient status bar, beveled blue-gray nav bar, light grouped pages,
+ * blue selection. All shapes/colors are drawn from code (ui_roundrect,
+ * ui_fill_grad, ui_tint), never copied bitmaps. */
+
+#define GUI_WHITE  0xFFFFFFu
+#define GUI_INK    0x14202Eu
+#define GUI_SUBINK 0x6B7787u
+#define GUI_PAGE   0xD9DEE6u
+#define GUI_GROUP  0xF2F4F7u
+#define GUI_SEP    0xC3CAD4u
+#define GUI_BAR0   0x556070u          /* status/hint bar: dark slate */
+#define GUI_BAR1   0x2A3340u
+#define GUI_NAV0   0xA9B6C8u          /* nav bar: light blue-gray, bevel */
+#define GUI_NAV1   0x7C8AA0u
+#define GUI_NAVEDGE 0x4C586Au
+#define GUI_SEL0   0x5C9CF0u          /* selection: iOS blue */
+#define GUI_SEL1   0x2F6FD0u
+
+static void gui_caret(int x, int y, int up, uint32_t c)   /* small triangle */
+{
+    for (int i = 0; i < 5; i++) {
+        int w = up ? 9 - 2 * i : 2 + 2 * i;
+        ui_fill(x + (9 - w) / 2, up ? y + i : y + 4 - i, w, 1, c);
+    }
+}
+
+/* full-width dark bar (status at top, hint at bottom), white 1x text */
+static void gui_bar(int ybot, int h, const char *left, const char *center,
+                    const char *right)
+{
+    int W = G.fbw_px;
+    ui_fill_grad(0, ybot, W, h, ui_rgb(0x56, 0x62, 0x74), ui_rgb(0x1E, 0x26, 0x33));
+    ui_fill(0, ybot + h - 1, W, 1, ui_rgb(0x0A, 0x0E, 0x14));
+    int ty = ybot + (h - 16) / 2;
+    if (left && left[0]) {
+        char t[128];
+        snprintf(t, sizeof t, "%.126s", left);
+        ui_text_sh(8, ty, 1, t, GUI_WHITE, ui_rgb(0x10, 0x14, 0x1C));
+    }
+    if (right && right[0]) {
+        char t[128];
+        snprintf(t, sizeof t, "%.126s", right);
+        ui_text_sh(W - 8 - ui_text_width(1, t), ty, 1, t, GUI_WHITE,
+                   ui_rgb(0x10, 0x14, 0x1C));
+    }
+    if (center && center[0]) {
+        char t[128];
+        snprintf(t, sizeof t, "%.126s", center);
+        int cx = (W - ui_text_width(1, t)) / 2;
+        ui_text_sh(cx, ty, 1, t, GUI_WHITE, ui_rgb(0x10, 0x14, 0x1C));
+    }
+}
+
+/* compose the same right-side info string the text status bar shows */
+static void gui_infobar(char *right, size_t cap)
+{
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char ts[32];
+    strftime(ts, sizeof ts, "%H:%M", &tm);
+    long operstate = k93_sysinfo_long("/sys/class/net/eth0/operstate");
+    if (operstate < 0) operstate = k93_sysinfo_long("/sys/class/net/enp0s3/operstate");
+    long cap_b = k93_sysinfo_long("/sys/class/power_supply/BAT0/capacity");
+    if (cap_b < 0) cap_b = k93_sysinfo_long("/sys/class/power_supply/CMB0/capacity");
+    snprintf(right, cap, "%ld%% %s %s", cap_b >= 0 ? cap_b : 100L,
+             operstate == 1 ? "up" : "down", ts);
+}
+
+static void gui_statusbar(const char *carrier)
+{
+    char right[64];
+    gui_infobar(right, sizeof right);
+    gui_bar(0, 20, carrier ? carrier : G.appname, NULL, right);
+    /* full-width pure-white gloss line: chrome accent + the screendump
+     * signature (horizontal run in landscape, vertical after rot90) */
+    ui_fill(0, 20, G.fbw_px, 2, ui_rgb(0xFF, 0xFF, 0xFF));
+}
+
+static void gui_hintbar(const char *msg)
+{
+    gui_bar(G.fbh_px - 24, 24, msg, NULL, NULL);
+}
+
+/* blue-gray beveled nav bar with a bold centered title */
+static void gui_navbar(const char *title)
+{
+    int W = G.fbw_px;
+    ui_fill_grad(0, 20, W, 44, ui_rgb(0xB6, 0xC2, 0xD4), ui_rgb(0x83, 0x92, 0xA8));
+    ui_fill(0, 20, W, 1, ui_rgb(0xD8, 0xE0, 0xEA));
+    ui_fill(0, 63, W, 1, ui_rgb(0x4E, 0x5A, 0x6C));
+    if (title && title[0]) {
+        char t[160];
+        snprintf(t, sizeof t, "%.158s", title);
+        int cx = (W - ui_text_width(1, t)) / 2;
+        ui_text_sh(cx, 34, 1, t, GUI_WHITE, ui_rgb(0x3A, 0x46, 0x58));
+    }
+}
+
+/* light grouped page with a rounded white panel; returns panel rect */
+static void gui_page(const char *title, int panel_h, int *px, int *py,
+                     int *pw, int *ph)
+{
+    ui_clear();
+    ui_statusbar(NULL);
+    gui_navbar(title);
+    ui_fill(0, 64, G.fbw_px, G.fbh_px - 64 - 24, ui_rgb(0xCB, 0xD2, 0xDC));
+    int margin = 24;
+    int w = G.fbw_px - 2 * margin;
+    int y = 88;
+    if (panel_h > G.fbh_px - 64 - 24 - 40) panel_h = G.fbh_px - 64 - 24 - 40;
+    ui_roundrect(margin, y, w, panel_h, 12, ui_rgb(0xFF, 0xFF, 0xFF),
+                 ui_rgb(0xEC, 0xEF, 0xF4));
+    *px = margin; *py = y; *pw = w; *ph = panel_h;
+}
+
+/* one row inside a grouped panel; sel draws the iOS blue capsule with a
+ * caret + white bold label, otherwise dark label on the white cell. */
+#define GUI_ROW_H 34
+static void gui_row(int x, int y, int w, const char *label, int sel)
+{
+    if (sel) {
+        ui_roundrect(x + 4, y + 2, w - 8, GUI_ROW_H - 4, 9,
+                     ui_tint(GUI_SEL0, 118, 100), GUI_SEL1);
+        gui_caret(x + 12, y + GUI_ROW_H / 2 - 2, 1, GUI_WHITE);
+        ui_text_bold(x + 30, y + (GUI_ROW_H - 16) / 2, 1, label, GUI_WHITE,
+                     ui_rgb(0x1E, 0x40, 0x80));
+    } else {
+        ui_text_sh(x + 30, y + (GUI_ROW_H - 16) / 2, 1, label, GUI_INK,
+                   ui_rgb(0xEE, 0xF1, 0xF6));
+        ui_fill(x + 4, y + GUI_ROW_H - 1, w - 8, 1, GUI_SEP);
+    }
+}
+
+/* ---- status bar / status message: graphical skin over the text logic --- */
+
 void ui_statusbar(const char *title)
 {
+    if (G.backend == BACK_FB) {
+        gui_statusbar(title);
+        ui_flush();
+        return;
+    }
     char left[256], right[128], mid[128] = "";
     time_t now = time(NULL);
     struct tm tm;
@@ -424,20 +816,20 @@ void ui_statusbar(const char *title)
         snprintf(left, sizeof left, "%s", G.appname);
     snprintf(bar, sizeof bar, "%-*.s %s", 0, "", "");
     /* compose: left  mid  right(battery+clock) */
-    char row[512];
+    char row[256];
     int width = G.cols;
     char rightfull[160];
-    snprintf(rightfull, sizeof rightfull, "%s %s", bat, right);
+    snprintf(rightfull, sizeof rightfull, "%.60s %.60s", bat, right);
     int rl = (int)strlen(rightfull);
-    int ll = (int)strlen(left);
-    int ml = (int)strlen(mid);
-    if (ll + ml + rl + 3 > width) { ml = 0; }
-    int pad1 = width - ll - rl - ml;
-    if (pad1 < 1) pad1 = 1;
-    snprintf(row, sizeof row, "%s%*s%s%s", left, pad1, "", mid, "");
+    int padw = width - rl - 1 < 0 ? 0 : width - rl - 1;
+    if (padw > 120) padw = 120;              /* keep inside row[256] */
+    snprintf(row, sizeof row, "%.80s%*s%.80s", left, padw, "", mid);
     /* place right text at the end */
     char full[512];
-    snprintf(full, sizeof full, "%-*s%s", width - rl - 1 < 0 ? 0 : width - rl - 1, row, rightfull);
+    int plen = (int)strlen(row);
+    int pad2 = 320 - plen;               /* 320 + rightfull[160] < 512 */
+    if (pad2 < 0) pad2 = 0;
+    snprintf(full, sizeof full, "%-*s%.159s", pad2, row, rightfull);
     ui_puts_inv(0, 0, full);
     (void)bar;
     ui_flush();
@@ -445,6 +837,11 @@ void ui_statusbar(const char *title)
 
 void ui_statusmsg(const char *msg)
 {
+    if (G.backend == BACK_FB) {
+        gui_hintbar(msg ? msg : "");
+        ui_flush();
+        return;
+    }
     char row[512];
     snprintf(row, sizeof row, "%-*.s", 0, "");
     char clean[512];
@@ -1053,14 +1450,37 @@ void ui_shutdown(void)
 
 /* ---------------------------------------------------------------- widgets */
 
+/* draw one frame of a grouped menu (graphical backend) */
+static void menu_gui(const char *title, const char *const *items, int n,
+                     int sel, int top)
+{
+    int avail = G.fbh_px - 64 - 24 - 24;          /* below navbar, above hint */
+    int view = avail / GUI_ROW_H;
+    if (view < 1) view = 1;
+    int px, py, pw, ph;
+    int rows = n - top < view ? n - top : view;
+    gui_page(title, rows * GUI_ROW_H + 8, &px, &py, &pw, &ph);
+    for (int i = 0; i < rows; i++)
+        gui_row(px, py + 4 + i * GUI_ROW_H, pw, items[top + i], top + i == sel);
+    if (top > 0) gui_caret(px + pw - 18, py + 6, 0, GUI_SUBINK);
+    if (top + view < n) gui_caret(px + pw - 18, py + ph - 12, 1, GUI_SUBINK);
+    ui_statusmsg("Up/Down select   Enter open   Esc back");
+    ui_flush();
+}
+
 int ui_menu(const char *title, const char *const *items, int n, int sel)
 {
     if (sel < 0) sel = 0;
     if (n <= 0) return -1;
     int top = 0;
     int view = G.rows - 4;
+    if (G.backend == BACK_FB)
+        view = (G.fbh_px - 64 - 24 - 24) / GUI_ROW_H;   /* grouped rows */
     if (view < 1) view = 1;
     for (;;) {
+        if (G.backend == BACK_FB) {
+            menu_gui(title, items, n, sel, top);
+        } else {
         ui_clear();
         ui_statusbar(title);
         for (int i = 0; i < view && top + i < n; i++) {
@@ -1075,6 +1495,7 @@ int ui_menu(const char *title, const char *const *items, int n, int sel)
         if (top + view < n) ui_printf(G.cols - 4, G.rows - 2, "[v]");
         ui_statusmsg("Up/Down select  Enter open  Esc back");
         ui_flush();
+        }
         int k = ui_getkey(250);
         switch (k) {
         case UI_KEY_UP: case UI_KEY_CHAR_BASE + 'k':
@@ -1096,8 +1517,53 @@ int ui_menu(const char *title, const char *const *items, int n, int sel)
     }
 }
 
+/* iOS-style alert: light rounded panel, title, body lines, blue OK button.
+ * Returns the pixel geometry so the caller can draw the button label. */
+static void msgbox_gui(const char *title, const char *body, int *bx, int *by,
+                       int *bw, int *bh)
+{
+    int px, py, pw;
+    int avail = G.fbh_px - 64 - 24 - 24;
+    int ph = avail < 320 ? avail : 320;
+    gui_page(title, ph, &px, &py, &pw, &ph);
+    int tx = px + 24, ty = py + 20, wrap = (pw - 48) / 8;
+    if (wrap < 8) wrap = 8;
+    char tmp[1024];
+    k93_strlcpy(tmp, body ? body : "", sizeof tmp);
+    char *save = NULL;
+    for (char *line = strtok_r(tmp, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        /* wrap each logical line to the panel width, one visual line per pass */
+        while (*line && ty <= py + ph - 60) {
+            int take = (int)strlen(line);
+            if (take > wrap) take = wrap;
+            char chunk[512];
+            snprintf(chunk, sizeof chunk, "%.*s", take, line);
+            ui_text(tx, ty, 1, chunk, GUI_INK);
+            ty += 20;
+            line += take;
+        }
+        if (ty > py + ph - 60) break;
+    }
+    int w = 120, h = 40;
+    int x = px + (pw - w) / 2, y = py + ph - h - 16;
+    ui_roundrect(x, y, w, h, 10, ui_tint(GUI_SEL0, 118, 100), GUI_SEL1);
+    *bx = x; *by = y; *bw = w; *bh = h;
+}
+
 void ui_msgbox(const char *title, const char *body)
 {
+    if (G.backend == BACK_FB) {
+        int bx, by, bw, bh;
+        msgbox_gui(title, body, &bx, &by, &bw, &bh);
+        const char *ok = "OK";
+        ui_text_bold(bx + (bw - ui_text_width(1, ok)) / 2, by + (bh - 16) / 2,
+                     1, ok, GUI_WHITE, 0x1E4080);
+        ui_statusmsg("Press any key");
+        ui_flush();
+        while (ui_getkey(250) == UI_KEY_NONE) ;
+        return;
+    }
     ui_clear();
     ui_statusbar(title);
     int y = 2;
@@ -1113,8 +1579,38 @@ void ui_msgbox(const char *title, const char *body)
     while (ui_getkey(250) == UI_KEY_NONE) ;
 }
 
+/* one large action button (icon/confirm skin). sel draws the blue capsule. */
+static void gui_button(int x, int y, int w, int h, const char *label, int sel)
+{
+    if (sel)
+        ui_roundrect(x, y, w, h, 9, ui_tint(GUI_SEL0, 118, 100), GUI_SEL1);
+    else
+        ui_roundrect(x, y, w, h, 9, ui_rgb(0xF4, 0xF6, 0xF9), ui_rgb(0xDD, 0xE2, 0xEA));
+    int tx = x + (w - ui_text_width(1, label)) / 2;
+    int ty = y + (h - 16) / 2;
+    if (sel) ui_text_bold(tx, ty, 1, label, GUI_WHITE, 0x1E4080);
+    else     ui_text_bold(tx, ty, 1, label, GUI_INK, 0xFFFFFF);
+}
+
 int ui_confirm(const char *title, const char *body)
 {
+    if (G.backend == BACK_FB) {
+        const char *opts[2] = { "Cancel", "Continue" };
+        int sel = 1;                    /* blue = confirm */
+        for (;;) {
+            int bx, by, bw, bh;
+            msgbox_gui(title, body, &bx, &by, &bw, &bh);
+            int half = bw / 2 - 6;
+            gui_button(bx, by, half, bh, opts[0], sel == 0);
+            gui_button(bx + bw - half, by, half, bh, opts[1], sel == 1);
+            ui_statusmsg("Left/Right choose   Enter select   Esc cancel");
+            ui_flush();
+            int k = ui_getkey(250);
+            if (k == UI_KEY_LEFT || k == UI_KEY_RIGHT || k == UI_KEY_TAB) sel = !sel;
+            else if (k == UI_KEY_ENTER) return sel;
+            else if (k == UI_KEY_ESC || k == UI_KEY_CTRL_C) return 0;
+        }
+    }
     const char *items[] = { "Cancel", "Yes, continue" };
     int r = ui_menu(title, items, 2, 0);
     (void)body;
@@ -1126,6 +1622,20 @@ int ui_input(const char *prompt, char *buf, size_t cap)
     size_t len = strlen(buf);
     size_t cur = len;
     for (;;) {
+        if (G.backend == BACK_FB) {
+            int px, py, pw, ph;
+            gui_page(prompt, 3, &px, &py, &pw, &ph);
+            ph = 72;
+            ui_roundrect(px, py, pw, ph, 8, ui_rgb(0xFF, 0xFF, 0xFF),
+                         ui_rgb(0xE8, 0xEC, 0xF2));
+            char shown[512];
+            snprintf(shown, sizeof shown, "%.480s", buf);
+            ui_text(px + 14, py + (ph - 16) / 2, 1, shown, GUI_INK);
+            int cx = px + 14 + ui_text_width(1, shown);
+            ui_fill(cx, py + (ph - 16) / 2, 9, 16, GUI_SEL0);   /* caret */
+            ui_statusmsg("Enter accept   Esc cancel   (type to enter)");
+            ui_flush();
+        } else {
         ui_clear();
         ui_statusbar(prompt);
         ui_puts(0, 2, "> ");
@@ -1137,6 +1647,7 @@ int ui_input(const char *prompt, char *buf, size_t cap)
         ui_puts(2 + (int)cur, 3, cursor);
         ui_statusmsg("Enter accept  Esc cancel  (chars to type)");
         ui_flush();
+        }
         int k = ui_getkey(250);
         if (k == UI_KEY_ENTER) return 0;
         if (k == UI_KEY_ESC || k == UI_KEY_CTRL_C) return 1;
@@ -1158,6 +1669,24 @@ int ui_input(const char *prompt, char *buf, size_t cap)
 
 static void textview_render(const char *title, char **lines, int nlines, int top, int sel)
 {
+    if (G.backend == BACK_FB) {
+        /* document skin: white page, dark text, blue selection band */
+        int px, py, pw, ph;
+        gui_page(title, G.fbh_px - 64 - 24 - 12, &px, &py, &pw, &ph);
+        int view = (ph - 8) / 18; if (view < 1) view = 1;
+        for (int i = 0; i < view && top + i < nlines; i++) {
+            int y = py + 4 + i * 18;
+            if (top + i == sel) {
+                ui_roundrect(px + 2, y - 1, pw - 4, 19, 4, ui_tint(GUI_SEL0, 112, 100), GUI_SEL1);
+                ui_text(px + 14, y, 1, lines[top + i], GUI_WHITE);
+            } else {
+                ui_text(px + 14, y, 1, lines[top + i], GUI_INK);
+            }
+        }
+        ui_statusmsg("Up/Dn scroll   PgUp/PgDn   Esc close");
+        ui_flush();
+        return;
+    }
     ui_clear();
     ui_statusbar(title);
     int view = G.rows - 4;
@@ -1195,8 +1724,11 @@ int ui_textview(const char *title, const char *text)
     int top = 0, sel = 0;
     for (;;) {
         textview_render(title, lines, n, top, sel);
+        int view = G.rows - 4;
+        if (G.backend == BACK_FB)
+            view = (G.fbh_px - 64 - 24 - 12 - 8) / 18;
+        if (view < 1) view = 1;
         int k = ui_getkey(250);
-        int view = G.rows - 4; if (view < 1) view = 1;
         switch (k) {
         case UI_KEY_UP: if (sel > 0) sel--; break;
         case UI_KEY_DOWN: if (sel < n - 1) sel++; break;

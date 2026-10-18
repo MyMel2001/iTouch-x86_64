@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#ff604a"/><stop offset="1" stop-color="#772b21"/>
+</linearGradient>
+<linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/>
+<stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+</linearGradient>
+</defs>
+<rect x="1" y="1" width="78" height="78" rx="17" ry="17" fill="url(#bg)"/>
+<path d="M1,18 A17,17 0 0 1 18,1 H62 A17,17 0 0 1 79,18 V38 C58,51 22,51 1,38 Z" fill="url(#gloss)"/>
+<rect x="24" y="17" width="4" height="9" rx="2" fill="#fff"/><rect x="52" y="17" width="4" height="9" rx="2" fill="#fff"/><rect x="17" y="21" width="46" height="42" rx="5" fill="#fff"/><path d="M17,26 a5,5 0 0 1 5,-5 h36 a5,5 0 0 1 5,5 v7 h-46 z" fill="#863025"/><circle cx="26" cy="42" r="2.4" fill="#863025"/><circle cx="40" cy="42" r="2.4" fill="#863025"/><circle cx="54" cy="42" r="2.4" fill="#863025"/><circle cx="26" cy="50" r="2.4" fill="#863025"/><circle cx="40" cy="50" r="2.4" fill="#863025"/><circle cx="54" cy="50" r="2.4" fill="#863025"/>
+<rect x="1.5" y="1.5" width="77" height="77" rx="16.5" ry="16.5" fill="none" stroke="#ffffff" stroke-opacity="0.35"/>
+<rect x="1.5" y="1.5" width="77" height="77" rx="16.5" ry="16.5" fill="none" stroke="#000000" stroke-opacity="0.15" transform="translate(0,1)"/>
+</svg>

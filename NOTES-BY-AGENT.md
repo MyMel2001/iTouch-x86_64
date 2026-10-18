@@ -310,3 +310,43 @@ Findings (behaviour study for clean-room fidelity only):
   decompilation pass over selected functions yet (rerun headless against
   the saved project to extend); `fairplayd.K93` was not found under
   `/usr/libexec` on this rootfs.
+
+## 6. TUI -> GUI pass (2026-10-17)
+
+Goal: make the text-menu apps look like a period GUI on the framebuffer
+without touching the serial paths that autotest greps.
+
+* `k93ui.c` grew a pixel layer: `ui_rgb`/`ui_tint` (shade derivation from
+  one base color — code instead of per-color assets), `ui_fill`,
+  `ui_fill_grad`, `ui_roundrect`, `ui_frame`, `ui_blit` (straight-alpha
+  0xAARRGGBB), `ui_text{,_sh,_bold}` with scale, `ui_text_width`,
+  `ui_px_width/height`. All no-op off the FB backend. `ui_clear` fills a
+  dark page gradient and glyph cells inherit it, so unmodified text UIs
+  sit on shaded chrome instead of black.
+* Widget GUI skins live in the toolkit (one place): status/hint bars,
+  beveled nav bar, grouped white panels, blue selection capsule +
+  caret, alert panel with wrapped body and a blue OK, two-button
+  confirm, input field, document page for `ui_textview`. Text backend
+  branches keep the old cell rendering byte-for-byte.
+* Icons: `tools/genicons.py` emits one rounded-square glossy SVG per app
+  (original geometry; base hue per app, gradient stops/ink from
+  `tint()`), rasterises via ImageMagick/librsvg to committed 80x80 PNGs
+  in `assets/icons/`, and compiles `build/gen/icons.c` (linked into
+  libk93.a, like `font8x16.o`). `k93_icon_by_name` resolves bare names,
+  bundle idents (`com.k93.files` -> `files`) and substrings, falling
+  back to the generic tile. No runtime decoder (SDK has no zlib use for
+  it) — ceiling documented, upgrade path = decode PNGs at boot.
+* SpringBoard home: wallpaper + status bar + icon grid + labels +
+  selection capsule + launch splash; 2D arrow navigation (cols=1 in the
+  text backend so UP/DOWN stay linear).
+* Screendump check rewritten (`tools/check-screendump.py`): longest
+  pure-white horizontal vs vertical run, >=200px in the expected
+  orientation and <200 in the other. The signature is the status bar's
+  full-width white gloss line (rotates with the canvas in portrait).
+  fbcon garbage (~16px runs) fails it, as before.
+* New `tools/qmp-input.py` (send-key drive-by) verified launched apps
+  visually: Music menu skin and AdSheet alert panel captured via QMP
+  screendump. `make qemu-test` all four phases green after the change;
+  SDK (`k93sdk new` template) and `touchdova new` scaffolds build
+  against the new toolkit; touchdova pages get the GUI document skin
+  via `ui_textview` with no app-side change.

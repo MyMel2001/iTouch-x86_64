@@ -51,7 +51,28 @@ registry reads: `CFBundleName`, `CFBundleDisplayName`,
 `#include "k93ui.h"` gives you the K93OS UI: `ui_init`, `ui_menu`,
 `ui_msgbox`, `ui_confirm`, `ui_input`, `ui_textview`, keyboard/input events.
 Works on the framebuffer (DRM/KMS, 8x16 font) and the serial/VT text
-console — same code, backend picked at runtime.
+console — same code, backend picked at runtime. On the framebuffer the
+shared widgets render a GUI skin (status/nav bars, grouped white panels,
+blue selection) automatically; the text console keeps the plain list look.
+
+For custom drawing on the framebuffer there is a pixel API (no-ops on the
+text console, so one binary runs both ways):
+
+```c
+if (ui_is_graphical()) {
+    ui_fill_grad(0, 0, ui_px_width(), ui_px_height(),
+                 ui_rgb(0x1B, 0x2A, 0x4A), ui_rgb(0x0B, 0x11, 0x20));
+    ui_roundrect(40, 40, 240, 60, 12, ui_rgb(0x5C, 0x9C, 0xF0),
+                 ui_rgb(0x2F, 0x6F, 0xD0));            /* gradient capsule */
+    ui_text_sh(60, 60, 1, "Hello", ui_rgb(0xFF, 0xFF, 0xFF), 0x1E4080);
+    ui_flush();
+}
+```
+
+`ui_tint(base, num, den)` derives shades from one base color — use it for
+button/label variants instead of shipping per-color art. `ui_blit(x, y, w,
+h, pixels)` draws 0xAARRGGBB pixel art (icons); supply your own arrays,
+there is no image decoder at runtime.
 
 - C: `examples/c-hello`
 - Zig: talk to libk93 through `extern fn` declarations, see `examples/zig-hello`

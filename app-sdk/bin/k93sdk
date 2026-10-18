@@ -98,7 +98,10 @@ VERSION=1.0
 EXECUTABLE=$exec_name
 EOF
     cat > "$dir/main.c" <<EOF
-/* $name - K93OS-x86 app (built with: k93sdk build . && k93sdk bundle .) */
+/* $name - K93OS-x86 app (built with: k93sdk build . && k93sdk bundle .)
+ * Widgets render a GUI skin on the framebuffer automatically; for custom
+ * drawing see the pixel API (ui_fill/ui_roundrect/ui_blit/ui_text) in
+ * app-sdk/README.md. */
 #include "k93ui.h"
 
 int main(void)

@@ -22,8 +22,8 @@ CFLAGS  += -I$(ZDIR) -I$(MDIR)/include
 LDLIBS_Z := $(ZLIBA)
 LDLIBS_TLS := $(MBEDLIB)/libmbedtls.a $(MBEDLIB)/libmbedx509.a $(MBEDLIB)/libmbedcrypto.a
 
-LIBK93_SRC := $(wildcard $(TOP)/userspace/libk93/*.c) $(GEN)/font8x16.c
-LIBK93_OBJ := $(patsubst $(TOP)/userspace/libk93/%.c,$(BUILD)/obj/%.o,$(filter $(TOP)/userspace/libk93/%,$(LIBK93_SRC))) $(GEN)/font8x16.o
+LIBK93_SRC := $(wildcard $(TOP)/userspace/libk93/*.c) $(GEN)/font8x16.c $(GEN)/icons.c
+LIBK93_OBJ := $(patsubst $(TOP)/userspace/libk93/%.c,$(BUILD)/obj/%.o,$(filter $(TOP)/userspace/libk93/%,$(LIBK93_SRC))) $(GEN)/font8x16.o $(GEN)/icons.o
 
 # ---------------------------------------------------------------- apps
 APPS := springboard settings files terminal installer installtohd \
@@ -72,6 +72,13 @@ $(BUILD)/obj/%.o: $(TOP)/userspace/libk93/%.c | $(UAPI)/.stamp
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(GEN)/font8x16.o: $(GEN)/font8x16.c | $(UAPI)/.stamp
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(GEN)/icons.c: $(TOP)/tools/genicons.py
+	@mkdir -p $(GEN) $(TOP)/assets/icons
+	python3 $(TOP)/tools/genicons.py $(TOP)/assets/icons $@
+
+$(GEN)/icons.o: $(GEN)/icons.c | $(UAPI)/.stamp
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 LIBK93 := $(BUILD)/libk93.a

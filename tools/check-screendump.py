@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Validate a K93OS SpringBoard screendump (PPM P6) actually rendered the UI.
+"""Validate a K93OS SpringBoard screendump (PPM P6) rendered the GUI home.
 
-SpringBoard's app list marks the selected entry with an inverted text row: a
-solid white band with black letter cut-outs. In landscape that row is a
-horizontal white band near the top; the portrait rot90 blit turns it into a
-vertical white band near the right edge. That band is a robust signature of the
-rendered framebuffer UI (fbcon glyph garbage or a blank/failed scanout will not
-produce a clean, long, white-dominant run), unlike a raw non-black pixel count.
+The GUI home draws a status bar with a full-width pure-white 2px gloss line
+right under it. In landscape that is a horizontal white run near the top of the
+frame; the portrait rot90 blit turns the same line into a vertical white run
+near one side. That run is a robust signature of the drawn framebuffer (fbcon
+glyph garbage or a blank/failed scanout will not produce one clean, long,
+white-dominant run).
 
 usage: check-screendump.py SCREEN.PPM {landscape|portrait}
-exit 0 = expected orientation's UI is present; 1 = not rendered / wrong.
+exit 0 = expected orientation's GUI is present; 1 = not rendered / wrong.
 """
 import sys
+
+MIN_RUN = 200
 
 
 def load(path):
@@ -27,51 +29,53 @@ def is_white(buf, w, x, y):
     return buf[i] == 255 and buf[i + 1] == 255 and buf[i + 2] == 255
 
 
-def longest_run(buf, w, h, horizontal, y=None, x=None, step=2, minfrac=0.5):
-    """Longest contiguous white run along a row (horizontal) or column."""
-    best = cur = 0
+def max_run(buf, w, h, horizontal):
+    """Longest pure-white run scanning every row (horizontal) or column."""
+    best = 0
     if horizontal:
-        rng = range(0, w, step)
-        for xx in rng:
-            if is_white(buf, w, xx, y):
-                cur += step
-                best = max(best, cur)
-            else:
-                cur = 0
+        for y in range(h):
+            run = 0
+            base = y * w * 3
+            for x in range(w):
+                i = base + x * 3
+                if buf[i] == 255 and buf[i + 1] == 255 and buf[i + 2] == 255:
+                    run += 1
+                    if run > best:
+                        best = run
+                else:
+                    run = 0
     else:
-        rng = range(0, h, step)
-        for yy in rng:
-            if is_white(buf, w, x, yy):
-                cur += step
-                best = max(best, cur)
-            else:
-                cur = 0
+        for x in range(w):
+            run = 0
+            for y in range(h):
+                i = (y * w + x) * 3
+                if buf[i] == 255 and buf[i + 1] == 255 and buf[i + 2] == 255:
+                    run += 1
+                    if run > best:
+                        best = run
+                else:
+                    run = 0
     return best
 
 
 def main():
     if len(sys.argv) != 3 or sys.argv[2] not in ("landscape", "portrait"):
-        sys.exit("usage: check-screendump.py SCREEN.PPM {landscape|portrait}")
-    want = sys.argv[2]
-    buf, w, h = load(sys.argv[1])
-
-    # Scan a few candidate rows near the top for a long horizontal white run
-    # (the landscape selected-entry band), and a few candidate columns near the
-    # right edge for a long vertical run (the portrait band after rot90).
-    horiz = max(longest_run(buf, w, h, True, y=y) for y in (32, 40, 48, 56))
-    vert = max(longest_run(buf, w, h, False, x=x) for x in (w - 48, w - 40, w - 32))
-
-    ok_h = horiz >= 200
-    ok_v = vert >= 200
-    if want == "landscape" and ok_h:
-        print(f"check-screendump: landscape UI present (h-band {horiz}px)")
-        return 0
-    if want == "portrait" and ok_v and not ok_h:
-        print(f"check-screendump: portrait UI present (v-band {vert}px)")
-        return 0
-    print(f"check-screendump: FAIL want={want} horiz={horiz} vert={vert}")
-    return 1
+        sys.exit(__doc__)
+    path, orient = sys.argv[1], sys.argv[2]
+    buf, w, h = load(path)
+    horiz = max_run(buf, w, h, True)
+    vert = max_run(buf, w, h, False)
+    print(f"{path} {w}x{h} orient={orient} max_h_white_run={horiz} "
+          f"max_v_white_run={vert} (need >= {MIN_RUN} in expected axis, "
+          f"< {MIN_RUN} in other)")
+    if orient == "landscape":
+        ok = horiz >= MIN_RUN and vert < MIN_RUN
+    else:
+        ok = vert >= MIN_RUN and horiz < MIN_RUN
+    if not ok:
+        sys.exit(f"FAIL: expected orientation {orient} white run not found")
+    print("PASS")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
