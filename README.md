@@ -111,8 +111,12 @@ printable keys). Quit QEMU with `Ctrl-A` `X`.
 ## Images
 
 * `build/initrd.cpio.gz` — the full rootfs as initramfs (what QEMU boots)
-* `build/osdisk.img` — ext4 "OS disk image", populated offline with
-  `mke2fs -d` (no root needed); mountable loopback, installable to media
+* `build/osdisk.img` — BIOS-bootable disk: MBR + GRUB (installed rootless
+  by hand: `boot.img` to sector 0, `core.img` to sector 1, `sfdisk`
+  partition table, `mke2fs -E offset=1M -d`) + ext4 partition at 1 MiB
+  holding rootfs, `/boot/vmlinuz` and `/boot/initrd.cpio.gz`. QEMU boots
+  it with no `-kernel`/`-initrd` (`make qemu-test` phase 4). Also
+  loopback-mountable at offset 1 MiB (no root needed to build)
 * `build/hdd16.img` — 16 GB sparse data disk; target for **InstallToHD**,
   which writes a fresh GPT (1 MiB aligned, Linux root + swap) and verifies
   it by re-reading
@@ -166,8 +170,10 @@ new MyApp` scaffolds an HTML-subset app with a `k93://` native bridge
   no USB audio.
 * DMG: UDZO/UDIF only (no sparse bundles, no encryption) — rejected
   clearly otherwise.
-* VM boots via QEMU `-kernel`/`-initrd`; bare-metal boot would need a
-  bootloader on `osdisk.img`.
+* Test VMs still boot via QEMU `-kernel`/`-initrd`; `osdisk.img` now
+  carries a BIOS/MBR GRUB (installed rootless by `mkdisk.sh`) so the disk
+  boots on its own — verified in `make qemu-test` phase 4. UEFI and
+  real-hardware firmware support are untested.
 * No code-signing exists at all (not as a check to bypass — as a design
   choice; see Settings > Root Access).
 * touchdova: no JavaScript engine (static HTML + `k93://` bridge only).

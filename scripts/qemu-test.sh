@@ -120,7 +120,36 @@ kill $QPID3 2>/dev/null || true
 wait $QPID3 2>/dev/null || true
 if [ "$prc" = 0 ] && python3 "$TOP/tools/check-screendump.py" "$PPM2" portrait; then
     echo "PORTRAIT TEST PASS (rotated canvas: $PPM2)"
+else
+    echo "PORTRAIT TEST FAIL (portrait_seen=$portrait_seen, log: $PLOG)"
+    exit 1
+fi
+
+# --------------------------------------------- phase 4: GRUB boot from osdisk
+# No -kernel/-initrd: the firmware must load the MBR boot code, GRUB's
+# core.img (sector 1), the ext4 partition (1 MiB) and only then the kernel
+# and initrd that live in /boot on the image.
+GLOG="$BUILD/serial-grub.log"
+rm -f "$GLOG"
+qemu-system-x86_64 \
+    -m 1536 -smp 1 -machine pc "${ACCEL[@]}" \
+    -drive "file=$BUILD/osdisk.img,format=raw" \
+    -drive "file=$BUILD/hdd16.img,if=virtio,format=raw" \
+    -vga none -device virtio-gpu-pci -display vnc=127.0.0.1:78 \
+    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+    -serial "file:$GLOG" -monitor none -no-reboot &
+QPID4=$!
+grub_seen=0
+for _ in $(seq 1 120); do
+    if grep -q "started com.k93.springboard" "$GLOG" 2>/dev/null; then grub_seen=1; break; fi
+    kill -0 $QPID4 2>/dev/null || break
+    sleep 1
+done
+kill $QPID4 2>/dev/null || true
+wait $QPID4 2>/dev/null || true
+if [ "$grub_seen" = 1 ] && grep -q "Booting \`K93OS" "$GLOG"; then
+    echo "GRUB BOOT TEST PASS (MBR -> core.img -> ext4 -> SpringBoard: $GLOG)"
     exit 0
 fi
-echo "PORTRAIT TEST FAIL (portrait_seen=$portrait_seen, log: $PLOG)"
+echo "GRUB BOOT TEST FAIL (grub_seen=$grub_seen, log: $GLOG)"
 exit 1

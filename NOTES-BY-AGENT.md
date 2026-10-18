@@ -216,9 +216,12 @@ Known ceilings (documented, not bugs):
   HDA only (no USB audio). Wired NICs only (no wireless drivers).
 * DMG: UDZO/koly/mish only; sparse bundles + encrypted images rejected
   with clear errors. Binary plists rejected with clear errors.
-* VM boots via QEMU `-kernel`/`-initrd`; `osdisk.img` (ext4, populated
-  offline with `mke2fs -d`) is the installable OS disk artifact — a
-  bootloader (grub/syslinux) would be needed for bare-metal boot.
+* VM tests boot via QEMU `-kernel`/`-initrd`; `osdisk.img` is BIOS-bootable:
+  MBR + GRUB core.img at sector 1 + ext4 partition at 1 MiB (rootfs, /boot
+  with vmlinuz+initrd), installed rootless by `mkdisk.sh` (`boot.img` via dd,
+  `sfdisk` table, `grub2-mkimage`, `mke2fs -E offset`; grub2-install needs
+  loop+root, so it is never used). Covered by `make qemu-test` phase 4.
+  UEFI/real-hardware firmware untested.
 * REA Mach-O deep inspection needs macOS or Ghidra headless (see above).
 * Graphics stack is DRM/KMS, not fbdev: this kernel is built with
   `CONFIG_FB_DEVICE=n` (`/dev/fb0` + `/sys/class/graphics/fb0` never exist —
