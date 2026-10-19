@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include "k93ui.h"
 #include "k93util.h"
+#include "k93font.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -615,10 +616,52 @@ void ui_blit(int x, int y, int w, int h, const uint32_t *src)
     ui_blit_scaled(x, y, w, h, src, w, h);   /* 1:1 sampling == plain blit */
 }
 
-/* draw the 8x16 font at a pixel position, scale >= 1, opaque fg */
-static void text_draw(int x, int y, int scale, const char *s, uint32_t fg)
+/* scalable-system-font path: rasterize each glyph from the scanned TTF and
+ * blend into the shadow buffer; falls through to the 8x16 bitmaps when no
+ * font file was found (k93font_ready()==0) */
+static void text_draw_ttf(int x, int y, int scale, const char *s,
+                          uint32_t fg, int bold)
 {
-    if (G.backend != BACK_FB || scale < 1) return;
+    int base = y + k93font_baseline(scale);
+    float pen = 0;
+    uint32_t prev = 0;
+    int i = 0;
+    while (s[i]) {
+        uint32_t cp = k93_utf8_next(s, &i);
+        int gw, gh, xo, yo;
+        float adv;
+        uint8_t *al = k93font_glyph(prev, cp, scale, bold,
+                                    &gw, &gh, &xo, &yo, &adv);
+        if (al) {
+            int px0 = x + (int)(pen + 0.5f) + xo;
+            int py0 = base + yo;
+            for (int r = 0; r < gh; r++)
+                for (int c = 0; c < gw; c++) {
+                    int a = al[r * gw + c];
+                    if (!a) continue;
+                    int dxx = px0 + c, dyy = py0 + r;
+                    if (!px_ok(dxx, dyy)) continue;
+                    if (a >= 255) { px_put(dxx, dyy, fg & 0xFFFFFF); continue; }
+                    uint32_t bg = px_get(dxx, dyy);
+                    uint32_t rr = (((fg >> 16) & 255) * a + ((bg >> 16) & 255) * (255 - a) + 127) / 255;
+                    uint32_t gg = (((fg >> 8) & 255) * a + ((bg >> 8) & 255) * (255 - a) + 127) / 255;
+                    uint32_t bb = ((fg & 255) * a + (bg & 255) * (255 - a) + 127) / 255;
+                    px_put(dxx, dyy, ui_rgb((uint8_t)rr, (uint8_t)gg, (uint8_t)bb));
+                }
+            k93font_glyph_free(al);
+        }
+        pen += adv;
+        prev = cp;
+    }
+}
+
+/* draw the font (scanned TTF when available, else 8x16 bitmap) at a pixel
+ * position, scale >= 1, opaque fg */
+static void text_draw(int x, int y, int scale, const char *s, uint32_t fg,
+                      int bold)
+{
+    if (G.backend != BACK_FB || scale < 1 || !s) return;
+    if (k93font_ready()) { text_draw_ttf(x, y, scale, s, fg, bold); return; }
     for (int ci = 0; s[ci]; ci++) {
         const uint8_t *gl = k93_font8x16 + ((unsigned char)s[ci]) * 16;
         int gx = x + ci * 8 * scale;
@@ -631,34 +674,54 @@ static void text_draw(int x, int y, int scale, const char *s, uint32_t fg)
             }
         }
     }
+    (void)bold;                       /* faux bold handled by ui_text_bold */
 }
 
 void ui_text(int x, int y, int scale, const char *s, uint32_t fg)
 {
-    text_draw(x, y, scale, s, fg);
+    text_draw(x, y, scale, s, fg, 0);
 }
 
 void ui_text_sh(int x, int y, int scale, const char *s, uint32_t fg, uint32_t shadow)
 {
     if (G.backend != BACK_FB || !s || !s[0]) return;
     int o = scale >= 2 ? 2 : 1;
-    text_draw(x, y + o, scale, s, shadow);
-    text_draw(x, y, scale, s, fg);
+    text_draw(x, y + o, scale, s, shadow, 0);
+    text_draw(x, y, scale, s, fg, 0);
 }
 
 void ui_text_bold(int x, int y, int scale, const char *s, uint32_t fg, uint32_t shadow)
 {
     if (G.backend != BACK_FB || !s || !s[0]) return;
     int o = scale >= 2 ? 2 : 1;
-    text_draw(x, y + o, scale, s, shadow);
-    text_draw(x, y, scale, s, fg);
-    text_draw(x + 1, y, scale, s, fg);   /* faux bold: overstrike */
+    if (k93font_ready()) {                  /* real bold face, both passes */
+        text_draw(x, y + o, scale, s, shadow, 1);
+        text_draw(x, y, scale, s, fg, 1);
+        return;
+    }
+    text_draw(x, y + o, scale, s, shadow, 0);
+    text_draw(x, y, scale, s, fg, 0);
+    text_draw(x + 1, y, scale, s, fg, 0);   /* faux bold: overstrike */
 }
 
 int ui_text_width(int scale, const char *s)
 {
     if (scale < 1) scale = 1;
-    return (int)strlen(s ? s : "") * 8 * scale;
+    s = s ? s : "";
+    if (G.backend == BACK_FB && k93font_ready())
+        return k93font_width(scale, s);     /* proportional advances */
+    return (int)strlen(s) * 8 * scale;
+}
+
+/* pick the text family for subsequent ui_text* calls: CSS/alias names
+ * ("sans-serif", "serif", "monospace"), a family name ("Liberation Sans"),
+ * NULL/""/"system" for the default system font. Unknown name: -1, current
+ * family kept. */
+int ui_set_font(const char *family)
+{
+    int id = k93font_id(family);
+    if (id < 0) return -1;
+    return k93font_select(id);
 }
 
 int ui_px_width(void)  { return G.backend == BACK_FB ? G.fbw_px : G.cols * 8; }
@@ -725,49 +788,29 @@ static void display_conf(char *mode, size_t mlen, char *orient, size_t olen)
     }
 }
 
-/* clean-room pointer cursor, drawn from code over the scanout after each
- * shadow->scanout copy (the shadow buffer stays clean, so partial redraws
- * never leave trails). B = black outline, W = white fill, . = clear. */
-static const char *cur_arrow[16] = {
-    "B...........",
-    "BB..........",
-    "BWB.........",
-    "BWWB........",
-    "BWWWB.......",
-    "BWWWWB......",
-    "BWWWWWB.....",
-    "BWWWWWWB....",
-    "BWWWWWWWB...",
-    "BWWWWWWWWB..",
-    "BWWWWWWWWWB.",
-    "BWWWWWBBBBB.",
-    "....BWWB....",
-    "....BWWB....",
-    ".....BWB....",
-    ".....BBB....",
-};
+/* clean-room pointer cursor: a filled CIRCLE whose pixels are the
+ * INVERTED shadow content beneath it, so the cursor shows an upside-down
+ * copy of whatever is under it and stays visible on any background
+ * (light -> dark, dark -> light). Centered at (ox,oy) == (m_x,m_y), so
+ * click targets keep pointing at the cursor position exactly.
+ * draw=0 restores the clean shadow pixel underneath (live motion leaves no
+ * trails). fb_render_all stamps the current position after every copy. */
+#define CUR_R 9
 
-/* stamp the arrow into the scanout at logical (ox,oy): draw=1 paints the
- * cursor, draw=0 restores the clean shadow pixel underneath (live motion).
- * fb_render_all stamps the current position after every full copy. */
 static void cursor_stamp(int ox, int oy, int draw)
 {
-    if (G.backend != BACK_FB || !G.fbr || !G.fbw || ox < 0) return;
+    if (G.backend != BACK_FB || !G.fbr || !G.fbw || ox < 0 || oy < 0) return;
     int bpp = G.fbbpp / 8;
-    for (int ry = 0; ry < 16; ry++) {
-        for (int rx = 0; rx < 12; rx++) {
-            int lx = ox + rx, ly = oy + ry;
+    for (int dy = -CUR_R; dy <= CUR_R; dy++) {
+        for (int dx = -CUR_R; dx <= CUR_R; dx++) {
+            if (dx * dx + dy * dy > CUR_R * CUR_R) continue;
+            int lx = ox + dx, ly = oy + dy;
             if ((unsigned)lx >= (unsigned)G.fbw_px ||
                 (unsigned)ly >= (unsigned)G.fbh_px) continue;
-            uint32_t col = 0;
-            if (draw) {
-                if (cur_arrow[ry][rx] == '.') continue;
-                col = cur_arrow[ry][rx] == 'B' ? 0u : 0xFFFFFFu;
-            } else {
-                const uint8_t *s = G.fbw + (size_t)ly * (size_t)G.wline +
-                                   (size_t)lx * (size_t)bpp;
-                col = s[0] | ((uint32_t)s[1] << 8) | ((uint32_t)s[2] << 16);
-            }
+            const uint8_t *s = G.fbw + (size_t)ly * (size_t)G.wline +
+                               (size_t)lx * (size_t)bpp;
+            uint32_t col = s[0] | ((uint32_t)s[1] << 8) | ((uint32_t)s[2] << 16);
+            if (draw) col = ~col & 0xFFFFFFu;      /* inverted beneath */
             int px, py;
             if (G.rot90) { px = G.sx - 1 - ly; py = lx; }  /* same transform
                                                               as fb_render_all */
@@ -1688,6 +1731,7 @@ int ui_init(const char *appname)
     if (G.backend == BACK_FB) {
         input_open_mouse();
         cursor_state_read();          /* keep pointer where the last app left it */
+        k93font_init();               /* scan TTF dir, best-effort (8x16 fallback) */
     }
     ui_clear();
     return 0;
@@ -1707,6 +1751,7 @@ void ui_shutdown(void)
     for (int f = 0; f < nmfd; f++) close(mfd[f]);
     nmfd = 0;
     if (G.backend == BACK_FB) cursor_state_write();
+    k93font_shutdown();
     m_x = m_y = -1;
     m_click[0] = m_click[1] = m_click[2] = 0;
     m_wheel = 0; meta_held = 0; meta_fired = 0; pending_key = -1;
@@ -2047,26 +2092,36 @@ static void page_render(const char *title, ui_page *p, int top, int sel)
                 if (l->bg && !issel)
                     ui_fill(px + 2, y, pw - 4, lh, l->bg);
                 int tw = 0;
-                for (int r = 0; r < l->nruns; r++)
+                int basef0 = k93font_default_id();
+                for (int r = 0; r < l->nruns; r++) {
+                    k93font_select(l->runs[r].font >= 0
+                                   ? l->runs[r].font : basef0);
                     tw += ui_text_width(l->scale > 0 ? l->scale : 1,
                                         l->runs[r].text);
+                }
                 int x = px + 14 + l->indent;
                 if (l->center) {
                     x = px + (pw - tw) / 2;
                     if (x < px + 14 + l->indent) x = px + 14 + l->indent;
                 }
+                int basef = k93font_default_id();
                 for (int r = 0; r < l->nruns; r++) {
                     const ui_prun *rn = &l->runs[r];
                     uint32_t fg = issel ? GUI_WHITE
                                 : (rn->link >= 0 ? PAGE_LINK : rn->fg);
                     int sc = l->scale > 0 ? l->scale : 1;
+                    int w = ui_text_width(sc, rn->text);
+                    k93font_select(rn->font >= 0 ? rn->font : basef);
                     if (rn->bold)
                         ui_text_bold(x, y + 3, sc, rn->text, fg,
                                      issel ? PAGE_SEL : 0xEEF1F6u);
                     else
                         ui_text_sh(x, y + 3, sc, rn->text, fg,
                                    issel ? PAGE_SEL : 0xFFFFFFu);
-                    x += ui_text_width(sc, rn->text);
+                    if (rn->underline)
+                        ui_fill(x, y + 3 + k93font_baseline(sc) + 1, w, 1,
+                                issel ? GUI_WHITE : fg);
+                    x += w;
                 }
             }
             y += lh;

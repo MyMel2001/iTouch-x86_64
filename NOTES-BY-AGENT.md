@@ -431,3 +431,68 @@ keeping AdSheet provider-neutral.
   converts wheel buttons to queued REL events immediately).
   QMP accepts only one live client per socket: close before spawning
   `qmp-screendump.py`, or its connect hangs forever.
+
+---
+
+## 8. Fonts / SVG / CSS+JS / SDK API pass (2026-10-18/19)
+
+* TTF engine `libk93/k93font.c` + `include/k93font.h`, clean-room from the
+  published TrueType/OpenType format docs: sfnt tables head/maxp/cmap
+  (formats 4 + 12, scored subtable pick)/loca/glyf (simple + composite)/
+  hhea/hmtx/kern (MS format 0), 4x4-supersampled nonzero-winding scanline
+  rasterizer, bold variants, kerning, `k93_utf8_next`. UI integration:
+  `ui_set_font` family picker, per-run font/underline in `ui_prun`
+  (pageview + Safari line renderer), underline rule at baseline+1. Build
+  copies known open-license fonts found on the host (Liberation/DejaVu/
+  Droid/... via a `/usr/share/fonts` scan in `scripts/mkrootfs.sh`) so the
+  guest defaults to a real system font; the 8x16 bitmap font remains the
+  text-console fallback (`k93font_ready()==0`).
+* Cursor: 9px-radius inverted disc (`CUR_R`) stamped into the shadow —
+  samples the framebuffer under it and writes inverted pixels, so it is
+  visible on any background.
+* SVG `libk93/k93svg.c` from scratch: XML-ish tokenizer, rect/circle/
+  ellipse/line/polyline/polygon/path (M L H V C S Q T A Z, rel variants,
+  comma/space separators), nonzero + evenodd fills, stroke, opacity,
+  solid fills -> RGBA raster -> own PNG encoder (stored-deflate, own
+  crc32/adler32) -> vendored stb_image decode in Safari. Wired in as
+  linked `<img>` (content sniffing) and inline `<svg>` blocks.
+* CSS: specificity computed per selector (id*100 + class/attr*10 + tag),
+  combinators `>` `+` `~`, attribute selectors `[a] [a=v] ^= $= *= ~=]`,
+  margin/padding shorthands, text-decoration underline, font-family ->
+  `k93font_id`; matching decls applied in stable specificity order.
+* JS (QuickJS bindings): classList, dataset + style camelCase Proxies,
+  DOMContentLoaded/load dispatch after scripts with readyState, rAF via
+  16ms timers, outerHTML get/set, replaceChild/cloneNode/contains/
+  hasChildNodes, document-level listener recording.
+* `libk93/k93net.c` + `include/k93net.h`: Safari's network stack extracted
+  for general use — url_parse/absolutize, /etc/k93/proxy.conf +
+  `k93net_set_proxy` (config priority) + HTTP(S)_PROXY, mbedTLS w/ system
+  CA (lazy init), chunked decode, redirect-following `k93net_get`; low-
+  level open/read_http/close kept for custom flows. Safari main.c is now
+  a thin shell around it.
+* `libk93/k93img.c`: `ui_image_load/free` (file -> opaque 0xFFRRGGBB,
+  alpha over white); `stbi.c` moved apps/safari -> libk93 so any app
+  links the decoder. SDK: `k93sdk` LIBC_SRC += k93html/k93img/stbi with
+  an `ensure_stb` step; app-sdk/README.md gained the complete API
+  reference (widgets, pixel, images, events, pages, fonts, HTML/CSS,
+  utils) + ceilings (no SDK HTTP: k93net needs mbedTLS).
+* Validation round found + fixed real bugs:
+  - `k93html_parse` text buffer `tbuf[4096]` was uninitialized; the text
+    branch did `strlen(tbuf)` on stack garbage so text landed at a random
+    offset (manifested as pointer-byte prefixes under -Os). Fixed with
+    `tbuf[0] = 0`; root-caused via a glibc -Os repro + gdb (clean at -O0).
+  - `render.c pool_put` still replaced UTF-8 multibyte with '?' (stale
+    ASCII ceiling) — the TTF cmap itself is fine (host probe rasterizes
+    é © · € — 中). Now memcpy verbatim.
+  - `k93svg path_add` aborted path parsing at comma-separated numbers
+    (the per-value loop didn't skip separators; `strtod` fails at ',').
+    Fixed: skip space+comma before each value; selfcheck covers a cubic
+    with commas.
+  - Named entity table lacked the Latin-1 accents (eacute etc.): 21
+    added.
+  `make selfcheck` 0 failures; `make qemu-test` all phases PASS; QEMU
+  drive6 screenshots (`build/scratch/tv6/`) show the full page: TTF
+  unicode line "é · © € — done", centered red h1, underline, serif run,
+  24px bold class run, linked SVG `<img>`, inline SVG incl. comma cubic,
+  and the DOM line "cls=z ds=42 st=#00aa00 oh=true clone=true
+  contains=true hcn=true repl=NEW dcl=complete raf=true".

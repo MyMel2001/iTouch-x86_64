@@ -16,6 +16,7 @@ static JSContext *ctx;
 static sf_page *PG;
 static k93node *DOC;
 static int dirty;
+static int scripts_done;
 static char navurl[1280];
 static char cookiejar[1024];
 
@@ -283,6 +284,13 @@ static JSValue c_alert(JSContext *c, JSValueConst thisv, int argc,
     return JS_UNDEFINED;
 }
 
+static JSValue c_readyState(JSContext *c, JSValueConst thisv, int argc,
+                            JSValueConst *argv)
+{
+    (void)thisv; (void)argc; (void)argv;
+    return JS_NewString(c, scripts_done ? "complete" : "loading");
+}
+
 static JSValue c_getElementById(JSContext *c, JSValueConst thisv, int argc,
                                 JSValueConst *argv)
 {
@@ -433,9 +441,46 @@ static JSValue c_cookie_set(JSContext *c, JSValueConst thisv, int argc,
 
 enum {
     P_TAGNAME, P_NODENAME, P_NODETYPE, P_ID, P_CLASSNAME, P_TEXTCONTENT,
-    P_INNERHTML, P_PARENTNODE, P_FIRSTCHILD, P_NEXTSIBLING, P_PREVSIBLING,
-    P_CHILDREN, P_STYLE
+    P_INNERHTML, P_OUTERHTML, P_PARENTNODE, P_FIRSTCHILD, P_NEXTSIBLING,
+    P_PREVSIBLING, P_CHILDREN, P_STYLE
 };
+
+/* serialize node + subtree to markup (attrs re-escaped for round-trip) */
+static char *serialize_outer(const k93node *n)
+{
+    if (!n) return NULL;
+    if (!strcmp(n->tag, "#text")) {
+        char *t = malloc(strlen(n->text ? n->text : "") + 1);
+        if (t) strcpy(t, n->text ? n->text : "");
+        return t;
+    }
+    size_t need = 64;
+    for (int i = 0; i < n->nattr; i++)
+        need += strlen(n->ak[i]) + 2 * (n->av[i] ? strlen(n->av[i]) : 0) + 8;
+    char *inner = k93html_inner_html((k93node *)n);
+    if (inner) need += strlen(inner);
+    char *s = malloc(need);
+    if (!s) { free(inner); return NULL; }
+    size_t o = (size_t)snprintf(s, need, "<%s", n->tag);
+    for (int i = 0; i < n->nattr; i++) {
+        o += (size_t)snprintf(s + o, need - o, " %s=\"", n->ak[i]);
+        for (const char *q = n->av[i] ? n->av[i] : ""; *q && o + 8 < need; q++) {
+            const char *ins = NULL;
+            if (*q == '&') ins = "&amp;";
+            else if (*q == '<') ins = "&lt;";
+            else if (*q == '>') ins = "&gt;";
+            else if (*q == '"') ins = "&quot;";
+            if (ins) o += (size_t)snprintf(s + o, need - o, "%s", ins);
+            else s[o++] = *q;
+        }
+        s[o++] = '"';
+    }
+    o += (size_t)snprintf(s + o, need - o, ">%s</%s>",
+                          inner ? inner : "", n->tag);
+    free(inner);
+    s[o] = 0;
+    return s;
+}
 
 static JSValue n_prop_get(JSContext *c, JSValueConst thisv, int magic)
 {
@@ -463,6 +508,12 @@ static JSValue n_prop_get(JSContext *c, JSValueConst thisv, int magic)
     }
     case P_INNERHTML: {
         char *s = k93html_inner_html(n);
+        JSValue v = JS_NewString(c, s ? s : "");
+        free(s);
+        return v;
+    }
+    case P_OUTERHTML: {
+        char *s = serialize_outer(n);
         JSValue v = JS_NewString(c, s ? s : "");
         free(s);
         return v;
@@ -506,6 +557,22 @@ static JSValue n_prop_set(JSContext *c, JSValueConst thisv, JSValueConst val,
         dirty = 1;
     } else if (magic == P_INNERHTML) {
         k93html_set_inner_html(n, s);
+        dirty = 1;
+    } else if (magic == P_OUTERHTML && n->parent) {
+        /* replace the node itself with the parsed fragment; the old node is
+         * unlinked but kept alive (js wrappers may still hold it) */
+        k93node *par = n->parent;
+        k93node *anchor = n->next;
+        k93node *frag = k93html_parse(s);
+        k93node *cur = frag ? frag->first : NULL;
+        k93html_unlink(n);
+        while (cur) {
+            k93node *nx = cur->next;
+            if (anchor) k93html_insert_before(anchor, cur);
+            else k93html_append(par, cur);
+            cur = nx;
+        }
+        k93html_free(frag);
         dirty = 1;
     }
     JS_FreeCString(ctx, s);
@@ -600,6 +667,66 @@ static JSValue n_removeChild(JSContext *c, JSValueConst thisv, int argc,
     return JS_DupValue(c, argv[0]);
 }
 
+static JSValue n_remove(JSContext *c, JSValueConst thisv, int argc,
+                        JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    k93node *n = node_of(c, thisv);
+    if (n && n->parent) { k93html_unlink(n); dirty = 1; }
+    return JS_UNDEFINED;
+}
+
+static JSValue n_replaceChild(JSContext *c, JSValueConst thisv, int argc,
+                              JSValueConst *argv)
+{
+    k93node *n = node_of(c, thisv);
+    k93node *nw = argc > 0 ? arg_node(c, argv[0]) : NULL;
+    k93node *od = argc > 1 ? arg_node(c, argv[1]) : NULL;
+    if (!n || !nw || !od || od->parent != n) return JS_UNDEFINED;
+    k93html_insert_before(od, nw);        /* new before old */
+    k93html_unlink(od);                   /* old orphaned, kept alive */
+    dirty = 1;
+    return node_wrap(c, od);
+}
+
+static JSValue n_contains(JSContext *c, JSValueConst thisv, int argc,
+                          JSValueConst *argv)
+{
+    k93node *n = node_of(c, thisv);
+    k93node *o = argc > 0 ? arg_node(c, argv[0]) : NULL;
+    for (k93node *k = o; k; k = k->parent)
+        if (k == n) return JS_TRUE;
+    return JS_FALSE;
+}
+
+static JSValue n_hasChildNodes(JSContext *c, JSValueConst thisv, int argc,
+                               JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    k93node *n = node_of(c, thisv);
+    return JS_NewBool(c, n && n->first != NULL);
+}
+
+static JSValue n_cloneNode(JSContext *c, JSValueConst thisv, int argc,
+                           JSValueConst *argv)
+{
+    k93node *n = node_of(c, thisv);
+    if (!n) return JS_NULL;
+    int deep = argc > 0 ? JS_ToBool(c, argv[0]) : 0;
+    k93node *k;
+    if (!strcmp(n->tag, "#text"))
+        k = k93html_textnode(n->text ? n->text : "");
+    else if (deep)
+        k = k93html_clone(n);
+    else {
+        k = k93html_elem(n->tag);
+        if (k)
+            for (int i = 0; i < n->nattr; i++)
+                k93html_set_attr(k, n->ak[i], n->av[i] ? n->av[i] : "");
+    }
+    return node_wrap(c, k);
+}
+
 /* node-local query (scoped to subtree) */
 static JSValue n_query(JSContext *c, JSValueConst thisv, int argc,
                        JSValueConst *argv, int all)
@@ -674,6 +801,11 @@ static const JSCFunctionListEntry node_proto_list[] = {
     JS_CFUNC_DEF("appendChild", 1, n_appendChild),
     JS_CFUNC_DEF("insertBefore", 2, n_insertBefore),
     JS_CFUNC_DEF("removeChild", 1, n_removeChild),
+    JS_CFUNC_DEF("remove", 0, n_remove),
+    JS_CFUNC_DEF("replaceChild", 2, n_replaceChild),
+    JS_CFUNC_DEF("contains", 1, n_contains),
+    JS_CFUNC_DEF("hasChildNodes", 0, n_hasChildNodes),
+    JS_CFUNC_DEF("cloneNode", 1, n_cloneNode),
     JS_CFUNC_DEF("querySelector", 1, n_query1),
     JS_CFUNC_DEF("querySelectorAll", 1, n_queryAll),
     JS_CFUNC_DEF("getElementsByTagName", 1, n_getElementsByTagName),
@@ -685,6 +817,7 @@ static const JSCFunctionListEntry node_proto_list[] = {
     JS_CGETSET_MAGIC_DEF("className", n_prop_get, NULL, P_CLASSNAME),
     JS_CGETSET_MAGIC_DEF("textContent", n_prop_get, n_prop_set, P_TEXTCONTENT),
     JS_CGETSET_MAGIC_DEF("innerHTML", n_prop_get, n_prop_set, P_INNERHTML),
+    JS_CGETSET_MAGIC_DEF("outerHTML", n_prop_get, n_prop_set, P_OUTERHTML),
     JS_CGETSET_MAGIC_DEF("parentNode", n_prop_get, NULL, P_PARENTNODE),
     JS_CGETSET_MAGIC_DEF("parentElement", n_prop_get, NULL, P_PARENTNODE),
     JS_CGETSET_MAGIC_DEF("firstChild", n_prop_get, NULL, P_FIRSTCHILD),
@@ -737,7 +870,7 @@ static const char bootstrap_js[] =
 "P.getElementsByTagName = P.getElementsByTagName || function (t) { return this.querySelectorAll(t); };\n"
 "Object.defineProperty(P, \"style\", { get: function () {\n"
 "  var self = this;\n"
-"  return {\n"
+"  var obj = {\n"
 "    setProperty: function (k, v) {\n"
 "      var s = self.getAttribute(\"style\") || \"\";\n"
 "      var re = new RegExp(\"(?:^|;)\\\\s*\" + k.replace(/-/g, \"\\\\-\") + \"\\\\s*:[^;]*\", \"i\");\n"
@@ -751,6 +884,70 @@ static const char bootstrap_js[] =
 "    },\n"
 "    removeProperty: function (k) { this.setProperty(k, \"\"); return \"\"; }\n"
 "  };\n"
+"  return new Proxy(obj, {\n"
+"    get: function (t, k) {\n"
+"      if (typeof k !== \"string\" || k in t) return t[k];\n"
+"      return t.getPropertyValue(k.replace(/[A-Z]/g,\n"
+"        function (m) { return \"-\" + m.toLowerCase(); }));\n"
+"    },\n"
+"    set: function (t, k, v) {\n"
+"      if (typeof k === \"string\")\n"
+"        t.setProperty(k.replace(/[A-Z]/g,\n"
+"          function (m) { return \"-\" + m.toLowerCase(); }), String(v));\n"
+"      return true;\n"
+"    }\n"
+"  });\n"
+"}});\n"
+"function __cls(el) {\n"
+"  return (el.getAttribute(\"class\") || \"\").trim().split(/\\s+/).filter(Boolean);\n"
+"}\n"
+"Object.defineProperty(P, \"classList\", { get: function () {\n"
+"  var el = this;\n"
+"  return {\n"
+"    get length() { return __cls(el).length; },\n"
+"    item: function (i) { return __cls(el)[i] || null; },\n"
+"    contains: function (c) { return __cls(el).indexOf(c) >= 0; },\n"
+"    add: function () {\n"
+"      var cs = __cls(el);\n"
+"      for (var i = 0; i < arguments.length; i++)\n"
+"        if (cs.indexOf(arguments[i]) < 0) cs.push(arguments[i]);\n"
+"      el.setAttribute(\"class\", cs.join(\" \"));\n"
+"    },\n"
+"    remove: function () {\n"
+"      var cs = __cls(el);\n"
+"      for (var i = 0; i < arguments.length; i++) {\n"
+"        var k = cs.indexOf(arguments[i]);\n"
+"        if (k >= 0) cs.splice(k, 1);\n"
+"      }\n"
+"      el.setAttribute(\"class\", cs.join(\" \"));\n"
+"    },\n"
+"    toggle: function (c) {\n"
+"      var cs = __cls(el); var k = cs.indexOf(c);\n"
+"      if (k >= 0) cs.splice(k, 1); else cs.push(c);\n"
+"      el.setAttribute(\"class\", cs.join(\" \"));\n"
+"      return k < 0;\n"
+"    }\n"
+"  };\n"
+"}});\n"
+"function __dskey(k) {\n"
+"  return \"data-\" + k.replace(/[A-Z]/g,\n"
+"    function (m) { return \"-\" + m.toLowerCase(); });\n"
+"}\n"
+"Object.defineProperty(P, \"dataset\", { get: function () {\n"
+"  var el = this;\n"
+"  /* ceiling: no ownKeys trap - for..in over dataset unsupported */\n"
+"  return new Proxy({}, {\n"
+"    get: function (t, k) {\n"
+"      return (typeof k === \"string\") ? el.getAttribute(__dskey(k)) : undefined;\n"
+"    },\n"
+"    set: function (t, k, v) {\n"
+"      if (typeof k === \"string\") el.setAttribute(__dskey(k), String(v));\n"
+"      return true;\n"
+"    },\n"
+"    has: function (t, k) {\n"
+"      return typeof k === \"string\" && el.getAttribute(__dskey(k)) !== null;\n"
+"    }\n"
+"  });\n"
 "}});\n"
 "globalThis.__k93_click = function (node) {\n"
 "  var ls = __listeners.get(node) || [];\n"
@@ -791,6 +988,7 @@ static const char bootstrap_js[] =
 "globalThis.setInterval = function (f, ms) { return sf_setInterval(f, ms || 0); };\n"
 "globalThis.clearInterval = function (id) { sf_clearTimeout(id); };\n"
 "globalThis.alert = function (m) { sf_alert(String(m)); };\n"
+"var __doclsn = [];\n"
 "var document = {\n"
 "  get body() { return sf_query(\"body\"); },\n"
 "  get documentElement() { return sf_query(\"html\"); },\n"
@@ -809,8 +1007,16 @@ static const char bootstrap_js[] =
 "  set title(v) { sf_setTitle(String(v)); },\n"
 "  get cookie() { return sf_getCookie(); },\n"
 "  set cookie(v) { sf_setCookie(String(v)); },\n"
-"  addEventListener: function (t, f) { var b = document.body; if (b) b.addEventListener(t, f); },\n"
-"  removeEventListener: function (t, f) { var b = document.body; if (b) b.removeEventListener(t, f); },\n"
+"  addEventListener: function (t, f) {\n"
+"    if (typeof f === \"function\") __doclsn.push({ t: t, f: f });\n"
+"    var b = document.body; if (b) b.addEventListener(t, f);\n"
+"  },\n"
+"  removeEventListener: function (t, f) {\n"
+"    for (var i = 0; i < __doclsn.length; i++)\n"
+"      if (__doclsn[i].t === t && __doclsn[i].f === f) { __doclsn.splice(i, 1); break; }\n"
+"    var b = document.body; if (b) b.removeEventListener(t, f);\n"
+"  },\n"
+"  get readyState() { return sf_readyState(); },\n"
 "  get currentScript() { return null; },\n"
 "  documentMode: 0\n"
 "};\n"
@@ -819,7 +1025,24 @@ static const char bootstrap_js[] =
 "globalThis.location = location;\n"
 "globalThis.self = globalThis;\n"
 "globalThis.top = globalThis;\n"
-"globalThis.name = \"\";\n";
+"globalThis.name = \"\";\n"
+"globalThis.addEventListener = function (t, f) { document.addEventListener(t, f); };\n"
+"globalThis.removeEventListener = function (t, f) { document.removeEventListener(t, f); };\n"
+"globalThis.requestAnimationFrame = function (f) {\n"
+"  return sf_setTimeout(function () { f(Date.now()); }, 16);\n"
+"};\n"
+"globalThis.cancelAnimationFrame = function (id) { sf_clearTimeout(id); };\n"
+"globalThis.__k93_dcl = function () {\n"
+"  var ev = { type: \"DOMContentLoaded\", target: document,\n"
+"    currentTarget: document, defaultPrevented: false,\n"
+"    preventDefault: function () { ev.defaultPrevented = true; },\n"
+"    stopPropagation: function () {} };\n"
+"  var ls = __doclsn.slice();\n"
+"  for (var i = 0; i < ls.length; i++)\n"
+"    if (ls[i].t === \"DOMContentLoaded\" || ls[i].t === \"load\") {\n"
+"      try { ls[i].f.call(document, ev); } catch (e) { console.log(\"dcl: \" + e); }\n"
+"    }\n"
+"};\n";
 
 /* ------------------------------------------------------------ lifecycle */
 
@@ -851,6 +1074,7 @@ int js_open(sf_page *p, k93node *doc, const char *base)
     PG = p;
     DOC = doc;
     dirty = 0;
+    scripts_done = 0;
     navurl[0] = 0;
     cookiejar[0] = 0;
     memset(T, 0, sizeof T);
@@ -891,6 +1115,7 @@ int js_open(sf_page *p, k93node *doc, const char *base)
     bind_global(ctx, "sf_setTimeout", c_setTimeout, 2);
     bind_global(ctx, "sf_setInterval", c_setInterval, 2);
     bind_global(ctx, "sf_clearTimeout", c_clearTimer, 1);
+    bind_global(ctx, "sf_readyState", c_readyState, 0);
     JS_FreeValue(ctx, g);
 
     JSValue r = JS_Eval(ctx, bootstrap_js, sizeof bootstrap_js - 1,
@@ -956,6 +1181,14 @@ void js_run_scripts(k93node *doc)
         JS_FreeValue(ctx, r);
         drain_jobs();
     }
+    scripts_done = 1;
+    static const char dcl_call[] =
+        "try{if(typeof __k93_dcl===\"function\")__k93_dcl();}"
+        "catch(e){sf_log(\"dcl: \"+e);}";
+    JSValue d = JS_Eval(ctx, dcl_call, sizeof dcl_call - 1,
+                        "dcl", JS_EVAL_TYPE_GLOBAL);
+    JS_FreeValue(ctx, d);
+    drain_jobs();
 }
 
 int js_tick(void)

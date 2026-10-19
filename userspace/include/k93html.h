@@ -45,11 +45,14 @@ void    k93css_add(k93css *c, const char *text);
 
 enum {
     K93CSS_FG = 1, K93CSS_BG = 2, K93CSS_BOLD = 4, K93CSS_CENTER = 8,
-    K93CSS_HIDDEN = 16, K93CSS_SCALE = 32, K93CSS_INDENT = 64
+    K93CSS_HIDDEN = 16, K93CSS_SCALE = 32, K93CSS_INDENT = 64,
+    K93CSS_UNDERLINE = 128, K93CSS_FONT = 256
 };
 typedef struct {
     uint32_t fg, bg;
     int bold, center, hidden, scale, indent;
+    int underline;                    /* text-decoration: underline */
+    int font;                         /* k93font id from font-family, -1 = none */
     unsigned flags;                   /* K93CSS_* of set properties */
 } k93cstyle;
 

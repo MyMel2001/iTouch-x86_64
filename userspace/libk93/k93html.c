@@ -4,6 +4,7 @@
  * textarea/title), implied end tags (li/td/tr/p/...), entity decoding. */
 #define _GNU_SOURCE
 #include "k93html.h"
+#include "k93font.h"
 #include "k93util.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,16 +14,34 @@
 /* ---------------------------------------------------------- entities */
 
 struct ent { const char *n; const char *v; };
+/* mapped to real Unicode (UTF-8) - the TTF engine renders them; the 8x16
+ * bitmap fallback shows notdef for these (ceiling) */
 static const struct ent ents[] = {
     { "amp", "&" }, { "lt", "<" }, { "gt", ">" }, { "quot", "\"" },
-    { "apos", "'" }, { "nbsp", " " }, { "copy", "(c)" }, { "reg", "(R)" },
-    { "trade", "(tm)" }, { "hellip", "..." }, { "mdash", "-" },
-    { "ndash", "-" }, { "rsquo", "'" }, { "lsquo", "'" }, { "ldquo", "\"" },
-    { "rdquo", "\"" }, { "bull", "*" }, { "middot", "." }, { "deg", "deg" },
-    { "plusmn", "+/-" }, { "times", "x" }, { "frac12", "1/2" },
-    { "laquo", "\"" }, { "raquo", "\"" }, { "cent", "c" }, { "pound", "L" },
-    { "yen", "Y" }, { "sect", "sec" }, { "para", "p" }, { "dagger", "+" },
-    { "permil", "0/00" }, { "euro", "EUR" }, { "dollar", "$" },
+    { "apos", "'" }, { "nbsp", " " },
+    { "copy", "\xC2\xA9" }, { "reg", "\xC2\xAE" }, { "trade", "\xE2\x84\xA2" },
+    { "hellip", "\xE2\x80\xA6" }, { "mdash", "\xE2\x80\x94" },
+    { "ndash", "\xE2\x80\x93" }, { "rsquo", "\xE2\x80\x99" },
+    { "lsquo", "\xE2\x80\x98" }, { "ldquo", "\xE2\x80\x9C" },
+    { "rdquo", "\xE2\x80\x9D" }, { "bull", "\xE2\x80\xA2" },
+    { "middot", "\xC2\xB7" }, { "deg", "\xC2\xB0" },
+    { "plusmn", "\xC2\xB1" }, { "times", "\xC2\xD7" },
+    { "frac12", "\xC2\xBD" }, { "laquo", "\xC2\xAB" },
+    { "raquo", "\xC2\xBB" }, { "cent", "\xC2\xA2" }, { "pound", "\xC2\xA3" },
+    { "yen", "\xC2\xA5" }, { "sect", "\xC2\xA7" }, { "para", "\xC2\xB6" },
+    { "dagger", "\xE2\x80\xA0" }, { "permil", "\xE2\x80\xB0" },
+    { "euro", "\xE2\x82\xAC" }, { "dollar", "$" },
+    { "agrave", "\xC3\x80" }, { "aacute", "\xC3\xA1" },
+    { "atilde", "\xC3\x83" }, { "auml", "\xC3\xA4" },
+    { "aring", "\xC3\xA5" }, { "ccedil", "\xC3\xA7" },
+    { "egrave", "\xC3\x88" }, { "eacute", "\xC3\xA9" },
+    { "igrave", "\xC3\x8C" }, { "iacute", "\xC3\xAD" },
+    { "iuml", "\xC3\xAF" }, { "ntilde", "\xC3\xB1" },
+    { "ograve", "\xC3\x92" }, { "oacute", "\xC3\xB3" },
+    { "otilde", "\xC3\x95" }, { "ouml", "\xC3\xB6" },
+    { "ugrave", "\xC3\xB9" }, { "uacute", "\xC3\xBA" },
+    { "uuml", "\xC3\xBC" }, { "yacute", "\xC3\xBD" },
+    { "szlig", "\xC3\x9F" },
     { NULL, NULL }
 };
 
@@ -44,11 +63,25 @@ void k93html_entity_decode(char *s)
             long code = (name[1] == 'x' || name[1] == 'X')
                         ? strtol(name + 2, NULL, 16)
                         : strtol(name + 1, NULL, 10);
-            if (code == 32 || (code > 32 && code < 127)) {
-                numbuf[0] = (char)code; numbuf[1] = 0;
-                val = numbuf;
-            } else if (code > 0) {          /* non-ASCII -> '?' (font limit) */
-                numbuf[0] = '?'; numbuf[1] = 0;
+            if (code > 0 && code < 0x110000) {   /* UTF-8 encode (TTF era) */
+                if (code < 0x80) {
+                    numbuf[0] = (char)code; numbuf[1] = 0;
+                } else if (code < 0x800) {
+                    numbuf[0] = (char)(0xC0 | (code >> 6));
+                    numbuf[1] = (char)(0x80 | (code & 63));
+                    numbuf[2] = 0;
+                } else if (code < 0x10000) {
+                    numbuf[0] = (char)(0xE0 | (code >> 12));
+                    numbuf[1] = (char)(0x80 | ((code >> 6) & 63));
+                    numbuf[2] = (char)(0x80 | (code & 63));
+                    numbuf[3] = 0;
+                } else {
+                    numbuf[0] = (char)(0xF0 | (code >> 18));
+                    numbuf[1] = (char)(0x80 | ((code >> 12) & 63));
+                    numbuf[2] = (char)(0x80 | ((code >> 6) & 63));
+                    numbuf[3] = (char)(0x80 | (code & 63));
+                    numbuf[4] = 0;
+                }
                 val = numbuf;
             }
         } else {
@@ -306,6 +339,7 @@ k93node *k93html_parse(const char *html)
     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
         (unsigned char)p[2] == 0xBF) p += 3;
     char tbuf[4096];
+    tbuf[0] = 0;                       /* used = strlen(tbuf) below trusts this */
     while (*p) {
         if (*p == '<') {
             if (!strncmp(p, "<!--", 4)) {
@@ -464,21 +498,78 @@ void k93html_set_inner_html(k93node *n, const char *html)
 
 /* ---------------------------------------------------------- query */
 
-/* part := tag? ( "." cls | "#id" )*  ("*" = any tag) */
+/* [attr], [attr=v], [attr^=v], [attr$=v], [attr*=v], [attr~=v] */
+static int attr_match(const k93node *n, const char *expr)
+{
+    char name[48]; size_t ni = 0;
+    const char *p = expr;
+    while (*p && *p != '=' && *p != '^' && *p != '$' && *p != '*' &&
+           *p != '~' && ni < sizeof name - 1)
+        name[ni++] = *p++;
+    while (ni > 0 && name[ni - 1] == ' ') ni--;
+    name[ni] = 0;
+    while (*p == ' ') p++;
+    if (!*p) return k93html_attr(n, name) != NULL;   /* bare presence */
+    char op[3] = { 0, 0, 0 };
+    if (p[1] == '=') { op[0] = *p; op[1] = '='; p += 2; }
+    else if (*p == '=') { op[0] = '='; p++; }
+    else return 0;
+    while (*p == ' ') p++;
+    char want[64]; size_t wi = 0;
+    while (*p && *p != ']' && wi < sizeof want - 1) want[wi++] = *p++;
+    while (wi > 0 && want[wi - 1] == ' ') wi--;
+    want[wi] = 0;
+    if (wi >= 2 && (want[0] == '"' || want[0] == '\'') &&
+        want[wi - 1] == want[0]) {
+        memmove(want, want + 1, wi - 2);
+        wi -= 2;
+        want[wi] = 0;
+    }
+    const char *v = k93html_attr(n, name);
+    if (!v) return 0;
+    size_t vl = strlen(v), wl = strlen(want);
+    if (!strcmp(op, "=")) return vl == wl && !strncmp(v, want, wl);
+    if (!strcmp(op, "^=")) return wl <= vl && !strncmp(v, want, wl);
+    if (!strcmp(op, "$=")) return wl <= vl && !strcmp(v + vl - wl, want);
+    if (!strcmp(op, "*=")) return wl == 0 || strstr(v, want) != NULL;
+    if (!strcmp(op, "~=")) {                        /* word in list */
+        const char *c = v;
+        while (*c) {
+            while (*c == ' ' || *c == '\t') c++;
+            size_t cl = 0;
+            while (c[cl] && c[cl] != ' ' && c[cl] != '\t') cl++;
+            if (cl == wl && !strncmp(c, want, wl)) return 1;
+            c += cl;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+/* part := tag? ( "." cls | "#id" | "[attr...]" )*  ("*" = any tag) */
 static int match_part(const k93node *n, const char *part)
 {
     if (!n || n->tag[0] == '#') return 0;
     const char *p = part;
     char tag[32]; size_t i = 0;
-    while (*p && *p != '.' && *p != '#' && i < sizeof tag - 1)
+    while (*p && *p != '.' && *p != '#' && *p != '[' && i < sizeof tag - 1)
         tag[i++] = *p++;
     tag[i] = 0;
     if (i && strcmp(tag, "*") && strcmp(n->tag, tag)) return 0;
-    if (!i && (*p == '.' || *p == '#')) { /* bare class/id selector */ }
     while (*p) {
+        if (*p == '[') {                           /* attribute selector */
+            char expr[128]; size_t ei = 0;
+            p++;
+            while (*p && *p != ']' && ei < sizeof expr - 1) expr[ei++] = *p++;
+            if (*p == ']') p++;
+            expr[ei] = 0;
+            if (!attr_match(n, expr)) return 0;
+            continue;
+        }
         char kind = *p++;
         char val[64]; size_t vi = 0;
-        while (*p && *p != '.' && *p != '#' && vi < sizeof val - 1)
+        while (*p && *p != '.' && *p != '#' && *p != '[' &&
+               vi < sizeof val - 1)
             val[vi++] = *p++;
         val[vi] = 0;
         if (!vi) return 0;
@@ -504,26 +595,47 @@ static int match_part(const k93node *n, const char *part)
     return 1;
 }
 
+/* sel := part (comb part)* with comb in {descendant, '>', '+', '~'};
+ * comb j links part j to part j+1 (j+1 is closer to n; walk right to left) */
 static int match_sel(const k93node *n, const char *sel)
 {
-    char parts[8][96];
-    int nparts = 0;
+    struct { char part[96]; char comb; } seg[8];
+    int nseg = 0;
     const char *p = sel;
-    while (*p && nparts < 8) {
+    while (*p && nseg < 8) {
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') p++;
+        if (!*p) break;
         size_t i = 0;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && i < 95)
-            parts[nparts][i++] = *p++;
-        parts[nparts][i] = 0;
-        if (i) nparts++;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != ',' &&
+               *p != '>' && *p != '+' && *p != '~' && i < 95)
+            seg[nseg].part[i++] = *p++;
+        seg[nseg].part[i] = 0;
+        if (!i) break;
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        seg[nseg].comb = ' ';
+        if (*p == '>' || *p == '+' || *p == '~') seg[nseg].comb = *p++;
+        nseg++;
     }
-    if (!nparts) return 0;
-    if (!match_part(n, parts[nparts - 1])) return 0;
-    const k93node *a = n->parent;
-    for (int j = nparts - 2; j >= 0; j--) {
-        while (a && !match_part(a, parts[j])) a = a->parent;
+    if (!nseg) return 0;
+    if (!match_part(n, seg[nseg - 1].part)) return 0;
+    const k93node *cur = n;
+    for (int j = nseg - 2; j >= 0; j--) {
+        const k93node *a;
+        if (seg[j].comb == ' ') {
+            a = cur->parent;
+            while (a && !match_part(a, seg[j].part)) a = a->parent;
+        } else if (seg[j].comb == '>') {
+            a = cur->parent;
+            if (a && !match_part(a, seg[j].part)) a = NULL;
+        } else if (seg[j].comb == '+') {
+            a = cur->prev;
+            if (a && !match_part(a, seg[j].part)) a = NULL;
+        } else {                                    /* '~' general sibling */
+            a = cur->prev;
+            while (a && !match_part(a, seg[j].part)) a = a->prev;
+        }
         if (!a) return 0;
-        a = a->parent;
+        cur = a;
     }
     return 1;
 }
@@ -782,16 +894,90 @@ static void apply_decl(k93cstyle *st, const char *prop, const char *val)
                !strcasecmp(prop, "padding-left")) {
         int px = atoi(val);
         if (px > 0) { st->indent += px; st->flags |= K93CSS_INDENT; }
+    } else if (!strcasecmp(prop, "margin") || !strcasecmp(prop, "padding")) {
+        /* shorthand: left component = 4th of 4, 2nd of 2, else the 1st */
+        char toks[4][32]; int nt = 0;
+        const char *q = val;
+        while (*q && nt < 4) {
+            while (*q == ' ') q++;
+            size_t ti = 0;
+            while (*q && *q != ' ' && ti < 31) toks[nt][ti++] = *q++;
+            toks[nt][ti] = 0;
+            if (ti) nt++;
+        }
+        const char *lv = nt == 4 ? toks[3] : nt == 2 ? toks[1]
+                        : nt ? toks[0] : "";
+        int px = atoi(lv);
+        if (px > 0) { st->indent += px; st->flags |= K93CSS_INDENT; }
+    } else if (!strcasecmp(prop, "text-decoration")) {
+        st->underline = strstr(val, "underline") != NULL;
+        st->flags |= K93CSS_UNDERLINE;
+    } else if (!strcasecmp(prop, "font-family")) {
+        /* first family name, quotes stripped; unknown -> system default */
+        char fam[48]; size_t fi = 0;
+        const char *q = val;
+        while (*q && *q != ',' && fi < sizeof fam - 1) fam[fi++] = *q++;
+        while (fi > 0 && (fam[fi - 1] == ' ' || fam[fi - 1] == '\t')) fi--;
+        fam[fi] = 0;
+        if (fi >= 2 && (fam[0] == '"' || fam[0] == '\'') &&
+            fam[fi - 1] == fam[0]) {
+            memmove(fam, fam + 1, fi - 2);
+            fi -= 2;
+            fam[fi] = 0;
+        }
+        st->font = fi ? k93font_id(fam) : -1;
+        st->flags |= K93CSS_FONT;
+    } else if (!strcasecmp(prop, "font-style")) {
+        /* italic/oblique: no italic faces rasterized (ceiling) - upright */
+    } else if (!strcasecmp(prop, "line-height")) {
+        /* ceiling: linear layout keeps fixed line pitch */
     }
+}
+
+/* rough specificity: ids*100 + (classes+attrs)*10 + tags; later wins ties */
+static int sel_spec(const char *s)
+{
+    int spec = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '#') spec += 100;
+        else if (*p == '.' || *p == '[') spec += 10;
+        else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                 *p == '*') {
+            spec += 1;
+            while (p[1] && ((p[1] >= 'a' && p[1] <= 'z') ||
+                            (p[1] >= 'A' && p[1] <= 'Z') ||
+                            (p[1] >= '0' && p[1] <= '9') || p[1] == '-' ||
+                            p[1] == '*' || p[1] == '_' || p[1] == '['))
+                p++;
+        }
+    }
+    return spec;
 }
 
 void k93css_apply(const k93css *c, const k93node *n, k93cstyle *st)
 {
     if (!n) return;
-    if (c)
-        for (int i = 0; i < c->n; i++)
-            if (match_sel(n, c->sel[i]))
-                apply_decl(st, c->prop[i], c->val[i]);
+    if (c && c->n) {
+        int ord[512], spec[512], m = 0;     /* ceiling: 512 matching decls */
+        for (int i = 0; i < c->n && m < 512; i++)
+            if (match_sel(n, c->sel[i])) {
+                ord[m] = i;
+                spec[m] = sel_spec(c->sel[i]);
+                m++;
+            }
+        for (int i = 1; i < m; i++) {       /* stable sort: spec, then order */
+            int o = ord[i], s = spec[i], j = i - 1;
+            while (j >= 0 && (spec[j] > s || (spec[j] == s && ord[j] > o))) {
+                ord[j + 1] = ord[j];
+                spec[j + 1] = spec[j];
+                j--;
+            }
+            ord[j + 1] = o;
+            spec[j + 1] = s;
+        }
+        for (int i = 0; i < m; i++)
+            apply_decl(st, c->prop[ord[i]], c->val[ord[i]]);
+    }
     /* inline style attribute wins (applied last) */
     const char *sa = k93html_attr(n, "style");
     if (sa) {

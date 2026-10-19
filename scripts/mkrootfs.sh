@@ -187,6 +187,47 @@ mkdir -p "$ROOT/usr/share/udhcpc"
 install -m 0755 "$TOP/userspace/rootfs-files/udhcpc-default.script" \
     "$ROOT/usr/share/udhcpc/default.script"
 
+# ------------------------------------------------------------- system fonts
+# Copy the first known OPEN-LICENSE TTF trio (Sans/Serif/Mono) found on the
+# build host into the OS. Candidate list is limited to fonts whose licenses
+# are non-proprietary (OFL: Liberation/Noto, Bitstream Vera: DejaVu,
+# GPL+FE: FreeFont, Apache-2.0: Droid) - never anything proprietary, never
+# downloaded: detection only. A host with none of them simply leaves the
+# embedded 8x16 font as the default (k93font falls back).
+FONTD="$ROOT/usr/share/fonts/k93"
+mkdir -p "$FONTD"
+try_font() {                       # $1 = target base name, $2/$3 = srcs
+    [ -f "$2" ] || return 1
+    cp -f "$2" "$FONTD/$1-Regular.ttf"
+    [ -f "$3" ] && cp -f "$3" "$FONTD/$1-Bold.ttf"
+    echo "k93rootfs: font installed: $1"
+    return 0
+}
+try_sans() {
+    try_font LiberationSans /usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf /usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf ||
+    try_font LiberationSans /usr/share/fonts/liberation2-sans-fonts/LiberationSans-Regular.ttf /usr/share/fonts/liberation2-sans-fonts/LiberationSans-Bold.ttf ||
+    try_font DejaVuSans /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf ||
+    try_font DejaVuSans /usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf /usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf ||
+    try_font FreeSans /usr/share/fonts/truetype/freefont/FreeSans.ttf /usr/share/fonts/truetype/freefont/FreeSansBold.ttf ||
+    try_font DroidSans /usr/share/fonts/google-droid-sans-fonts/DroidSans.ttf ""
+}
+try_serif() {
+    try_font LiberationSerif /usr/share/fonts/liberation-serif-fonts/LiberationSerif-Regular.ttf /usr/share/fonts/liberation-serif-fonts/LiberationSerif-Bold.ttf ||
+    try_font LiberationSerif /usr/share/fonts/liberation2-serif-fonts/LiberationSerif-Regular.ttf /usr/share/fonts/liberation2-serif-fonts/LiberationSerif-Bold.ttf ||
+    try_font DejaVuSerif /usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf ||
+    try_font FreeSerif /usr/share/fonts/truetype/freefont/FreeSerif.ttf /usr/share/fonts/truetype/freefont/FreeSerifBold.ttf
+}
+try_mono() {
+    try_font LiberationMono /usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf /usr/share/fonts/liberation-mono-fonts/LiberationMono-Bold.ttf ||
+    try_font LiberationMono /usr/share/fonts/liberation2-mono-fonts/LiberationMono-Regular.ttf /usr/share/fonts/liberation2-mono-fonts/LiberationMono-Bold.ttf ||
+    try_font DejaVuSansMono /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf ||
+    try_font FreeMono /usr/share/fonts/truetype/freefont/FreeMono.ttf /usr/share/fonts/truetype/freefont/FreeMonoBold.ttf ||
+    try_font DroidSansMono /usr/share/fonts/google-droid-sans-mono-fonts/DroidSansMono.ttf ""
+}
+try_sans || true
+try_serif || true
+try_mono || true
+
 # ------------------------------------------------------------- config
 cat > "$ROOT/etc/k93/proxy.conf" <<'EOF'
 # K93OS HTTP proxy configuration (read by Safari and network tools)

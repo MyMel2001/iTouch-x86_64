@@ -11,6 +11,9 @@
 #include "k93gpt.h"
 #include "k93snd.h"
 #include "k93html.h"
+#include "k93font.h"
+#include "k93svg.h"
+#include "k93ui.h"
 #include <linux/fb.h>
 #ifndef __user
 #define __user
@@ -116,6 +119,65 @@ int main(int argc, char **argv)
         k93css_free(hc);
         k93html_free(hw);
         k93html_free(hd_doc);
+    }
+
+    /* --- css combinators / attributes / specificity / entities --- */
+    {
+        k93node *doc2 = k93html_parse(
+            "<div id=\"wrap\"><p class=\"a\">one</p><p class=\"b\">two</p></div>"
+            "<ul><li id=\"i1\" data-x=\"7\" title=\"hello world\">item</li>"
+            "<li>next</li></ul>");
+        k93node *pa = k93html_query(doc2, "p.a");
+        k93node *pb = k93html_query(doc2, "p.b");
+        k93node *li2 = k93html_query(doc2, "#i1 ~ li");
+        chk(pa && pb && li2, "selector targets exist");
+        k93css *c2 = k93css_new();
+        k93css_add(c2,
+            "#wrap > p.a { color: #112233 }"
+            "p.a + p.b { color: #445566 }"
+            "#i1 ~ li { background-color: #778899 }"
+            "p { color: #ff0000; font-weight: normal }"
+            "p.a { color: #00ff00; margin: 2px 8px }"
+            "ul li#i1 { font-weight: bold }"
+            "[data-x=\"7\"] { text-decoration: underline }"
+            "[title^=hell] { font-family: \"Nonexistent Sans\" }");
+        k93cstyle s2;
+        memset(&s2, 0, sizeof s2);
+        k93css_apply(c2, pa, &s2);
+        chk((s2.flags & K93CSS_FG) && s2.fg == 0x112233,
+            "child comb + specificity order (id>class>elem)");
+        chk((s2.flags & K93CSS_INDENT) && s2.indent == 8,
+            "margin shorthand left value");
+        memset(&s2, 0, sizeof s2);
+        k93css_apply(c2, pb, &s2);
+        chk((s2.flags & K93CSS_FG) && s2.fg == 0x445566,
+            "adjacent sibling selector");
+        memset(&s2, 0, sizeof s2);
+        k93css_apply(c2, li2, &s2);
+        chk((s2.flags & K93CSS_BG) && s2.bg == 0x778899,
+            "general sibling selector");
+        memset(&s2, 0, sizeof s2);
+        k93node *li1 = k93html_query(doc2, "#i1");
+        k93css_apply(c2, li1, &s2);
+        chk(s2.bold == 1, "id specificity beats element");
+        chk((s2.flags & K93CSS_UNDERLINE) && s2.underline,
+            "attribute selector + underline");
+        chk(s2.font == -1 && (s2.flags & K93CSS_FONT),
+            "font-family unknown -> default");
+        chk(k93html_query(doc2, "#wrap > p.a") == pa,
+            "child combinator query");
+        chk(k93html_query(doc2, "ul li[data-x='7']") == li1,
+            "descendant + attribute query");
+        k93css_free(c2);
+        k93html_free(doc2);
+        /* numeric + named entities -> UTF-8 */
+        k93node *doc3 = k93html_parse("&#x4E2D;&#8364;&copy;&eacute;");
+        char ebuf[64];
+        k93html_text_content(doc3, ebuf, sizeof ebuf);
+        chk(!strcmp(ebuf, "\xE4\xB8\xAD\xE2\x82\xAC\xC2\xA9\xC3\xA9"),
+            "entities decode to UTF-8");
+        k93html_free(doc3);
+        printf("info - css combinators/specificity/entities ok\n");
     }
 
     /* --- plist --- */
@@ -329,6 +391,181 @@ int main(int argc, char **argv)
             chk(k93_snd_play(silence, 4096) == 0, "alsa pcm write");
             k93_snd_close();
         }
+    }
+
+    /* --- TTF rasterizer (clean-room font engine) --- */
+    {
+        /* guest: /usr/share/fonts/k93 (installed by mkrootfs). Build host:
+         * probe known open-font dirs so the raster path is covered in
+         * `make selfcheck` too. No font anywhere -> 8x16 fallback path. */
+        int fok = k93font_init() == 0;
+        if (!fok) {
+            /* probe all known open-font dirs at once (colon list) */
+            static const char *cand =
+                "/usr/share/fonts/liberation-sans-fonts:"
+                "/usr/share/fonts/liberation-serif-fonts:"
+                "/usr/share/fonts/liberation-mono-fonts:"
+                "/usr/share/fonts/liberation2-sans-fonts:"
+                "/usr/share/fonts/liberation2-serif-fonts:"
+                "/usr/share/fonts/liberation2-mono-fonts:"
+                "/usr/share/fonts/truetype/liberation:"
+                "/usr/share/fonts/dejavu-sans-fonts:"
+                "/usr/share/fonts/truetype/dejavu:"
+                "/usr/share/fonts/truetype/freefont:"
+                "/usr/share/fonts/google-droid-sans-fonts:"
+                "/usr/share/fonts/google-droid-sans-mono-fonts";
+            setenv("K93_FONTDIR", cand, 1);
+            fok = k93font_init() == 0;
+        }
+        int di = 0;
+        uint32_t uc1 = k93_utf8_next("A\xc3\xa9", &di);
+        uint32_t uc2 = k93_utf8_next("A\xc3\xa9", &di);
+        chk(uc1 == 'A' && uc2 == 0xE9 && di == 3, "utf8 decode");
+        if (!fok) {
+            printf("skip - no TTF on this system (8x16 fallback)\n");
+            chk(!k93font_ready(), "no font -> fallback flag");
+            chk(k93font_width(1, "abc") == 24, "fallback width = 8x16 cells");
+        } else {
+            chk(k93font_ready(), "system font loads");
+            chk(k93font_count() >= 1, "font families found");
+            chk(k93font_id("system") == k93font_default_id(), "system alias -> default");
+            int wa = k93font_width(1, "A"), wW = k93font_width(1, "W");
+            int wi = k93font_width(1, "i"), wsp = k93font_width(1, " ");
+            int wh = k93font_width(1, "Hello");
+            chk(wa > 2 && wW >= wa && wsp >= 1 && wsp < wa,
+                "proportional advances");
+            chk(wi < wa, "narrow glyph narrower than A");
+            chk(wh > 4 && wh < wa * 6, "word width sane");
+            chk(k93font_baseline(1) > 4 && k93font_baseline(1) < 16,
+                "baseline inside 16px cell");
+            chk(k93font_width(1, "AV") <= k93font_width(1, "A") + k93font_width(1, "V"),
+                "kerning: width(AV) <= width(A)+width(V)");
+            int w, h, xo, yo;
+            float adv;
+            uint8_t *g = k93font_glyph(0, 'A', 1, 0, &w, &h, &xo, &yo, &adv);
+            int ink = 0;
+            if (g)
+                for (int i = 0; i < w * h; i++) if (g[i]) ink++;
+            chk(g && w > 2 && h > 4 && adv > 1.0f, "glyph A rasterizes");
+            chk(ink > w * h / 8, "glyph A has plausible ink");
+            k93font_glyph_free(g);
+            g = k93font_glyph('A', ' ', 1, 0, &w, &h, &xo, &yo, &adv);
+            chk(!g && adv > 1.0f, "space: advance, no bitmap");
+            k93font_glyph_free(g);
+            /* missing codepoint renders the '?' glyph, not a hole */
+            g = k93font_glyph(0, 0x4E09, 1, 0, &w, &h, &xo, &yo, &adv);
+            chk(g && w > 1 && h > 1, "missing codepoint -> fallback glyph");
+            k93font_glyph_free(g);
+            int mono = k93font_id("monospace");
+            if (mono >= 0 && strstr(k93font_name(mono), "Mono") &&
+                k93font_select(mono) == 0) {
+                chk(k93font_width(1, "iii") == k93font_width(1, "WWW"),
+                    "monospace: equal advances");
+                chk(k93font_select(k93font_default_id()) == 0, "font reselect");
+            } else {
+                printf("skip - no monospace family installed\n");
+            }
+            chk(k93font_width(2, "Hello") > k93font_width(1, "Hello"),
+                "scale 2 wider than scale 1");
+            printf("info - font: default=%s families=%d baseline=%d w(Hello)=%d\n",
+                   k93font_name(k93font_default_id()), k93font_count(),
+                   k93font_baseline(1), wh);
+            k93font_shutdown();
+            chk(!k93font_ready(), "font shutdown clears state");
+        }
+    }
+
+    /* --- SVG rasterizer + PNG encoder (browser pipeline) --- */
+    {
+        chk(k93png_crc32("123456789", 9) == 0xCBF43926u, "png crc32 vector");
+        uint8_t solid[4 * 2 * 4];
+        for (int i = 0; i < 8; i++) {
+            solid[i * 4 + 0] = (uint8_t)(i * 30);
+            solid[i * 4 + 1] = 77;
+            solid[i * 4 + 2] = 200;
+            solid[i * 4 + 3] = (uint8_t)(255 - i * 20);
+        }
+        size_t plen = 0;
+        uint8_t *png = k93png_encode(solid, 4, 2, &plen);
+        chk(png && plen > 50 && png[0] == 137 && png[1] == 'P',
+            "png encode signature");
+        if (png) {
+            int pw = 0, ph = 0;
+            uint8_t *back = k93png_decode_stored(png, plen, &pw, &ph);
+            chk(back && pw == 4 && ph == 2 &&
+                back && memcmp(solid, back, sizeof solid) == 0,
+                "png decode roundtrip");
+            free(back);
+        }
+        free(png);
+        static const char *sv =
+            "<svg width=\"16\" height=\"16\">"
+            "<rect x=\"1\" y=\"1\" width=\"14\" height=\"14\" fill=\"#3366cc\"/>"
+            "<circle cx=\"8\" cy=\"8\" r=\"4\" fill=\"white\"/>"
+            "<path d=\"M2 13 L13 2\" stroke=\"#000000\" stroke-width=\"2\"/>"
+            "</svg>";
+        int vw = 0, vh = 0;
+        uint8_t *rgba = k93svg_to_rgba(sv, strlen(sv), &vw, &vh);
+        chk(rgba && vw == 16 && vh == 16, "svg raster size");
+        if (rgba) {
+            const uint8_t *c = rgba + ((size_t)14 * vw + 14) * 4; /* rect corner */
+            chk(c[0] == 0x33 && c[2] == 0xCC && c[3] == 255,
+                "svg rect fill");
+            const uint8_t *cc = rgba + ((size_t)8 * vw + 8) * 4;  /* circle */
+            chk(cc[0] > 200 && cc[1] > 200 && cc[2] > 200,
+                "svg circle over rect");
+            chk(rgba[3] == 0, "svg transparent background");
+            const uint8_t *st = rgba + ((size_t)4 * vw + 11) * 4; /* stroke */
+            chk(st[0] < 64 && st[3] > 200, "svg path stroke");
+            /* svg -> png -> decode = identical pixels */
+            size_t slen = 0;
+            uint8_t *spng = k93svg_to_png(sv, strlen(sv), &slen, &vw, &vh);
+            chk(spng && slen > 100, "svg to png pipeline");
+            free(spng);
+            free(rgba);
+        }
+        /* comma-separated path numbers (real-world SVG style) */
+        static const char *svc =
+            "<svg width=\"16\" height=\"16\">"
+            "<path d=\"M2 13, C 4 2, 12 2, 14 13\" fill=\"none\" "
+            "stroke=\"#000000\" stroke-width=\"2\"/></svg>";
+        uint8_t *rgbc = k93svg_to_rgba(svc, strlen(svc), &vw, &vh);
+        int dark = 0;
+        if (rgbc)
+            for (int i = 0; i < vw * vh; i++)
+                if (rgbc[i * 4 + 3] > 200 && rgbc[i * 4] < 64) dark++;
+        chk(rgbc && dark > 20, "svg cubic path with comma separators");
+        free(rgbc);
+        chk(!k93svg_to_rgba("<html></html>", 13, &vw, &vh),
+            "svg rejects non-svg");
+        printf("info - svg/png ok\n");
+    }
+
+    /* --- ui_image_load (stb_image backend) --- */
+    {
+        uint8_t rgba[4 * 4 * 4];
+        for (int i = 0; i < 64; i += 4) {
+            rgba[i] = 200; rgba[i + 1] = 10; rgba[i + 2] = 20; rgba[i + 3] = 255;
+        }
+        size_t plen = 0;
+        uint8_t *png = k93png_encode(rgba, 4, 4, &plen);
+        chk(png != NULL && plen > 0, "png encode for image test");
+        if (png) {
+            k93_write_file("/tmp/k93_imgtest.png", png, plen, 0);
+            free(png);
+            ui_image im;
+            memset(&im, 0, sizeof im);
+            chk(ui_image_load(&im, "/tmp/k93_imgtest.png") == 0 &&
+                im.w == 4 && im.h == 4 && im.px &&
+                (im.px[0] & 0xFFFFFFu) == 0xC80A14u,
+                "ui_image_load png roundtrip");
+            ui_image_free(&im);
+            chk(im.px == NULL && im.w == 0, "ui_image_free clears");
+            chk(ui_image_load(&im, "/nonexistent/x.png") < 0,
+                "ui_image_load missing file fails");
+        }
+        remove("/tmp/k93_imgtest.png");
+        printf("info - ui_image ok\n");
     }
 
     printf("%s (%d failures)\n", fails ? "SELFCHECK FAILED" : "SELFCHECK PASSED", fails);

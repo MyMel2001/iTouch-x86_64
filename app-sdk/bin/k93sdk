@@ -23,14 +23,24 @@ INC="$K93_HOME/userspace/include"
 LIBSRC="$K93_HOME/userspace/libk93"
 UAPI="$K93_HOME/build/uapi"
 
-# libk93 subset every graphical app links (POSIX + kernel uapi only,
-# no zlib/mbedtls - those stay in the OS build for Files/Safari)
-LIBC_SRC="$LIBSRC/k93ui.c $LIBSRC/k93util.c"
+# libk93 subset every graphical app links (POSIX + kernel uapi only; the
+# image decoder pulls the vendored stb_image.h header once, like the OS
+# build does - no zlib/mbedtls: those stay in the OS build for Safari)
+LIBC_SRC="$LIBSRC/k93ui.c $LIBSRC/k93util.c $LIBSRC/k93font.c \
+          $LIBSRC/k93html.c $LIBSRC/k93img.c $LIBSRC/stbi.c"
+SDIR="$K93_HOME/third_party/_build/stb"
 
 ensure_uapi() {
     [ -f "$UAPI/linux/drm.h" ] && return
     command -v make >/dev/null 2>&1 || die "run 'make uapi' in the K93OS checkout once"
     make -C "$K93_HOME" uapi >/dev/null
+}
+
+ensure_stb() {
+    [ -f "$SDIR/stb_image.h" ] && return
+    command -v curl >/dev/null 2>&1 \
+        || die "stb_image.h missing: run 'make deps' in the K93OS checkout once"
+    bash "$K93_HOME/scripts/build-deps.sh" stb >/dev/null
 }
 
 ensure_font() {
@@ -125,6 +135,7 @@ cmd_build() {
     APPDIR=$(cd "${1:-.}" && pwd)
     read_conf
     ensure_uapi
+    ensure_stb
     ensure_font
     CC=$(pick_cc)
     out="$APPDIR/$EXEC"
@@ -143,7 +154,7 @@ cmd_build() {
         for s in $LIBC_SRC "$FONT"; do
             o="$APPDIR/.k93sdk/$(basename "$s" .c).o"
             mkdir -p "$APPDIR/.k93sdk"
-            zig cc -target x86_64-linux-musl -Os -I"$INC" -I"$UAPI" -c "$s" -o "$o"
+            zig cc -target x86_64-linux-musl -Os -I"$INC" -I"$UAPI" -I"$SDIR" -c "$s" -o "$o"
             objs="$objs $o"
         done
         zig build-exe "$APPDIR/main.zig" $objs -lc \
@@ -155,7 +166,7 @@ cmd_build() {
         for s in $LIBC_SRC "$FONT"; do
             o="$APPDIR/.k93sdk/$(basename "$s" .c).o"
             mkdir -p "$APPDIR/.k93sdk"
-            $CC -Os -I"$INC" -I"$UAPI" -c "$s" -o "$o"
+            $CC -Os -I"$INC" -I"$UAPI" -I"$SDIR" -c "$s" -o "$o"
             objs="$objs $o"
         done
         if command -v zig >/dev/null 2>&1; then
@@ -171,7 +182,7 @@ cmd_build() {
         for s in $LIBC_SRC "$FONT"; do
             o="$APPDIR/.k93sdk/$(basename "$s" .c).o"
             mkdir -p "$APPDIR/.k93sdk"
-            $CC -Os -I"$INC" -I"$UAPI" -c "$s" -o "$o"
+            $CC -Os -I"$INC" -I"$UAPI" -I"$SDIR" -c "$s" -o "$o"
             objs="$objs $o"
         done
         $CC -Os -I"$INC" -static -o "$out" "$APPDIR/main.c" $objs

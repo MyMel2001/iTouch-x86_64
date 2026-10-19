@@ -1,15 +1,13 @@
-/* safari.h - shared browser pieces: transport (main.c), DOM renderer
- * (render.c), QuickJS engine (js.c). */
+/* safari.h - shared browser pieces: main.c (browse shell), DOM renderer
+ * (render.c), QuickJS engine (js.c). Transport lives in libk93 k93net. */
 #ifndef SAFARI_H
 #define SAFARI_H
 #include "k93ui.h"
 #include "k93html.h"
+#include "k93net.h"
 #include <stddef.h>
 
-/* ---- transport (main.c) ---- */
-struct url { char scheme[8]; char host[256]; int port; char path[1024]; };
-int  url_parse(const char *s, struct url *u);
-void url_absolutize(const char *base, const char *rel, char *out, size_t cap);
+/* ---- fetch (main.c: thin wrapper over k93net) ---- */
 /* GET url; returns malloc'd NUL-terminated body (binary bodies may contain
  * NUL; length via sf_fetch_len()), or NULL (err filled). */
 char *sf_fetch(const char *url, int *status, char *err, size_t errlen);

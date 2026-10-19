@@ -114,7 +114,7 @@ $(GBIN)/%: $(TOP)/userspace/apps/%/main.c $(LIBK93) $(LIBK93_OBJ)
 
 $(GBIN)/k93selfcheck: $(TOP)/userspace/tests/selfcheck.c $(LIBK93)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS) $(LDLIBS_Z)
+	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS) $(LDLIBS_Z) -lm
 
 $(GBIN)/k93dmgtool: $(TOP)/userspace/tools/dmgtool.c $(LIBK93)
 	@mkdir -p $(@D)
@@ -130,8 +130,7 @@ $(GBIN)/k93smc: $(TOP)/userspace/tools/smc.c $(LIBK93)
 
 SAFARI_SRC := $(TOP)/userspace/apps/safari/main.c \
               $(TOP)/userspace/apps/safari/render.c \
-              $(TOP)/userspace/apps/safari/js.c \
-              $(TOP)/userspace/apps/safari/stbi.c
+              $(TOP)/userspace/apps/safari/js.c
 $(GBIN)/safari: $(SAFARI_SRC) $(LIBK93) $(LDLIBS_TLS) $(QJSA) $(SDIR)/stb_image.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $(SAFARI_SRC) $(LIBK93) $(LDFLAGS) \

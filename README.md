@@ -35,20 +35,27 @@ explanation (K93OS runs native x86_64 ELF only).
   host's maintained bundle at build time (the 2011-era roots in the
   original rootfs are not used)
 * Safari web engine (clean-room): `libk93/k93html.c` provides a DOM
-  parser (entities incl. numeric, rawtext elements, implied end tags),
-  `querySelector(All)`, innerHTML/clone, and a CSS subset (colors,
-  display:none, text-align, font-weight, margin-left, background-color,
-  font scale; inline `style` wins, later rule wins). Safari renders the
-  DOM to wrapped text lines with per-run color/bold/link runs, fetches
-  and decodes `<img>` (PNG/JPEG/GIF/BMP/... via vendored stb_image v2.30,
-  alt-text fallback, per-page pixel cache), and runs page JavaScript
-  with vendored QuickJS 2025-04-26 (MIT): DOM core, event listeners,
+  parser (entities incl. numeric + Latin-1, rawtext elements, implied
+  end tags), `querySelector(All)` (tag/.class/#id/descendant/`>`/`+`/`~`
+  attribute selectors), innerHTML/outerHTML/clone, and a CSS subset with
+  computed specificity (colors, display:none, text-align, font-weight,
+  margin/padding incl. shorthand, background-color, text-decoration,
+  font-family via system TTF, font scale; combinators, inline `style`
+  wins). Safari renders the DOM to wrapped text lines with per-run
+  color/bold/link/font/underline runs in the system TrueType fonts
+  (UTF-8 text end-to-end), fetches and decodes `<img>` (PNG/JPEG/GIF/
+  BMP/... via vendored stb_image v2.30, alt-text fallback, per-page
+  pixel cache) and SVG (own from-scratch rasterizer `k93svg.c` -> PNG
+  -> stb_image, linked and inline), and runs page JavaScript with
+  vendored QuickJS 2025-04-26 (MIT): DOM core, event listeners,
   `onclick` attributes, buttons, timers, `XMLHttpRequest`, `fetch`,
-  cookies, `document.title`, `preventDefault`; timers and DOM changes
-  re-render in place while browsing. Deps are fetched pinned-sha256 by
+  cookies, `document.title`, `preventDefault`, classList/dataset/style,
+  DOMContentLoaded/load with readyState, requestAnimationFrame, outerHTML
+  get/set, replaceChild/cloneNode; timers and DOM changes re-render in
+  place while browsing. Deps are fetched pinned-sha256 by
   `scripts/build-deps.sh` into gitignored `third_party/_build/`.
-  Ceilings: no canvas/WebGL/SVG/frames, no CSS specificity, ASCII
-  glyphs only, blocking image fetches, `<pre>` wrap only
+  Ceiling: no canvas/WebGL/frames, no CSS gradients, blocking image
+  fetches, `<pre>` wrap only
 * Serial-console-first UI toolkit. Graphics stack is DRM/KMS (clean-room
   client in `libk93/k93ui.c`): init waits for `/dev/dri/card0`, loads the
   GPU driver, SpringBoard becomes DRM master, creates its own dumb buffer
@@ -57,6 +64,17 @@ explanation (K93OS runs native x86_64 ELF only).
   never reach the host: they don't drive the plane's `atomic_update`, so the
   host scanout never switches). ANSI text console is the fallback when no
   KMS device appears. evdev + tty input, embedded GPL font
+* TrueType text (clean-room engine `libk93/k93font.c`, written from the
+  published format documentation): sfnt tables (head/maxp/cmap 4+12/
+  loca/glyf/hhea/hmtx/kern), 4x4-supersampled scanline glyph
+  rasterization, bold variants, kerning. On build, known open-license
+  fonts found on the host (Liberation, DejaVu, Droid, ...) are copied
+  into the image; the system default font renders all UI and page text
+  (UTF-8), falling back to the embedded 8x16 bitmap on the text console.
+  Apps pick families via `ui_set_font` / `k93font_select`
+* HTTP/HTTPS client `libk93/k93net.c` (extracted from Safari for general
+  use): proxy.conf + `HTTP(S)_PROXY`, mbedTLS with the system CA store,
+  chunked decoding, redirect-following GET
 * Display configuration (`/etc/k93/display.conf`: `MODE=auto|WxH`,
   `ORIENTATION=landscape|portrait`), settable in **Settings > Display**
   (resolution picker from the connector's mode list, orientation, restart
@@ -182,9 +200,10 @@ console keeps the plain look, so headless autotests are unchanged):
   `ui_textview`, status/hint bars get GUI skins (grouped white panels,
   blue selection, nav bar) in `k93ui.c`; one code path, both backends.
 * **Pixel API** — `ui_fill`/`ui_fill_grad`/`ui_roundrect`/`ui_frame`/
-  `ui_blit`/`ui_text*`/`ui_rgb`/`ui_tint` for custom drawing (see
-  `app-sdk/README.md`); SDK apps get it too (no icon tables shipped in
-  the SDK — apps bring their own art, no runtime image decoder).
+  `ui_blit`/`ui_image_load`/`ui_text*`/`ui_rgb`/`ui_tint` for custom
+  drawing (see `app-sdk/README.md`); SDK apps get it too (no icon tables
+  shipped in the SDK — apps bring their own art, or load PNG/JPG/GIF/BMP
+  files at runtime via `ui_image_load`, stb_image-backed).
 * **Mouse + super key** — libk93 opens every relative evdev pointer that
   is not the keyboard (`mfd[]`) and sums deltas/buttons, so a PS/2 mouse
   and a USB HID mouse coexist. Left = activate (hit-test launch on

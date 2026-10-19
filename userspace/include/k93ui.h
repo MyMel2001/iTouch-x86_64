@@ -39,10 +39,20 @@ void ui_frame(int x, int y, int w, int h, int r, int thick, uint32_t rgb);
 void ui_blit(int x, int y, int w, int h, const uint32_t *argb); /* straight alpha */
 void ui_blit_scaled(int x, int y, int dw, int dh,
                     const uint32_t *argb, int sw, int sh); /* nearest-neighbour */
+
+/* --- image files (stb_image backend): PNG/JPG/GIF/BMP/TGA ---
+ * Pixels are opaque 0xFFRRGGBB (alpha composited over white), drawn with
+ * ui_blit/ui_blit_scaled. */
+typedef struct { uint32_t *px; int w, h; } ui_image;
+int  ui_image_load(ui_image *im, const char *path);  /* 0 ok, -1 error */
+void ui_image_free(ui_image *im);                    /* safe on zeroed */
 void ui_text(int x, int y, int scale, const char *s, uint32_t fg);
 void ui_text_sh(int x, int y, int scale, const char *s, uint32_t fg, uint32_t shadow);
 void ui_text_bold(int x, int y, int scale, const char *s, uint32_t fg, uint32_t shadow);
 int  ui_text_width(int scale, const char *s);
+int  ui_set_font(const char *family); /* CSS alias or family name; NULL/""/
+                                       * "system" = default system font;
+                                       * unknown name: -1, family kept */
 
 /* events */
 enum { UI_KEY_NONE = 0, UI_KEY_UP, UI_KEY_DOWN, UI_KEY_LEFT, UI_KEY_RIGHT,
@@ -79,6 +89,8 @@ typedef struct {
     uint32_t fg;
     int bold;
     int link;                        /* link index activated by Enter, or -1 */
+    int font;                        /* k93font id for this run, -1 = default */
+    int underline;                   /* draw underline under the run */
 } ui_prun;
 
 typedef struct {

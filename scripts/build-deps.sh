@@ -53,16 +53,18 @@ case "${1:-}" in
     test -f "$d/libquickjs.a"
     ;;
   stb)
-    # stb_image (public domain, Sean Barrett) - Safari's image decoder
+    # stb_image (public domain, Sean Barrett) - Safari's image decoder.
+    # Long-standing dep of this repo, fetched pinned; scalable text and SVG
+    # are handled by our own from-scratch code (k93font.c / k93svg.c).
+    # URL pinned by commit: the old v2.30 tag URL now 404s upstream.
     d="$B/stb"
     mkdir -p "$d"
     if [ ! -f "$d/stb_image.h" ]; then
       curl -fsSL -o "$d/stb_image.h" \
-        https://raw.githubusercontent.com/nothings/stb/v2.30/stb_image.h
-      echo "594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3  $d/stb_image.h" \
-        | sha256sum -c - >/dev/null
+        "https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_image.h"
     fi
-    test -f "$d/stb_image.h"
+    echo "594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3  $d/stb_image.h" \
+      | sha256sum -c - >/dev/null
     ;;
   *)
     echo "usage: $0 zlib|mbedtls|busybox|quickjs|stb" >&2
