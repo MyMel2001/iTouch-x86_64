@@ -437,6 +437,133 @@ static JSValue c_cookie_set(JSContext *c, JSValueConst thisv, int argc,
     return JS_UNDEFINED;
 }
 
+/* ------------------------------------------------- dialogs + storage --- */
+
+static JSValue c_confirm(JSContext *c, JSValueConst thisv, int argc,
+                         JSValueConst *argv)
+{
+    (void)thisv;
+    const char *m = argc > 0 ? JS_ToCString(ctx, argv[0]) : "Are you sure?";
+    int r = ui_confirm("Confirm", m && *m ? m : "Are you sure?");
+    if (m) JS_FreeCString(ctx, m);
+    dirty = 1;
+    return JS_NewBool(c, r);
+}
+
+static JSValue c_prompt(JSContext *c, JSValueConst thisv, int argc,
+                        JSValueConst *argv)
+{
+    (void)thisv;
+    const char *msg = argc > 0 ? JS_ToCString(ctx, argv[0]) : "";
+    const char *dv = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
+    char buf[512];
+    k93_strlcpy(buf, dv && dv[0] ? dv : "", sizeof buf);
+    int r = ui_input(msg ? msg : "Enter value", buf, sizeof buf);
+    JSValue out;
+    if (r == 0) out = JS_NewString(c, buf);          /* 0 = accepted */
+    else out = JS_NULL;
+    if (msg) JS_FreeCString(ctx, msg);
+    if (dv) JS_FreeCString(ctx, dv);
+    dirty = 1;
+    return out;
+}
+
+static JSValue c_selectmenu(JSContext *c, JSValueConst thisv, int argc,
+                            JSValueConst *argv)
+{
+    (void)thisv;
+    if (argc < 2) return JS_NewInt32(c, -1);
+    const char *title = JS_ToCString(ctx, argv[0]);
+    char items[64][64];
+    const char *ptrs[64];
+    int n = 0;
+    if (JS_IsArray(ctx, argv[1])) {
+        JSValue lv = JS_GetPropertyStr(ctx, argv[1], "length");
+        int32_t ln = 0;
+        JS_ToInt32(ctx, &ln, lv);
+        JS_FreeValue(ctx, lv);
+        if (ln > 64) ln = 64;
+        for (int32_t i = 0; i < ln; i++) {
+            JSValue ev = JS_GetPropertyUint32(ctx, argv[1], (uint32_t)i);
+            const char *s = JS_ToCString(ctx, ev);
+            k93_strlcpy(items[n], s ? s : "", sizeof items[0]);
+            if (s) JS_FreeCString(ctx, s);
+            JS_FreeValue(ctx, ev);
+            ptrs[n] = items[n];
+            n++;
+        }
+    }
+    int sel = 0;
+    if (argc > 2) JS_ToInt32(ctx, &sel, argv[2]);
+    if (sel < 0) sel = 0;
+    if (n > 0 && sel >= n) sel = n - 1;
+    int r = n > 0 ? ui_menu(title && *title ? title : "Select", ptrs, n, sel)
+                  : -1;
+    if (title) JS_FreeCString(ctx, title);
+    dirty = 1;
+    return JS_NewInt32(c, r);
+}
+
+/* in-memory web storage: persists across navigation while the app runs.
+ * JS side prefixes keys with the origin. Ceiling: RAM only. */
+#define MAXSTORE 64
+static struct { char k[160]; char v[512]; } STORE[MAXSTORE];
+static int nstore, srot;
+
+static JSValue c_store_get(JSContext *c, JSValueConst thisv, int argc,
+                           JSValueConst *argv)
+{
+    (void)thisv;
+    if (argc < 1) return JS_NULL;
+    const char *k = JS_ToCString(ctx, argv[0]);
+    if (!k) return JS_NULL;
+    JSValue out = JS_NULL;
+    for (int i = 0; i < nstore; i++)
+        if (!strcmp(STORE[i].k, k)) { out = JS_NewString(c, STORE[i].v); break; }
+    JS_FreeCString(ctx, k);
+    return out;
+}
+
+static JSValue c_store_set(JSContext *c, JSValueConst thisv, int argc,
+                           JSValueConst *argv)
+{
+    (void)thisv;
+    if (argc < 1) return JS_UNDEFINED;
+    const char *k = JS_ToCString(ctx, argv[0]);
+    if (!k) return JS_UNDEFINED;
+    int slot = -1;
+    for (int i = 0; i < nstore; i++)
+        if (!strcmp(STORE[i].k, k)) { slot = i; break; }
+    if (argc < 2 || JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+        if (slot >= 0) STORE[slot].k[0] = 0;        /* delete */
+    } else {
+        const char *v = JS_ToCString(ctx, argv[1]);
+        if (slot < 0) {
+            if (nstore < MAXSTORE) slot = nstore++;
+            else { slot = srot % MAXSTORE; srot++; }
+        }
+        k93_strlcpy(STORE[slot].k, k, sizeof STORE[0].k);
+        k93_strlcpy(STORE[slot].v, v ? v : "", sizeof STORE[0].v);
+        if (v) JS_FreeCString(ctx, v);
+    }
+    JS_FreeCString(ctx, k);
+    return JS_UNDEFINED;
+}
+
+static JSValue c_pxw(JSContext *c, JSValueConst thisv, int argc,
+                     JSValueConst *argv)
+{
+    (void)thisv; (void)argc; (void)argv;
+    return JS_NewInt32(c, ui_px_width());
+}
+
+static JSValue c_pxh(JSContext *c, JSValueConst thisv, int argc,
+                     JSValueConst *argv)
+{
+    (void)thisv; (void)argc; (void)argv;
+    return JS_NewInt32(c, ui_px_height());
+}
+
 /* ---------------------------------------------------- node proto funcs */
 
 enum {
@@ -492,7 +619,9 @@ static JSValue n_prop_get(JSContext *c, JSValueConst thisv, int magic)
     case P_NODENAME:
         return JS_NewString(c, n->tag);
     case P_NODETYPE:
-        return JS_NewInt32(c, strcmp(n->tag, "#text") ? 1 : 3);
+        if (!strcmp(n->tag, "#text")) return JS_NewInt32(c, 3);
+        if (!strncmp(n->tag, "#comment", 8)) return JS_NewInt32(c, 8);
+        return JS_NewInt32(c, 1);
     case P_ID: {
         const char *v = k93html_attr(n, "id");
         return JS_NewString(c, v ? v : "");
@@ -638,6 +767,16 @@ static JSValue n_appendChild(JSContext *c, JSValueConst thisv, int argc,
     k93node *n = node_of(c, thisv);
     k93node *ch = argc > 0 ? arg_node(c, argv[0]) : NULL;
     if (!n || !ch) return JS_UNDEFINED;
+    if (!strcmp(ch->tag, "#fragment")) {   /* move fragment children in order */
+        k93node *f = ch->first;
+        while (f) {
+            k93node *nx = f->next;
+            k93html_append(n, f);
+            f = nx;
+        }
+        dirty = 1;
+        return JS_DupValue(c, argv[0]);
+    }
     k93html_append(n, ch);
     dirty = 1;
     return JS_DupValue(c, argv[0]);
@@ -763,6 +902,73 @@ static JSValue n_getElementsByTagName(JSContext *c, JSValueConst thisv,
     return n_queryAll(c, thisv, argc, argv);
 }
 
+static JSValue n_matches(JSContext *c, JSValueConst thisv, int argc,
+                         JSValueConst *argv)
+{
+    k93node *n = node_of(c, thisv);
+    if (!n || argc < 1) return JS_FALSE;
+    const char *sel = JS_ToCString(ctx, argv[0]);
+    int m = sel ? k93html_matches(n, sel) : 0;
+    if (sel) JS_FreeCString(ctx, sel);
+    return JS_NewBool(c, m);
+}
+
+static JSValue n_closest(JSContext *c, JSValueConst thisv, int argc,
+                         JSValueConst *argv)
+{
+    k93node *n = node_of(c, thisv);
+    if (!n || argc < 1) return JS_NULL;
+    const char *sel = JS_ToCString(ctx, argv[0]);
+    k93node *hit = NULL;
+    if (sel) {
+        for (k93node *k = n; k && !hit; k = k->parent)
+            if (k93html_matches(k, sel)) hit = k;
+        JS_FreeCString(ctx, sel);
+    }
+    return node_wrap(c, hit);
+}
+
+/* insertAdjacentHTML: beforebegin/afterbegin/beforeend/afterend */
+static JSValue n_insertAdjacentHTML(JSContext *c, JSValueConst thisv, int argc,
+                                    JSValueConst *argv)
+{
+    k93node *n = node_of(c, thisv);
+    if (!n || argc < 2) return JS_UNDEFINED;
+    const char *pos = JS_ToCString(ctx, argv[0]);
+    const char *html = JS_ToCString(ctx, argv[1]);
+    if (!pos || !html) {
+        if (pos) JS_FreeCString(ctx, pos);
+        if (html) JS_FreeCString(ctx, html);
+        return JS_UNDEFINED;
+    }
+    k93node *frag = k93html_parse(html);
+    JS_FreeCString(ctx, pos);
+    JS_FreeCString(ctx, html);
+    if (!frag) return JS_UNDEFINED;
+    if (!strcmp(pos, "beforeend")) {
+        while (frag->first) k93html_append(n, frag->first);
+    } else if (!strcmp(pos, "afterbegin")) {
+        k93node *anchor = n->first;
+        while (frag->first) {
+            if (anchor) k93html_insert_before(anchor, frag->first);
+            else k93html_append(n, frag->first);
+        }
+    } else if (!strcmp(pos, "beforebegin") && n->parent) {
+        while (frag->first) k93html_insert_before(n, frag->first);
+    } else if (!strcmp(pos, "afterend") && n->parent) {
+        k93node *anchor = n->next;
+        while (frag->first) {
+            if (anchor) k93html_insert_before(anchor, frag->first);
+            else k93html_append(n->parent, frag->first);
+        }
+    }
+    frag->first = frag->last = NULL;
+    free(frag->tag);
+    free(frag);
+    dirty = 1;
+    return JS_UNDEFINED;
+}
+
 /* dispatch click on this node via bootstrap __k93_click */
 static int dispatch_click(k93node *n)
 {
@@ -810,6 +1016,9 @@ static const JSCFunctionListEntry node_proto_list[] = {
     JS_CFUNC_DEF("querySelectorAll", 1, n_queryAll),
     JS_CFUNC_DEF("getElementsByTagName", 1, n_getElementsByTagName),
     JS_CFUNC_DEF("click", 0, n_click),
+    JS_CFUNC_DEF("matches", 1, n_matches),
+    JS_CFUNC_DEF("closest", 1, n_closest),
+    JS_CFUNC_DEF("insertAdjacentHTML", 2, n_insertAdjacentHTML),
     JS_CGETSET_MAGIC_DEF("tagName", n_prop_get, NULL, P_TAGNAME),
     JS_CGETSET_MAGIC_DEF("nodeName", n_prop_get, NULL, P_NODENAME),
     JS_CGETSET_MAGIC_DEF("nodeType", n_prop_get, NULL, P_NODETYPE),
@@ -830,10 +1039,26 @@ static const JSCFunctionListEntry node_proto_list[] = {
 /* ------------------------------------------------- bootstrap (JS side) */
 
 static const char bootstrap_js[] =
+"var __ct = {}, __cc = {};\n"
 "globalThis.console = { log: function () { sf_log([].slice.call(arguments).join(\" \")); },\n"
 "  warn: function () { sf_log([].slice.call(arguments).join(\" \")); },\n"
 "  error: function () { sf_log([].slice.call(arguments).join(\" \")); },\n"
-"  info: function () { sf_log([].slice.call(arguments).join(\" \")); } };\n"
+"  info: function () { sf_log([].slice.call(arguments).join(\" \")); },\n"
+"  debug: function () { sf_log([].slice.call(arguments).join(\" \")); },\n"
+"  trace: function () { var s = (new Error()).stack || \"\"; sf_log(\"trace: \" + String(s).slice(0, 300)); },\n"
+"  dir: function (o) { try { sf_log(\"dir: \" + JSON.stringify(o)); }\n"
+"    catch (e) { sf_log(\"dir: \" + o); } },\n"
+"  table: function (o) { if (Array.isArray(o)) {\n"
+"      for (var i = 0; i < o.length; i++) { try { sf_log(\"table: \" + JSON.stringify(o[i])); }\n"
+"        catch (e) { sf_log(\"table: \" + o[i]); } } }\n"
+"    else sf_log(\"table: \" + o); },\n"
+"  time: function (k) { __ct[k || \"default\"] = Date.now(); },\n"
+"  timeEnd: function (k) { k = k || \"default\"; var t = __ct[k];\n"
+"    sf_log(k + \": \" + (t ? (Date.now() - t) : 0) + \"ms\"); },\n"
+"  count: function (k) { k = k || \"default\"; __cc[k] = (__cc[k] || 0) + 1;\n"
+"    sf_log(k + \": \" + __cc[k]); },\n"
+"  group: function () {}, groupCollapsed: function () {}, groupEnd: function () {},\n"
+"  assert: function (c, m) { if (!c) sf_log(\"assert: \" + (m || \"failed\")); } };\n"
 "globalThis.navigator = { userAgent: \"K93Safari/2.0 (K93OS; x86_64)\",\n"
 "  language: \"en-US\", platform: \"Linux x86_64\", onLine: true };\n"
 "var location = {\n"
@@ -849,6 +1074,128 @@ static const char bootstrap_js[] =
 "  reload: function () { sf_nav(sf_base()); },\n"
 "  toString: function () { return sf_base(); }\n"
 "};\n"
+"function __k93_resolve(u) {\n"
+"  u = String(u);\n"
+"  if (/^[a-z][a-z0-9+.-]*:/i.test(u)) return u;\n"
+"  var b = location.href.split(\"#\")[0];\n"
+"  if (u.slice(0, 2) === \"//\") return b.split(\":\")[0] + \":\" + u;\n"
+"  if (u.charAt(0) === \"#\") return b + u;\n"
+"  if (u.charAt(0) === \"?\") return b.split(\"?\")[0] + u;\n"
+"  if (u.charAt(0) === \"/\") { var m = b.match(/^([a-z]+:\\/\\/[^\\/?#]+)/i);\n"
+"    return (m ? m[1] : \"\") + u; }\n"
+"  var q = b.split(\"?\")[0];\n"
+"  return q.slice(0, q.lastIndexOf(\"/\") + 1) + u;\n"
+"}\n"
+"var __b64 = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\";\n"
+"globalThis.btoa = function (s) {\n"
+"  s = String(s);\n"
+"  var out = \"\", i = 0;\n"
+"  for (; i + 2 < s.length; i += 3) {\n"
+"    var n = (s.charCodeAt(i) << 16) | (s.charCodeAt(i + 1) << 8) | s.charCodeAt(i + 2);\n"
+"    out += __b64[(n >> 18) & 63] + __b64[(n >> 12) & 63] + __b64[(n >> 6) & 63] + __b64[n & 63];\n"
+"  }\n"
+"  if (i + 1 === s.length) { var a = s.charCodeAt(i);\n"
+"    out += __b64[a >> 2] + __b64[(a << 4) & 63] + \"==\"; }\n"
+"  else if (i + 2 === s.length) { var b = (s.charCodeAt(i) << 8) | s.charCodeAt(i + 1);\n"
+"    out += __b64[b >> 10] + __b64[(b >> 4) & 63] + __b64[(b << 2) & 63] + \"=\"; }\n"
+"  return out;\n"
+"};\n"
+"globalThis.atob = function (s) {\n"
+"  s = String(s).replace(/[^A-Za-z0-9+/]/g, \"\");\n"
+"  var out = \"\", i = 0;\n"
+"  for (; i + 3 < s.length; i += 4) {\n"
+"    var n = (__b64.indexOf(s[i]) << 18) | (__b64.indexOf(s[i + 1]) << 12) |\n"
+"            (__b64.indexOf(s[i + 2]) << 6) | __b64.indexOf(s[i + 3]);\n"
+"    out += String.fromCharCode((n >> 16) & 255, (n >> 8) & 255, n & 255);\n"
+"  }\n"
+"  var r = s.length - i;\n"
+"  if (r === 2) { var m = (__b64.indexOf(s[i]) << 2) | (__b64.indexOf(s[i + 1]) >> 4);\n"
+"    out += String.fromCharCode(m & 255); }\n"
+"  else if (r === 3) { var p = (__b64.indexOf(s[i]) << 10) | (__b64.indexOf(s[i + 1]) << 4) |\n"
+"    (__b64.indexOf(s[i + 2]) >> 2);\n"
+"    out += String.fromCharCode((p >> 8) & 255, p & 255); }\n"
+"  return out;\n"
+"};\n"
+"globalThis.queueMicrotask = function (f) { Promise.resolve().then(f); };\n"
+"globalThis.confirm = function (m) { return !!sf_confirm(String(m == null ? \"\" : m)); };\n"
+"globalThis.prompt = function (m, d) {\n"
+"  return sf_prompt(String(m == null ? \"\" : m), String(d == null ? \"\" : d));\n"
+"};\n"
+"function __mkstore() {\n"
+"  var pre = (function () { try { return location.origin; } catch (e) { return \"\"; } })();\n"
+"  return {\n"
+"    getItem: function (k) { return sf_store_get(pre + \"|\" + String(k)); },\n"
+"    setItem: function (k, v) { sf_store_set(pre + \"|\" + String(k), String(v)); },\n"
+"    removeItem: function (k) { sf_store_set(pre + \"|\" + String(k), null); },\n"
+"    clear: function () {},\n"
+"    key: function (i) { return null; },\n"
+"    get length() { return 0; }\n"
+"  };\n"
+"}\n"
+"/* ceiling: same RAM store for both; RAM only */\n"
+"globalThis.localStorage = __mkstore();\n"
+"globalThis.sessionStorage = globalThis.localStorage;\n"
+"var __hist = [location.href], __hpos = 0;\n"
+"globalThis.history = {\n"
+"  get length() { return __hist.length; },\n"
+"  get state() { return null; },\n"
+"  pushState: function (s, t, u) { if (u != null) {\n"
+"    __hist = __hist.slice(0, __hpos + 1); __hist.push(String(u));\n"
+"    __hpos = __hist.length - 1; } },\n"
+"  replaceState: function (s, t, u) { if (u != null) __hist[__hpos] = String(u); },\n"
+"  back: function () { if (__hpos > 0) { __hpos--; sf_nav(__hist[__hpos]); } },\n"
+"  forward: function () { if (__hpos + 1 < __hist.length) { __hpos++; sf_nav(__hist[__hpos]); } },\n"
+"  go: function (d) { var p = __hpos + (d | 0);\n"
+"    if (p >= 0 && p < __hist.length) { __hpos = p; sf_nav(__hist[p]); } }\n"
+"};\n"
+"Object.defineProperty(globalThis, \"innerWidth\",\n"
+"  { get: function () { return sf_pxw(); }, configurable: true });\n"
+"Object.defineProperty(globalThis, \"innerHeight\",\n"
+"  { get: function () { return sf_pxh(); }, configurable: true });\n"
+"Object.defineProperty(globalThis, \"outerWidth\",\n"
+"  { get: function () { return sf_pxw(); }, configurable: true });\n"
+"Object.defineProperty(globalThis, \"outerHeight\",\n"
+"  { get: function () { return sf_pxh(); }, configurable: true });\n"
+"Object.defineProperty(globalThis, \"devicePixelRatio\",\n"
+"  { get: function () { return 1; }, configurable: true });\n"
+"Object.defineProperty(globalThis, \"pageXOffset\",\n"
+"  { get: function () { return 0; }, configurable: true });\n"
+"Object.defineProperty(globalThis, \"pageYOffset\",\n"
+"  { get: function () { return 0; }, configurable: true });\n"
+"globalThis.scrollX = 0; globalThis.scrollY = 0;\n"
+"globalThis.screen = { width: sf_pxw(), height: sf_pxh(),\n"
+"  availWidth: sf_pxw(), availHeight: sf_pxh(), colorDepth: 24,\n"
+"  pixelDepth: 24, orientation: { type: \"landscape-primary\" } };\n"
+"globalThis.matchMedia = function (q) {\n"
+"  return { matches: false, media: String(q), onchange: null,\n"
+"    addListener: function () {}, removeListener: function () {},\n"
+"    addEventListener: function () {}, removeEventListener: function () {},\n"
+"    dispatchEvent: function () { return true; } };\n"
+"};\n"
+"var __cssd = { \"color\": \"rgb(0, 0, 0)\", \"background-color\": \"rgba(0, 0, 0, 0)\",\n"
+"  \"display\": \"inline\", \"visibility\": \"visible\", \"font-size\": \"16px\",\n"
+"  \"font-weight\": \"400\", \"font-family\": \"sans-serif\", \"opacity\": \"1\",\n"
+"  \"position\": \"static\", \"overflow\": \"visible\" };\n"
+"globalThis.getComputedStyle = function (el) {\n"
+"  var inline = (el && el.getAttribute) ? (el.getAttribute(\"style\") || \"\") : \"\";\n"
+"  var o = { getPropertyValue: function (k) {\n"
+"    var m = inline.match(new RegExp(\"(?:^|;)\\\\s*\" + k.replace(/-/g, \"\\\\-\") +\n"
+"      \"\\\\s*:\\\\s*([^;]*)\", \"i\"));\n"
+"    if (m) return m[1].trim();\n"
+"    return (k in __cssd) ? __cssd[k] : \"\";\n"
+"  } };\n"
+"  return new Proxy(o, { get: function (t, k) {\n"
+"    if (typeof k !== \"string\" || k in t) return t[k];\n"
+"    return t.getPropertyValue(k.replace(/[A-Z]/g,\n"
+"      function (m) { return \"-\" + m.toLowerCase(); }));\n"
+"  } });\n"
+"};\n"
+"globalThis.Image = function (w, h) {\n"
+"  var i = document.createElement(\"img\");\n"
+"  if (w != null) i.setAttribute(\"width\", String(w));\n"
+"  if (h != null) i.setAttribute(\"height\", String(h));\n"
+"  return i;\n"
+"};\n"
 "var __listeners = new Map();\n"
 "var P = __sf_proto;\n"
 "P.addEventListener = function (t, f) {\n"
@@ -862,7 +1209,11 @@ static const char bootstrap_js[] =
 "  for (var i = 0; i < a.length; i++)\n"
 "    if (a[i].t === t && a[i].f === f) { a.splice(i, 1); return; }\n"
 "};\n"
-"P.dispatchEvent = function (ev) { if (ev && ev.type === \"click\") this.click(); return true; };\n"
+"P.dispatchEvent = function (ev) {\n"
+"  if (!ev || !ev.type) return true;\n"
+"  __k93_emit(this, String(ev.type), ev);\n"
+"  return !ev.defaultPrevented;\n"
+"};\n"
 "P.focus = function () {}; P.blur = function () {};\n"
 "P.scrollIntoView = function () {};\n"
 "P.getBoundingClientRect = function () { return { left: 0, top: 0, right: 320, bottom: 480,\n"
@@ -949,21 +1300,292 @@ static const char bootstrap_js[] =
 "    }\n"
 "  });\n"
 "}});\n"
+"P.hasAttribute = function (k) { return this.getAttribute(k) != null; };\n"
+"P.toggleAttribute = function (k, force) {\n"
+"  var want = force === undefined ? !this.hasAttribute(k) : !!force;\n"
+"  if (want) this.setAttribute(k, \"\"); else this.removeAttribute(k);\n"
+"  return want;\n"
+"};\n"
+"Object.defineProperty(P, \"lastChild\", { get: function () {\n"
+"  var c = this.firstChild, l = null; while (c) { l = c; c = c.nextSibling; }\n"
+"  return l; } });\n"
+"Object.defineProperty(P, \"firstElementChild\", { get: function () {\n"
+"  var c = this.firstChild; while (c && c.nodeType === 3) c = c.nextSibling;\n"
+"  return c; } });\n"
+"Object.defineProperty(P, \"lastElementChild\", { get: function () {\n"
+"  var e = this.children; return e && e.length ? e[e.length - 1] : null; } });\n"
+"Object.defineProperty(P, \"nextElementSibling\", { get: function () {\n"
+"  var c = this.nextSibling; while (c && c.nodeType === 3) c = c.nextSibling;\n"
+"  return c; } });\n"
+"Object.defineProperty(P, \"previousElementSibling\", { get: function () {\n"
+"  var c = this.previousSibling; while (c && c.nodeType === 3) c = c.previousSibling;\n"
+"  return c; } });\n"
+"Object.defineProperty(P, \"childElementCount\", { get: function () {\n"
+"  return this.children.length; } });\n"
+"function __attrprop(name, dflt) {\n"
+"  return { get: function () { var v = this.getAttribute(name);\n"
+"      return v == null ? (dflt === undefined ? \"\" : dflt) : v; },\n"
+"    set: function (v) { this.setAttribute(name, String(v)); } };\n"
+"}\n"
+"function __boolprop(name, radio) {\n"
+"  return { get: function () { return this.hasAttribute(name); },\n"
+"    set: function (v) {\n"
+"      if (radio && v) {\n"
+"        var nm = this.getAttribute(\"name\");\n"
+"        if (nm) {\n"
+"          var root = this.form || document;\n"
+"          var all = root.querySelectorAll(\"input\");\n"
+"          for (var i = 0; i < all.length; i++) {\n"
+"            var a = all[i];\n"
+"            if (a !== this && (a.getAttribute(\"type\") || \"\").toLowerCase() === \"radio\" &&\n"
+"                a.getAttribute(\"name\") === nm) a.removeAttribute(\"checked\");\n"
+"          }\n"
+"        }\n"
+"      }\n"
+"      if (v) this.setAttribute(name, \"\"); else this.removeAttribute(name);\n"
+"    } };\n"
+"}\n"
+"Object.defineProperty(P, \"disabled\", __boolprop(\"disabled\"));\n"
+"Object.defineProperty(P, \"checked\", __boolprop(\"checked\", true));\n"
+"Object.defineProperty(P, \"selected\", __boolprop(\"selected\"));\n"
+"Object.defineProperty(P, \"name\", __attrprop(\"name\"));\n"
+"Object.defineProperty(P, \"placeholder\", __attrprop(\"placeholder\"));\n"
+"Object.defineProperty(P, \"src\", __attrprop(\"src\"));\n"
+"Object.defineProperty(P, \"alt\", __attrprop(\"alt\"));\n"
+"Object.defineProperty(P, \"title\", __attrprop(\"title\"));\n"
+"Object.defineProperty(P, \"target\", __attrprop(\"target\"));\n"
+"Object.defineProperty(P, \"method\", __attrprop(\"method\", \"get\"));\n"
+"Object.defineProperty(P, \"type\", { get: function () {\n"
+"  var t = this.getAttribute(\"type\"); if (t) return t;\n"
+"  var tag = (this.tagName || \"\").toLowerCase();\n"
+"  if (tag === \"input\") return \"text\";\n"
+"  if (tag === \"button\") return \"submit\";\n"
+"  if (tag === \"select\") return \"select-one\";\n"
+"  if (tag === \"textarea\") return \"textarea\";\n"
+"  return \"\"; },\n"
+"  set: function (v) { this.setAttribute(\"type\", String(v)); } });\n"
+"Object.defineProperty(P, \"href\", { get: function () {\n"
+"  var h = this.getAttribute(\"href\"); return h == null ? \"\" : __k93_resolve(h); },\n"
+"  set: function (v) { this.setAttribute(\"href\", String(v)); } });\n"
+"Object.defineProperty(P, \"action\", { get: function () {\n"
+"  var a = this.getAttribute(\"action\");\n"
+"  return a == null ? location.href : __k93_resolve(a); },\n"
+"  set: function (v) { this.setAttribute(\"action\", String(v)); } });\n"
+"Object.defineProperty(P, \"value\", { get: function () {\n"
+"  var tag = (this.tagName || \"\").toLowerCase();\n"
+"  if (tag === \"select\") {\n"
+"    var opts = this.querySelectorAll(\"option\");\n"
+"    for (var i = 0; i < opts.length; i++)\n"
+"      if (opts[i].hasAttribute(\"selected\")) return opts[i].value;\n"
+"    return opts.length ? opts[0].value : \"\";\n"
+"  }\n"
+"  if (tag === \"option\" || tag === \"textarea\") {\n"
+"    var tv = this.getAttribute(\"value\");\n"
+"    if (tv != null) return tv;\n"
+"    return (this.textContent || \"\").replace(/^\\s+|\\s+$/g, \"\");\n"
+"  }\n"
+"  var iv = this.getAttribute(\"value\");\n"
+"  return iv == null ? \"\" : iv;\n"
+"},\n"
+"  set: function (v) {\n"
+"    v = String(v);\n"
+"    var tag = (this.tagName || \"\").toLowerCase();\n"
+"    if (tag === \"select\") {\n"
+"      var opts = this.querySelectorAll(\"option\");\n"
+"      for (var i = 0; i < opts.length; i++) {\n"
+"        if (opts[i].value === v) opts[i].setAttribute(\"selected\", \"\");\n"
+"        else opts[i].removeAttribute(\"selected\");\n"
+"      }\n"
+"      return;\n"
+"    }\n"
+"    this.setAttribute(\"value\", v);\n"
+"  } });\n"
+"Object.defineProperty(P, \"defaultValue\", __attrprop(\"value\"));\n"
+"Object.defineProperty(P, \"selectedIndex\", { get: function () {\n"
+"  var opts = this.querySelectorAll(\"option\");\n"
+"  for (var i = 0; i < opts.length; i++)\n"
+"    if (opts[i].hasAttribute(\"selected\")) return i;\n"
+"  return opts.length ? 0 : -1;\n"
+"},\n"
+"  set: function (i) {\n"
+"    var opts = this.querySelectorAll(\"option\");\n"
+"    i = i | 0;\n"
+"    for (var j = 0; j < opts.length; j++) {\n"
+"      if (j === i) opts[j].setAttribute(\"selected\", \"\");\n"
+"      else opts[j].removeAttribute(\"selected\");\n"
+"    }\n"
+"  } });\n"
+"Object.defineProperty(P, \"options\", { get: function () {\n"
+"  return this.querySelectorAll(\"option\"); } });\n"
+"Object.defineProperty(P, \"form\", { get: function () {\n"
+"  var n = this;\n"
+"  while (n) { if ((n.tagName || \"\").toLowerCase() === \"form\") return n;\n"
+"    n = n.parentNode; }\n"
+"  return null; } });\n"
+"Object.defineProperty(P, \"elements\", { get: function () {\n"
+"  return this.querySelectorAll(\"input, select, textarea, button\"); } });\n"
+"P.submit = function () { __k93_submit(this); };\n"
+"P.reset = function () { __k93_reset(this); };\n"
+/* ---- event core: bubble node -> ancestors -> document, then default ---- */
+"function __k93_emit(target, type, base) {\n"
+"  var ev = base || {};\n"
+"  ev.type = type;\n"
+"  if (ev.target === undefined || ev.target === null) ev.target = target;\n"
+"  ev.bubbles = ev.bubbles !== false;\n"
+"  ev.cancelable = ev.cancelable !== false;\n"
+"  ev.defaultPrevented = !!ev.defaultPrevented;\n"
+"  ev._stop = false;\n"
+"  ev._imm = false;\n"
+"  ev.eventPhase = 2;\n"
+"  if (!ev.preventDefault) ev.preventDefault = function () { ev.defaultPrevented = true; };\n"
+"  if (!ev.stopPropagation) ev.stopPropagation = function () { ev._stop = true; };\n"
+"  if (!ev.stopImmediatePropagation)\n"
+"    ev.stopImmediatePropagation = function () { ev._stop = true; ev._imm = true; };\n"
+"  var chain = [], n = target;\n"
+"  while (n) { chain.push(n); n = n.parentNode; }\n"
+"  if (chain[chain.length - 1] !== document) chain.push(document);\n"
+"  for (var ci = 0; ci < chain.length && !ev._stop; ci++) {\n"
+"    var t = chain[ci];\n"
+"    ev.currentTarget = t;\n"
+"    var ls = __listeners.get(t);\n"
+"    if (ls) {\n"
+"      ls = ls.slice();\n"
+"      for (var i = 0; i < ls.length && !ev._stop; i++) {\n"
+"        if (ls[i].t !== type) continue;\n"
+"        try { ls[i].f.call(t, ev); } catch (e) { console.log(type + \": \" + e); }\n"
+"        if (ev._imm) break;\n"
+"      }\n"
+"    }\n"
+"    if (ev._imm) break;\n"
+"    if (t && t !== document && t.getAttribute) {\n"
+"      var oc = t.getAttribute(\"on\" + type);\n"
+"      if (oc) {\n"
+"        try { (new Function(\"event\", oc)).call(t, ev); }\n"
+"        catch (e) { console.log(\"on\" + type + \": \" + e); }\n"
+"        if (ev._imm) break;\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  ev.currentTarget = null;\n"
+"  ev.eventPhase = 0;\n"
+"  return ev;\n"
+"}\n"
+/* ---- form submission: GET query built from named controls (POST ceiling) -- */
+"function __k93_submit(form) {\n"
+"  if (!form || !form.tagName || form.tagName.toLowerCase() !== \"form\") return;\n"
+"  var ev = __k93_emit(form, \"submit\");\n"
+"  if (ev.defaultPrevented) return;\n"
+"  var method = (form.getAttribute(\"method\") || \"get\").toLowerCase();\n"
+"  var action = form.getAttribute(\"action\") || location.href;\n"
+"  var q = [];\n"
+"  var cs = form.querySelectorAll(\"input, select, textarea\");\n"
+"  for (var i = 0; i < cs.length; i++) {\n"
+"    var c = cs[i];\n"
+"    var t = c.type;\n"
+"    if (t === \"submit\" || t === \"button\" || t === \"reset\" ||\n"
+"        t === \"image\" || t === \"file\") continue;\n"
+"    if (c.disabled) continue;\n"
+"    var nm = c.getAttribute(\"name\");\n"
+"    if (!nm) continue;\n"
+"    q.push(encodeURIComponent(nm) + \"=\" + encodeURIComponent(c.value == null ? \"\" : c.value));\n"
+"  }\n"
+"  if (method !== \"get\") console.log(\"form POST: ceiling, sending as GET\");\n"
+"  var url = __k93_resolve(action).split(\"#\")[0].split(\"?\")[0];\n"
+"  var qs = q.join(\"&\");\n"
+"  sf_nav(qs ? url + \"?\" + qs : url);\n"
+"}\n"
+"function __k93_reset(form) {\n"
+"  if (!form || !form.elements) return;\n"
+"  var cs = form.elements;\n"
+"  for (var i = 0; i < cs.length; i++) {\n"
+"    var c = cs[i], tag = (c.tagName || \"\").toLowerCase();\n"
+"    if (c.__dc === undefined) c.__dc = c.hasAttribute(\"checked\");\n"
+"    if (c.__dc) c.setAttribute(\"checked\", \"\"); else c.removeAttribute(\"checked\");\n"
+"    if (c.__dv === undefined) c.__dv = c.getAttribute(\"value\");\n"
+"    if (tag === \"textarea\") c.removeAttribute(\"value\");\n"
+"    else if (c.__dv !== undefined) {\n"
+"      if (c.__dv != null) c.setAttribute(\"value\", c.__dv);\n"
+"      else c.removeAttribute(\"value\");\n"
+"    }\n"
+"    if (tag === \"select\") {\n"
+"      if (c.__dsel === undefined) c.__dsel = c.selectedIndex;\n"
+"      var opts = c.querySelectorAll(\"option\");\n"
+"      for (var j = 0; j < opts.length; j++) {\n"
+"        if (j === c.__dsel) opts[j].setAttribute(\"selected\", \"\");\n"
+"        else opts[j].removeAttribute(\"selected\");\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  __k93_emit(form, \"reset\");\n"
+"}\n"
+/* ---- widget default actions (checkbox/radio/editor/menu/submit) ---------- */
+"function __k93_default(node) {\n"
+"  if (!node || !node.tagName || node.nodeType !== 1) return false;\n"
+"  var tag = node.tagName.toLowerCase();\n"
+"  var type = node.type;\n"
+"  if (tag === \"input\") {\n"
+"    if (type === \"checkbox\") {\n"
+"      node.checked = !node.hasAttribute(\"checked\");\n"
+"      __k93_emit(node, \"change\");\n"
+"      return true;\n"
+"    }\n"
+"    if (type === \"radio\") { node.checked = true; __k93_emit(node, \"change\"); return true; }\n"
+"    if (type === \"submit\" || type === \"image\") { __k93_submit(node.form); return true; }\n"
+"    if (type === \"reset\") { __k93_reset(node.form); return true; }\n"
+"    if (type === \"button\" || type === \"hidden\") return false;\n"
+"    if (node.__dv === undefined) node.__dv = node.getAttribute(\"value\");\n"
+"    var lab = node.getAttribute(\"placeholder\") || node.getAttribute(\"name\") || \"Text\";\n"
+"    var nv = sf_prompt(lab, node.value == null ? \"\" : String(node.value));\n"
+"    if (nv !== null && nv !== undefined) {\n"
+"      node.value = nv;\n"
+"      __k93_emit(node, \"input\");\n"
+"      __k93_emit(node, \"change\");\n"
+"    }\n"
+"    return true;\n"
+"  }\n"
+"  if (tag === \"textarea\") {\n"
+"    if (node.__dv === undefined) node.__dv = node.getAttribute(\"value\");\n"
+"    var lab2 = node.getAttribute(\"placeholder\") || node.getAttribute(\"name\") || \"Text\";\n"
+"    var nv2 = sf_prompt(lab2, String(node.value));\n"
+"    if (nv2 !== null && nv2 !== undefined) {\n"
+"      node.value = nv2;\n"
+"      __k93_emit(node, \"input\");\n"
+"      __k93_emit(node, \"change\");\n"
+"    }\n"
+"    return true;\n"
+"  }\n"
+"  if (tag === \"select\") {\n"
+"    var opts = node.querySelectorAll(\"option\");\n"
+"    if (!opts.length) return true;\n"
+"    if (node.__dsel === undefined) node.__dsel = node.selectedIndex;\n"
+"    var labels = [], cur = node.selectedIndex;\n"
+"    for (var i = 0; i < opts.length; i++) {\n"
+"      var ot = opts[i].textContent || \"\";\n"
+"      labels.push(String(ot).replace(/^\\s+|\\s+$/g, \"\"));\n"
+"    }\n"
+"    var title = node.getAttribute(\"name\") || \"Select\";\n"
+"    var pick = sf_selectmenu(title, labels, cur < 0 ? 0 : cur);\n"
+"    if (pick >= 0 && pick < opts.length) {\n"
+"      for (var j = 0; j < opts.length; j++) {\n"
+"        if (j === pick) opts[j].setAttribute(\"selected\", \"\");\n"
+"        else opts[j].removeAttribute(\"selected\");\n"
+"      }\n"
+"      __k93_emit(node, \"change\");\n"
+"    }\n"
+"    return true;\n"
+"  }\n"
+"  if (tag === \"button\") {\n"
+"    if (type === \"reset\") { __k93_reset(node.form); return true; }\n"
+"    if (type === \"submit\") { __k93_submit(node.form); return true; }\n"
+"    return true;\n"
+"  }\n"
+"  return false;\n"
+"}\n"
 "globalThis.__k93_click = function (node) {\n"
-"  var ls = __listeners.get(node) || [];\n"
-"  var ev = { type: \"click\", target: node, currentTarget: node,\n"
-"    defaultPrevented: false, preventDefault: function () { ev.defaultPrevented = true; },\n"
-"    stopPropagation: function () {} };\n"
-"  var handled = ls.length > 0;\n"
-"  for (var i = 0; i < ls.length; i++) {\n"
-"    try { ls[i].f.call(node, ev); } catch (e) { console.log(\"click: \" + e); }\n"
-"  }\n"
-"  var oc = null;\n"
-"  try { oc = node.getAttribute && node.getAttribute(\"onclick\"); } catch (e) {}\n"
-"  if (oc) { handled = true;\n"
-"    try { (new Function(\"event\", oc)).call(node, ev); } catch (e) { console.log(\"onclick: \" + e); }\n"
-"  }\n"
-"  return ev.defaultPrevented ? 2 : (handled ? 1 : 0);\n"
+"  var ev = __k93_emit(node, \"click\", { type: \"click\", target: node,\n"
+"    bubbles: true, cancelable: true });\n"
+"  if (!ev.defaultPrevented) __k93_default(node);\n"
+"  return ev.defaultPrevented ? 2 : 1;\n"
 "};\n"
 "function XMLHttpRequest() { this.readyState = 0; this.status = 0;\n"
 "  this.responseText = \"\"; this.onreadystatechange = null; this._u = \"\"; }\n"
@@ -988,7 +1610,6 @@ static const char bootstrap_js[] =
 "globalThis.setInterval = function (f, ms) { return sf_setInterval(f, ms || 0); };\n"
 "globalThis.clearInterval = function (id) { sf_clearTimeout(id); };\n"
 "globalThis.alert = function (m) { sf_alert(String(m)); };\n"
-"var __doclsn = [];\n"
 "var document = {\n"
 "  get body() { return sf_query(\"body\"); },\n"
 "  get documentElement() { return sf_query(\"html\"); },\n"
@@ -1000,6 +1621,9 @@ static const char bootstrap_js[] =
 "  getElementsByClassName: function (t) { return sf_queryAll(\".\" + t); },\n"
 "  createElement: function (t) { return sf_createElement(t); },\n"
 "  createTextNode: function (t) { return sf_createTextNode(t); },\n"
+"  createComment: function (t) {\n"
+"    var c = document.createElement(\"#comment\"); c.textContent = String(t); return c; },\n"
+"  createDocumentFragment: function () { return document.createElement(\"#fragment\"); },\n"
 "  write: function (h) { sf_write(h); },\n"
 "  writeln: function (h) { sf_write(h + \"\\n\"); },\n"
 "  open: function () {}, close: function () {},\n"
@@ -1008,14 +1632,20 @@ static const char bootstrap_js[] =
 "  get cookie() { return sf_getCookie(); },\n"
 "  set cookie(v) { sf_setCookie(String(v)); },\n"
 "  addEventListener: function (t, f) {\n"
-"    if (typeof f === \"function\") __doclsn.push({ t: t, f: f });\n"
-"    var b = document.body; if (b) b.addEventListener(t, f);\n"
+"    if (typeof f !== \"function\") return;\n"
+"    var a = __listeners.get(document);\n"
+"    if (!a) { a = []; __listeners.set(document, a); }\n"
+"    for (var i = 0; i < a.length; i++) if (a[i].t === t && a[i].f === f) return;\n"
+"    a.push({ t: t, f: f });\n"
 "  },\n"
 "  removeEventListener: function (t, f) {\n"
-"    for (var i = 0; i < __doclsn.length; i++)\n"
-"      if (__doclsn[i].t === t && __doclsn[i].f === f) { __doclsn.splice(i, 1); break; }\n"
-"    var b = document.body; if (b) b.removeEventListener(t, f);\n"
+"    var a = __listeners.get(document); if (!a) return;\n"
+"    for (var i = 0; i < a.length; i++)\n"
+"      if (a[i].t === t && a[i].f === f) { a.splice(i, 1); return; }\n"
 "  },\n"
+"  get forms() { return this.querySelectorAll(\"form\"); },\n"
+"  get defaultView() { return globalThis; },\n"
+"  get activeElement() { return document.body; },\n"
 "  get readyState() { return sf_readyState(); },\n"
 "  get currentScript() { return null; },\n"
 "  documentMode: 0\n"
@@ -1033,11 +1663,12 @@ static const char bootstrap_js[] =
 "};\n"
 "globalThis.cancelAnimationFrame = function (id) { sf_clearTimeout(id); };\n"
 "globalThis.__k93_dcl = function () {\n"
+"  var ls = __listeners.get(document);\n"
+"  ls = ls ? ls.slice() : [];\n"
 "  var ev = { type: \"DOMContentLoaded\", target: document,\n"
 "    currentTarget: document, defaultPrevented: false,\n"
 "    preventDefault: function () { ev.defaultPrevented = true; },\n"
 "    stopPropagation: function () {} };\n"
-"  var ls = __doclsn.slice();\n"
 "  for (var i = 0; i < ls.length; i++)\n"
 "    if (ls[i].t === \"DOMContentLoaded\" || ls[i].t === \"load\") {\n"
 "      try { ls[i].f.call(document, ev); } catch (e) { console.log(\"dcl: \" + e); }\n"
@@ -1116,6 +1747,13 @@ int js_open(sf_page *p, k93node *doc, const char *base)
     bind_global(ctx, "sf_setInterval", c_setInterval, 2);
     bind_global(ctx, "sf_clearTimeout", c_clearTimer, 1);
     bind_global(ctx, "sf_readyState", c_readyState, 0);
+    bind_global(ctx, "sf_confirm", c_confirm, 1);
+    bind_global(ctx, "sf_prompt", c_prompt, 2);
+    bind_global(ctx, "sf_selectmenu", c_selectmenu, 3);
+    bind_global(ctx, "sf_store_get", c_store_get, 1);
+    bind_global(ctx, "sf_store_set", c_store_set, 2);
+    bind_global(ctx, "sf_pxw", c_pxw, 0);
+    bind_global(ctx, "sf_pxh", c_pxh, 0);
     JS_FreeValue(ctx, g);
 
     JSValue r = JS_Eval(ctx, bootstrap_js, sizeof bootstrap_js - 1,
@@ -1209,3 +1847,20 @@ int js_click(sf_link *l)
 const char *js_nav_url(void) { return navurl[0] ? navurl : NULL; }
 void js_nav_clear(void) { navurl[0] = 0; }
 int js_active(void) { return ctx != NULL; }
+
+int js_run_url(const char *url)
+{
+    if (!ctx || !url || strncmp(url, "javascript:", 11)) return 0;
+    const char *code = url + 11;
+    JSValue r = JS_Eval(ctx, code, strlen(code), "js-url", JS_EVAL_TYPE_GLOBAL);
+    int ok = !JS_IsException(r);
+    if (!ok) {
+        JSValue e = JS_GetException(ctx);
+        const char *m = JS_ToCString(ctx, e);
+        k93_log("safari-js", "javascript: URL error: %s", m ? m : "?");
+        JS_FreeCString(ctx, m);
+        JS_FreeValue(ctx, e);
+    }
+    JS_FreeValue(ctx, r);
+    return ok;
+}

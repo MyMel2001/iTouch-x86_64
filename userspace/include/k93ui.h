@@ -90,7 +90,8 @@ typedef struct {
     int bold;
     int link;                        /* link index activated by Enter, or -1 */
     int font;                        /* k93font id for this run, -1 = default */
-    int underline;                   /* draw underline under the run */
+    int underline;                   /* bitmask: 1=underline, 2=line-through */
+    uint32_t bg;                     /* run background band, 0 = none */
 } ui_prun;
 
 typedef struct {
@@ -101,6 +102,7 @@ typedef struct {
     int link;                        /* line's activatable link, or -1 */
     const uint32_t *img;             /* RGBA pixels for image lines or NULL */
     int imgw, imgh;
+    int lh;                          /* line height px, 0 = scale default */
 } ui_pline;
 
 typedef struct { ui_pline *lines; int n; int cap; int top, sel; } ui_page;

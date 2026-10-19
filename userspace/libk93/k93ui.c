@@ -108,7 +108,17 @@ static int evfd = -1;
 static int shift_down = 0;
 
 /* ---- mouse + super/Windows key ---------------------------------------- */
-static int mfd[8], nmfd;                /* relative mice (evdev), summed */
+/* Absolute pointers (USB tablet / VNC) AND relative mice (PS/2, USB HID):
+ * all non-keyboard pointer devices open; rel deltas sum, abs coords are
+ * scaled onto the canvas in mouse_pump(). */
+static struct {
+    int fd;
+    int abs;                           /* 1 = absolute (tablet) */
+    int minx, maxx, miny, maxy;        /* EVIOCGABS ranges */
+    int ax, ay;                        /* last raw abs coords */
+    int amoved;                        /* abs event seen this pump */
+} mfd[8];
+static int nmfd;
 static int m_x = -1, m_y = -1;          /* cursor px; -1 = never moved */
 static int m_click[3];                  /* pending presses: 0=left 1=right 2=mid */
 static int m_wheel = 0;                 /* pending lines: +down / -up */
@@ -125,7 +135,11 @@ static void input_open_evdev(void)
         int fd = open(p, O_RDONLY | O_NOCTTY | O_NONBLOCK);
         if (fd < 0) continue;
         char name[256] = {0};
-        if (ioctl(fd, EVIOCGNAME(sizeof name - 1), name) >= 0 &&
+        unsigned long absb = 0;
+        int has_abs = ioctl(fd, EVIOCGBIT(EV_ABS, sizeof absb), &absb) >= 0 &&
+                      (absb & (1UL << ABS_X));
+        if (!has_abs &&                              /* not a tablet/pointer */
+            ioctl(fd, EVIOCGNAME(sizeof name - 1), name) >= 0 &&
             (strcasestr(name, "keyboard") || strcasestr(name, "AT Translated") ||
              strcasestr(name, "QEMU") || strcasestr(name, "Virtual")))
             evfd = fd;
@@ -136,11 +150,9 @@ static void input_open_evdev(void)
 
 static void input_open_mouse(void)
 {
-    /* Open EVERY relative-motion device that is not the keyboard: a plain
-     * PS/2 two/three-button mouse and a USB HID 3-button+wheel mouse can
-     * coexist; deltas from all of them are summed in mouse_pump().
-     * ponytail: absolute pointers (USB tablet/trackpad, ABS_X/ABS_Y) are
-     * not opened; add EV_ABS handling when such hardware matters. */
+    /* Open EVERY pointer device that is not the keyboard: PS/2 + USB HID
+     * relative mice (deltas summed) and absolute pointers (USB tablet for
+     * VNC) coexist. */
     for (int i = 0; i < 16 && nmfd < (int)(sizeof mfd / sizeof mfd[0]); i++) {
         char p[64];
         snprintf(p, sizeof p, "/dev/input/event%d", i);
@@ -149,10 +161,32 @@ static void input_open_mouse(void)
         struct stat st1, st2;
         if (evfd >= 0 && fstat(fd, &st1) == 0 && fstat(evfd, &st2) == 0 &&
             st1.st_rdev == st2.st_rdev) { close(fd); continue; }
-        unsigned long rel = 0;
-        if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof rel), &rel) < 0 ||
-            !(rel & (1UL << REL_X))) { close(fd); continue; }
-        mfd[nmfd++] = fd;
+        unsigned long rel = 0, absb = 0;
+        int has_rel = ioctl(fd, EVIOCGBIT(EV_REL, sizeof rel), &rel) >= 0 &&
+                      (rel & (1UL << REL_X));
+        int has_abs = ioctl(fd, EVIOCGBIT(EV_ABS, sizeof absb), &absb) >= 0 &&
+                      (absb & (1UL << ABS_X));
+        if (!has_rel && !has_abs) { close(fd); continue; }
+        mfd[nmfd].fd = fd;
+        mfd[nmfd].abs = has_abs;
+        mfd[nmfd].minx = 0; mfd[nmfd].maxx = 1;
+        mfd[nmfd].miny = 0; mfd[nmfd].maxy = 1;
+        if (has_abs) {
+            struct input_absinfo ai;
+            if (ioctl(fd, EVIOCGABS(ABS_X), &ai) >= 0) {
+                mfd[nmfd].minx = ai.minimum;
+                mfd[nmfd].maxx = ai.maximum > ai.minimum ? ai.maximum
+                                                         : ai.minimum + 1;
+                mfd[nmfd].ax = ai.value;
+            }
+            if (ioctl(fd, EVIOCGABS(ABS_Y), &ai) >= 0) {
+                mfd[nmfd].miny = ai.minimum;
+                mfd[nmfd].maxy = ai.maximum > ai.minimum ? ai.maximum
+                                                         : ai.minimum + 1;
+                mfd[nmfd].ay = ai.value;
+            }
+        }
+        nmfd++;
     }
 }
 
@@ -186,28 +220,44 @@ static void cursor_state_read(void)
 
 static void mouse_pump(void)
 {
-    int dx = 0, dy = 0, moved = 0;
+    int dx = 0, dy = 0, moved = 0, abs_tx = -1, abs_ty = -1;
     struct input_event ie;
     for (int f = 0; f < nmfd; f++) {
-        while (read(mfd[f], &ie, sizeof ie) == sizeof ie) {
+        while (read(mfd[f].fd, &ie, sizeof ie) == sizeof ie) {
             if (ie.type == EV_REL) {
                 if (ie.code == REL_X) { dx += ie.value; moved = 1; }
                 else if (ie.code == REL_Y) { dy += ie.value; moved = 1; }
                 else if (ie.code == REL_WHEEL) m_wheel -= (int)ie.value;
+            } else if (ie.type == EV_ABS && mfd[f].abs) {
+                if (ie.code == ABS_X) mfd[f].ax = (int)ie.value;
+                else if (ie.code == ABS_Y) mfd[f].ay = (int)ie.value;
+                else continue;
+                mfd[f].amoved = 1;
             } else if (ie.type == EV_KEY) {
                 int b = ie.code == BTN_LEFT ? 0 : ie.code == BTN_RIGHT ? 1 :
                         ie.code == BTN_MIDDLE ? 2 : -1;
                 if (b >= 0 && ie.value == 1 && m_click[b] < 8) m_click[b]++;
             }
         }
+        if (mfd[f].abs && mfd[f].amoved) {   /* scale abs -> canvas px */
+            long rx = (long)(mfd[f].ax - mfd[f].minx) * (G.fbw_px - 1) /
+                      (long)(mfd[f].maxx - mfd[f].minx);
+            long ry = (long)(mfd[f].ay - mfd[f].miny) * (G.fbh_px - 1) /
+                      (long)(mfd[f].maxy - mfd[f].miny);
+            abs_tx = rx < 0 ? 0 : (rx >= G.fbw_px ? G.fbw_px - 1 : (int)rx);
+            abs_ty = ry < 0 ? 0 : (ry >= G.fbh_px ? G.fbh_px - 1 : (int)ry);
+            mfd[f].amoved = 0;
+            moved = 1;
+        }
     }
     if (!moved) return;
     int ox = m_x, oy = m_y;
-    if (m_x < 0) {                       /* first motion: spawn at center */
+    if (m_x < 0 && abs_tx < 0) {           /* first rel motion: at center */
         ox = m_x = G.fbw_px / 2;
         oy = m_y = G.fbh_px / 2;
     }
-    m_x += dx; m_y += dy;
+    if (abs_tx >= 0) { m_x = abs_tx; m_y = abs_ty; }   /* tablet teleports */
+    else { m_x += dx; m_y += dy; }
     if (m_x < 0) m_x = 0;
     if (m_y < 0) m_y = 0;
     if (m_x >= G.fbw_px) m_x = G.fbw_px - 1;
@@ -1748,7 +1798,7 @@ void ui_shutdown(void)
     if (G.fbr) { munmap(G.fbr, G.fblen); G.fbr = NULL; }
     if (G.fbfd > 0) { close(G.fbfd); G.fbfd = -1; }
     if (evfd >= 0) { close(evfd); evfd = -1; shift_down = 0; }
-    for (int f = 0; f < nmfd; f++) close(mfd[f]);
+    for (int f = 0; f < nmfd; f++) close(mfd[f].fd);
     nmfd = 0;
     if (G.backend == BACK_FB) cursor_state_write();
     k93font_shutdown();
@@ -2065,6 +2115,7 @@ static int page_h(const ui_pline *l, int text_rows)
 {
     if (l->img) return text_rows ? 1 : l->imgh + 10;
     if (text_rows) return 1;
+    if (l->lh > 0) return l->lh;             /* CSS line-height override */
     int sc = l->scale < 1 ? 1 : (l->scale > 2 ? 2 : l->scale);
     return sc * 16 + (sc > 1 ? 6 : 2);
 }
@@ -2112,14 +2163,19 @@ static void page_render(const char *title, ui_page *p, int top, int sel)
                     int sc = l->scale > 0 ? l->scale : 1;
                     int w = ui_text_width(sc, rn->text);
                     k93font_select(rn->font >= 0 ? rn->font : basef);
+                    if (rn->bg && !issel)
+                        ui_fill(x, y + 1, w, lh - 1, rn->bg);
                     if (rn->bold)
                         ui_text_bold(x, y + 3, sc, rn->text, fg,
                                      issel ? PAGE_SEL : 0xEEF1F6u);
                     else
                         ui_text_sh(x, y + 3, sc, rn->text, fg,
                                    issel ? PAGE_SEL : 0xFFFFFFu);
-                    if (rn->underline)
+                    if (rn->underline & 1)
                         ui_fill(x, y + 3 + k93font_baseline(sc) + 1, w, 1,
+                                issel ? GUI_WHITE : fg);
+                    if (rn->underline & 2)
+                        ui_fill(x, y + 3 + k93font_baseline(sc) / 2 + 2, w, 1,
                                 issel ? GUI_WHITE : fg);
                     x += w;
                 }
@@ -2174,6 +2230,42 @@ static int page_hit(ui_page *p, int top, int x, int y)
     return -1;
 }
 
+/* fine link hit inside line li: which run covers x? Mirrors the exact run
+ * x-layout of page_render (centering, indent, font-dependent advances). */
+static int page_hit_link(ui_page *p, int li, int x)
+{
+    const ui_pline *l = &p->lines[li];
+    if (l->img || l->nruns < 1) return l->link;
+    int px, py, pw, ph;
+    page_panel(G.fbh_px - 64 - 24 - 12, &px, &py, &pw, &ph);
+    int sc = l->scale > 0 ? l->scale : 1;
+    int basef0 = k93font_default_id();
+    int tw = 0;
+    for (int r = 0; r < l->nruns; r++) {
+        k93font_select(l->runs[r].font >= 0 ? l->runs[r].font : basef0);
+        tw += ui_text_width(sc, l->runs[r].text);
+    }
+    int x0 = px + 14 + l->indent;
+    if (l->center) {
+        x0 = px + (pw - tw) / 2;
+        if (x0 < px + 14 + l->indent) x0 = px + 14 + l->indent;
+    }
+    int basef = k93font_default_id();
+    k93font_select(basef);
+    int xr = x0, hit = -1, haslink = 0;
+    for (int r = 0; r < l->nruns; r++) {
+        int w = ui_text_width(sc, l->runs[r].text);
+        k93font_select(l->runs[r].font >= 0 ? l->runs[r].font : basef);
+        if (l->runs[r].link >= 0) haslink = 1;
+        if (x >= xr && x < xr + w && l->runs[r].link >= 0)
+            hit = l->runs[r].link;
+        xr += w;
+    }
+    if (hit >= 0) return hit;
+    /* line has links but x missed them: no action (plain text is inert) */
+    return haslink ? -1 : l->link;
+}
+
 int ui_pageview(const char *title, ui_page *p,
                 int (*tick)(ui_page *p, void *ctx), void *ctx)
 {
@@ -2200,9 +2292,11 @@ int ui_pageview(const char *title, ui_page *p,
         if (ui_mouse_clicked(0)) {
             handled = 1;
             int li = page_hit(p, top, ui_mouse_x(), ui_mouse_y());
-            if (li >= 0 && p->lines[li].link >= 0) {
-                p->sel = li; p->top = top;
-                return p->lines[li].link;
+            if (li >= 0) {
+                p->sel = li;
+                p->top = top;
+                int fl = page_hit_link(p, li, ui_mouse_x());
+                if (fl >= 0) return fl;
             }
         }
         int k = handled ? UI_KEY_NONE : ui_getkey(250);
@@ -2241,13 +2335,11 @@ int ui_pageview(const char *title, ui_page *p,
         /* keep selection visible */
         if (sel < top) top = sel;
         if (G.backend == BACK_FB) {
-            int y = 0, i = top;
-            while (i < sel && y + page_h(&p->lines[i], 0) < viewh) {
-                y += page_h(&p->lines[i], 0); i++;
-            }
-            while (y + page_h(&p->lines[sel], 0) > viewh && top < sel) {
-                y -= page_h(&p->lines[top], 0);
-                if (y < 0) y = 0;
+            /* slide top forward until lines top..sel all fit in viewh */
+            int y2 = 0;
+            for (int j = top; j <= sel; j++) y2 += page_h(&p->lines[j], 0);
+            while (y2 > viewh && top < sel) {
+                y2 -= page_h(&p->lines[top], 0);
                 top++;
             }
         } else {

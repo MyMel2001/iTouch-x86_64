@@ -52,6 +52,7 @@ int  js_click(sf_link *l);   /* 0 none, 1 handled(navigate ok), 2 prevented */
 const char *js_nav_url(void);
 void js_nav_clear(void);
 int  js_active(void);
+int  js_run_url(const char *url);        /* javascript: URL; 1 = ran ok */
 
 /* ---- stb_image (stbi.c) ---- */
 unsigned char *stbi_load_from_memory(const unsigned char *buf, int len,

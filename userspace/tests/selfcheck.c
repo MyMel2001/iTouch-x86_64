@@ -180,6 +180,86 @@ int main(int argc, char **argv)
         printf("info - css combinators/specificity/entities ok\n");
     }
 
+    /* --- css level: colors, new properties, pseudo-classes --- */
+    {
+        uint32_t col = 0;
+        chk(k93css_color("rgb(255, 0, 0)", &col) && col == 0xff0000, "css rgb()");
+        chk(k93css_color("rgba(0, 128, 0, 0.5)", &col) && col == 0x008000,
+            "css rgba()");
+        chk(k93css_color("hsl(240, 100%, 50%)", &col) && col == 0x0000ff,
+            "css hsl() blue");
+        chk(k93css_color("hsl(120, 100%, 50%)", &col) && col == 0x00ff00,
+            "css hsl() green");
+        chk(k93css_color("hsl(0, 0%, 100%)", &col) && col == 0xffffff,
+            "css hsl() white");
+        chk(k93css_color("rebeccapurple", &col) && col == 0x663399,
+            "css named color (extended set)");
+        chk(k93css_color("cornflowerblue", &col) && col == 0x6495ed,
+            "css named color 2");
+        chk(k93css_color("lightgoldenrodyellow", &col) && col == 0xfafad2,
+            "css named color 3");
+        chk(!k93css_color("notacolor", &col), "css bad color rejected");
+
+        k93node *d4 = k93html_parse(
+            "<html><body>"
+            "<div id=r>"
+            "<ul><li id=a>one</li><li id=b>two</li><li id=c>three</li></ul>"
+            "<p class=x lang=en-US id=q>txt</p>"
+            "<p lang=en id=w>other</p>"
+            "</div></body></html>");
+        k93css *c4 = k93css_new();
+        k93css_add(c4,
+            "p { text-transform: uppercase; line-height: 24px; opacity: 0.5 }\n"
+            "div { border: 2px solid #123456; width: 300px }\n"
+            "ul { list-style-type: decimal }\n"
+            "#q { text-decoration: line-through; color: tomato }\n");
+        k93node *qw = k93html_query(d4, "#w");
+        k93node *qd = k93html_query(d4, "#r");
+        k93node *qu = k93html_query(d4, "ul");
+        k93cstyle s4;
+        memset(&s4, 0, sizeof s4);
+        k93css_apply(c4, qw, &s4);
+        chk((s4.flags & K93CSS_XFORM) && s4.xform == 1, "css text-transform");
+        chk((s4.flags & K93CSS_LH) && s4.lh == 24, "css line-height px");
+        chk((s4.flags & K93CSS_OPACITY) && s4.opacity == 50, "css opacity 0.5");
+        memset(&s4, 0, sizeof s4);
+        k93css_apply(c4, qd, &s4);
+        chk((s4.flags & K93CSS_BORDER) && s4.bordw == 2 && s4.bordc == 0x123456,
+            "css border shorthand w+style+color");
+        chk((s4.flags & K93CSS_WIDTH) && s4.width == 300, "css width px");
+        memset(&s4, 0, sizeof s4);
+        k93css_apply(c4, qu, &s4);
+        chk((s4.flags & K93CSS_LSTYLE) && s4.lstyle == K93L_DECIMAL,
+            "css list-style-type");
+        memset(&s4, 0, sizeof s4);
+        k93css_apply(c4, k93html_query(d4, "#q"), &s4);
+        chk((s4.flags & K93CSS_STRIKE) && s4.strike == 1, "css line-through");
+        chk((s4.flags & K93CSS_FG) && s4.fg == 0xff6347, "css named fg tomato");
+
+        /* pseudo-classes */
+        k93node *la = k93html_query(d4, "#a");
+        k93node *lb = k93html_query(d4, "#b");
+        k93node *lc = k93html_query(d4, "#c");
+        chk(k93html_matches(la, "li:first-child"), ":first-child");
+        chk(!k93html_matches(lb, "li:first-child"), ":first-child negative");
+        chk(k93html_matches(lc, "li:last-child"), ":last-child");
+        chk(k93html_matches(lb, "li:nth-child(2)"), ":nth-child(2)");
+        chk(k93html_matches(la, "li:nth-child(odd)"), ":nth-child(odd)");
+        chk(k93html_matches(lc, "li:nth-child(2n+1)"), ":nth-child(2n+1)");
+        chk(!k93html_matches(lb, "li:nth-child(2n+1)"), ":nth-child neg");
+        chk(k93html_matches(lb, "li:not(:first-child)"), ":not()");
+        chk(k93html_matches(qw, "p:not(.x)"), ":not(class)");
+        chk(k93html_matches(qw, "[lang|=en]"), "attr |= operator");
+        chk(k93html_matches(la, "ul li"), "matches descendant");
+        chk(k93html_matches(qw, "p, li"), "matches selector list");
+        chk(!k93html_matches(la, "p"), "matches negative");
+        k93node *root = k93html_query(d4, "html");
+        chk(k93html_matches(root, ":root"), ":root");
+        k93css_free(c4);
+        k93html_free(d4);
+        printf("info - css colors/properties/pseudo ok\n");
+    }
+
     /* --- plist --- */
     k93_plist *p = k93_plist_parse(SAMPLE, strlen(SAMPLE), err, sizeof err);
     chk(p != NULL, "plist parses");

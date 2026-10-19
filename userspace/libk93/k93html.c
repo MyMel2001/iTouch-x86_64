@@ -498,13 +498,13 @@ void k93html_set_inner_html(k93node *n, const char *html)
 
 /* ---------------------------------------------------------- query */
 
-/* [attr], [attr=v], [attr^=v], [attr$=v], [attr*=v], [attr~=v] */
+/* [attr], [attr=v], [attr^=v], [attr$=v], [attr*=v], [attr~=v], [attr|=v] */
 static int attr_match(const k93node *n, const char *expr)
 {
     char name[48]; size_t ni = 0;
     const char *p = expr;
     while (*p && *p != '=' && *p != '^' && *p != '$' && *p != '*' &&
-           *p != '~' && ni < sizeof name - 1)
+           *p != '~' && *p != '|' && ni < sizeof name - 1)
         name[ni++] = *p++;
     while (ni > 0 && name[ni - 1] == ' ') ni--;
     name[ni] = 0;
@@ -543,16 +543,65 @@ static int attr_match(const k93node *n, const char *expr)
         }
         return 0;
     }
+    if (!strcmp(op, "|="))                          /* exact or prefix- */
+        return (vl == wl && !strncmp(v, want, wl)) ||
+               (wl < vl && !strncmp(v, want, wl) && v[wl] == '-');
     return 0;
 }
 
-/* part := tag? ( "." cls | "#id" | "[attr...]" )*  ("*" = any tag) */
+static int match_sel(const k93node *n, const char *sel);   /* :not uses it */
+
+/* index of n among element siblings, 1-based; 0 if not found */
+static int elem_index(const k93node *n)
+{
+    if (!n || !n->parent) return 0;
+    int idx = 0;
+    for (const k93node *k = n->parent->first; k; k = k->next) {
+        if (k->tag[0] != '#') idx++;
+        if (k == n) return idx;
+    }
+    return 0;
+}
+
+/* "an+b" microsyntax: 3 | 2n | 2n+1 | -n+3 | odd | even */
+static int nth_match(const k93node *n, const char *arg)
+{
+    int idx = elem_index(n);
+    if (idx <= 0) return 0;
+    while (*arg == ' ') arg++;
+    if (!strcasecmp(arg, "odd")) return idx % 2 == 1;
+    if (!strcasecmp(arg, "even")) return idx % 2 == 0;
+    char buf[32];
+    k93_strlcpy(buf, arg, sizeof buf);
+    for (char *q = buf; *q; q++) if (*q == ' ') *q = 0;
+    char *p2 = buf, *end = NULL;
+    long a = 0, b = 0;
+    if (*p2 == 'n') a = 1;
+    else {
+        a = strtol(p2, &end, 10);
+        if (end == p2) return 0;
+        p2 = end;
+    }
+    if (*p2 == 'n') {
+        p2++;
+        if (*p2 == '+' || *p2 == '-') b = strtol(p2, &end, 10);
+    } else {
+        b = a;                            /* plain "N": index must equal N */
+        a = 0;
+    }
+    if (a == 0) return idx == b;
+    long diff = idx - b;
+    return diff % a == 0 && diff / a >= 0;
+}
+
+/* part := tag? ( "." cls | "#id" | "[attr...]" | ":pseudo" )* */
 static int match_part(const k93node *n, const char *part)
 {
     if (!n || n->tag[0] == '#') return 0;
     const char *p = part;
     char tag[32]; size_t i = 0;
-    while (*p && *p != '.' && *p != '#' && *p != '[' && i < sizeof tag - 1)
+    while (*p && *p != '.' && *p != '#' && *p != '[' && *p != ':' &&
+           i < sizeof tag - 1)
         tag[i++] = *p++;
     tag[i] = 0;
     if (i && strcmp(tag, "*") && strcmp(n->tag, tag)) return 0;
@@ -564,6 +613,62 @@ static int match_part(const k93node *n, const char *part)
             if (*p == ']') p++;
             expr[ei] = 0;
             if (!attr_match(n, expr)) return 0;
+            continue;
+        }
+        if (*p == ':') {                           /* pseudo-class */
+            p++;
+            if (*p == ':') p++;                    /* pseudo-element */
+            char name[32]; size_t ni = 0;
+            while (*p && *p != '(' && *p != '.' && *p != '#' && *p != '[' &&
+                   *p != ':' && ni < sizeof name - 1)
+                name[ni++] = *p++;
+            name[ni] = 0;
+            char arg[64]; size_t ai = 0;
+            arg[0] = 0;
+            if (*p == '(') {
+                p++;
+                int depth = 1;
+                while (*p && ai < sizeof arg - 1) {
+                    if (*p == '(') depth++;
+                    else if (*p == ')') {
+                        if (--depth == 0) { p++; break; }
+                    }
+                    arg[ai++] = *p++;
+                }
+                arg[ai] = 0;
+            }
+            if (!strcmp(name, "first-child")) {
+                const k93node *k = n->prev;
+                while (k && k->tag[0] == '#') k = k->prev;
+                if (k) return 0;
+            } else if (!strcmp(name, "last-child")) {
+                const k93node *k = n->next;
+                while (k && k->tag[0] == '#') k = k->next;
+                if (k) return 0;
+            } else if (!strcmp(name, "only-child")) {
+                if (n->prev || n->next) return 0;
+            } else if (!strcmp(name, "nth-child")) {
+                if (!nth_match(n, arg)) return 0;
+            } else if (!strcmp(name, "nth-last-child")) {
+                if (!nth_match(n, arg)) return 0;   /* ceiling: counted forward */
+            } else if (!strcmp(name, "not")) {
+                if (match_sel(n, arg)) return 0;
+            } else if (!strcmp(name, "root")) {
+                if (!n->parent || strcmp(n->parent->tag, "document")) return 0;
+            } else if (!strcmp(name, "empty")) {
+                if (n->first) return 0;
+                if (n->text && *n->text && strcmp(n->tag, "#text")) return 0;
+            } else if (!strcmp(name, "link")) {
+                const char *h = k93html_attr(n, "href");
+                if (!h || !*h) return 0;
+            } else if (!strcmp(name, "enabled") || !strcmp(name, "disabled")) {
+                int dis = k93html_attr(n, "disabled") != NULL;
+                if ((strcmp(name, "enabled") == 0) == dis) return 0;
+            } else {
+                /* :hover/:focus/:visited/:active/:checked: no interaction
+                 * state in the cascade (ceiling) - never match */
+                return 0;
+            }
             continue;
         }
         char kind = *p++;
@@ -606,9 +711,21 @@ static int match_sel(const k93node *n, const char *sel)
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') p++;
         if (!*p) break;
         size_t i = 0;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != ',' &&
-               *p != '>' && *p != '+' && *p != '~' && i < 95)
+        int depth = 0;
+        while (*p && i < 95) {
+            char c = *p;
+            if (depth > 0) {               /* keep everything inside (...) */
+                if (c == '(') depth++;
+                else if (c == ')') depth--;
+                seg[nseg].part[i++] = *p++;
+                continue;
+            }
+            if (c == ' ' || c == '\t' || c == '\n' || c == ',' ||
+                c == '>' || c == '+' || c == '~')
+                break;
+            if (c == '(') depth++;
             seg[nseg].part[i++] = *p++;
+        }
         seg[nseg].part[i] = 0;
         if (!i) break;
         while (*p == ' ' || *p == '\t' || *p == '\n') p++;
@@ -669,6 +786,20 @@ k93node *k93html_query(k93node *root, const char *sel)
 {
     k93node *out[1];
     return k93html_query_all(root, sel, out, 1) ? out[0] : NULL;
+}
+
+int k93html_matches(const k93node *n, const char *sel)
+{
+    if (!n || !sel) return 0;
+    char buf[512];
+    k93_strlcpy(buf, sel, sizeof buf);
+    char *save = NULL;
+    for (char *one = strtok_r(buf, ",", &save); one;
+         one = strtok_r(NULL, ",", &save)) {
+        while (*one == ' ' || *one == '\t') one++;
+        if (match_sel(n, one)) return 1;
+    }
+    return 0;
 }
 
 k93node *k93html_get_id(k93node *root, const char *id)
@@ -809,26 +940,121 @@ void k93css_add(k93css *c, const char *text)
     }
 }
 
+/* split "a, b , c" style args inside rgb()/hsl() - commas OR spaces */
+static int func_args(const char *v, char toks[][40], int max)
+{
+    const char *o = strchr(v, '(');
+    if (!o) return 0;
+    const char *e = strchr(o, ')');
+    char buf[160];
+    size_t len = e ? (size_t)(e - o - 1) : strlen(o + 1);
+    if (len >= sizeof buf) len = sizeof buf - 1;
+    memcpy(buf, o + 1, len);
+    buf[len] = 0;
+    int n = 0;
+    char *save = NULL;
+    for (char *t = strtok_r(buf, ", \t", &save); t && n < max;
+         t = strtok_r(NULL, ", \t", &save))
+        k93_strlcpy(toks[n++], t, 40);
+    return n;
+}
+
+/* h,s,l (s/l already 0..1) -> 0xRRGGBB; hand-rolled, no libm */
+static uint32_t hsl2rgb(double h, double s, double l)
+{
+    while (h >= 360.0) h -= 360.0;
+    while (h < 0.0) h += 360.0;
+    double c = (1.0 - (l >= 0.5 ? 2.0 * l - 1.0 : 1.0 - 2.0 * l)) * s;
+    double hp = h / 60.0;
+    int sector = (int)hp;
+    double frac = hp - sector;
+    double x = c * ((sector & 1) ? 1.0 - frac : frac);   /* even sectors rise */
+    double r = 0, g = 0, b = 0;
+    switch (sector) {
+    case 0: r = c; g = x; break;
+    case 1: r = x; g = c; break;
+    case 2: g = c; b = x; break;
+    case 3: g = x; b = c; break;
+    case 4: r = x; b = c; break;
+    default: r = c; b = x; break;
+    }
+    double m = l - c / 2.0;
+    int R = (int)((r + m) * 255.0 + 0.5), G = (int)((g + m) * 255.0 + 0.5),
+        B = (int)((b + m) * 255.0 + 0.5);
+    if (R < 0) R = 0;
+    if (R > 255) R = 255;
+    if (G < 0) G = 0;
+    if (G > 255) G = 255;
+    if (B < 0) B = 0;
+    if (B > 255) B = 255;
+    return ((uint32_t)R << 16) | ((uint32_t)G << 8) | (uint32_t)B;
+}
+
+/* all 148 CSS Color Module named colors (public spec data) */
+static const struct { const char *n; uint32_t c; } cnames[] = {
+    { "aliceblue", 0xF0F8FF }, { "antiquewhite", 0xFAEBD7 },
+    { "aqua", 0x00FFFF }, { "aquamarine", 0x7FFFD4 }, { "azure", 0xF0FFFF },
+    { "beige", 0xF5F5DC }, { "bisque", 0xFFE4C4 }, { "black", 0x000000 },
+    { "blanchedalmond", 0xFFEBCD }, { "blue", 0x0000FF },
+    { "blueviolet", 0x8A2BE2 }, { "brown", 0xA52A2A }, { "burlywood", 0xDEB887 },
+    { "cadetblue", 0x5F9EA0 }, { "chartreuse", 0x7FFF00 },
+    { "chocolate", 0xD2691E }, { "coral", 0xFF7F50 },
+    { "cornflowerblue", 0x6495ED }, { "cornsilk", 0xFFF8DC },
+    { "crimson", 0xDC143C }, { "cyan", 0x00FFFF }, { "darkblue", 0x00008B },
+    { "darkcyan", 0x008B8B }, { "darkgoldenrod", 0xB8860B },
+    { "darkgray", 0xA9A9A9 }, { "darkgreen", 0x006400 }, { "darkgrey", 0xA9A9A9 },
+    { "darkkhaki", 0xBDB76B }, { "darkmagenta", 0x8B008B },
+    { "darkolivegreen", 0x556B2F }, { "darkorange", 0xFF8C00 },
+    { "darkorchid", 0x9932CC }, { "darkred", 0x8B0000 }, { "darksalmon", 0xE9967A },
+    { "darkseagreen", 0x8FBC8F }, { "darkslateblue", 0x483D8B },
+    { "darkslategray", 0x2F4F4F }, { "darkslategrey", 0x2F4F4F },
+    { "darkturquoise", 0x00CED1 }, { "darkviolet", 0x9400D3 },
+    { "deeppink", 0xFF1493 }, { "deepskyblue", 0x00BFFF }, { "dimgray", 0x696969 },
+    { "dimgrey", 0x696969 }, { "dodgerblue", 0x1E90FF }, { "firebrick", 0xB22222 },
+    { "floralwhite", 0xFFFAF0 }, { "forestgreen", 0x228B22 },
+    { "fuchsia", 0xFF00FF }, { "gainsboro", 0xDCDCDC }, { "ghostwhite", 0xF8F8FF },
+    { "gold", 0xFFD700 }, { "goldenrod", 0xDAA520 }, { "gray", 0x808080 },
+    { "grey", 0x808080 }, { "green", 0x008000 }, { "greenyellow", 0xADFF2F },
+    { "honeydew", 0xF0FFF0 }, { "hotpink", 0xFF69B4 }, { "indianred", 0xCD5C5C },
+    { "indigo", 0x4B0082 }, { "ivory", 0xFFFFF0 }, { "khaki", 0xF0E68C },
+    { "lavender", 0xE6E6FA }, { "lavenderblush", 0xFFF0F5 },
+    { "lawngreen", 0x7CFC00 }, { "lemonchiffon", 0xFFFACD },
+    { "lightblue", 0xADD8E6 }, { "lightcoral", 0xF08080 }, { "lightcyan", 0xE0FFFF },
+    { "lightgoldenrodyellow", 0xFAFAD2 }, { "lightgray", 0xD3D3D3 },
+    { "lightgreen", 0x90EE90 }, { "lightgrey", 0xD3D3D3 }, { "lightpink", 0xFFB6C1 },
+    { "lightsalmon", 0xFFA07A }, { "lightseagreen", 0x20B2AA },
+    { "lightskyblue", 0x87CEFA }, { "lightslategray", 0x778899 },
+    { "lightslategrey", 0x778899 }, { "lightsteelblue", 0xB0C4DE },
+    { "lightyellow", 0xFFFFE0 }, { "lime", 0x00FF00 }, { "limegreen", 0x32CD32 },
+    { "linen", 0xFAF0E6 }, { "magenta", 0xFF00FF }, { "maroon", 0x800000 },
+    { "mediumaquamarine", 0x66CDAA }, { "mediumblue", 0x0000CD },
+    { "mediumorchid", 0xBA55D3 }, { "mediumpurple", 0x9370DB },
+    { "mediumseagreen", 0x3CB371 }, { "mediumslateblue", 0x7B68EE },
+    { "mediumspringgreen", 0x00FA9A }, { "mediumturquoise", 0x48D1CC },
+    { "mediumvioletred", 0xC71585 }, { "midnightblue", 0x191970 },
+    { "mintcream", 0xF5FFFA }, { "mistyrose", 0xFFE4E1 }, { "moccasin", 0xFFE4B5 },
+    { "navajowhite", 0xFFDEAD }, { "navy", 0x000080 }, { "oldlace", 0xFDF5E6 },
+    { "olive", 0x808000 }, { "olivedrab", 0x6B8E23 }, { "orange", 0xFFA500 },
+    { "orangered", 0xFF4500 }, { "orchid", 0xDA70D6 },
+    { "palegoldenrod", 0xEEE8AA }, { "palegreen", 0x98FB98 },
+    { "paleturquoise", 0xAFEEEE }, { "palevioletred", 0xDB7093 },
+    { "papayawhip", 0xFFEFD5 }, { "peachpuff", 0xFFDAB9 }, { "peru", 0xCD853F },
+    { "pink", 0xFFC0CB }, { "plum", 0xDDA0DD }, { "powderblue", 0xB0E0E6 },
+    { "purple", 0x800080 }, { "rebeccapurple", 0x663399 }, { "red", 0xFF0000 },
+    { "rosybrown", 0xBC8F8F }, { "royalblue", 0x4169E1 }, { "saddlebrown", 0x8B4513 },
+    { "salmon", 0xFA8072 }, { "sandybrown", 0xF4A460 }, { "seagreen", 0x2E8B57 },
+    { "seashell", 0xFFF5EE }, { "sienna", 0xA0522D }, { "silver", 0xC0C0C0 },
+    { "skyblue", 0x87CEEB }, { "slateblue", 0x6A5ACD }, { "slategray", 0x708090 },
+    { "slategrey", 0x708090 }, { "snow", 0xFFFAFA }, { "springgreen", 0x00FF7F },
+    { "steelblue", 0x4682B4 }, { "tan", 0xD2B48C }, { "teal", 0x008080 },
+    { "thistle", 0xD8BFD8 }, { "tomato", 0xFF6347 }, { "turquoise", 0x40E0D0 },
+    { "violet", 0xEE82EE }, { "wheat", 0xF5DEB3 }, { "white", 0xFFFFFF },
+    { "whitesmoke", 0xF5F5F5 }, { "yellow", 0xFFFF00 }, { "yellowgreen", 0x9ACD32 },
+    { "transparent", 0 }, { NULL, 0 }
+};
+
 int k93css_color(const char *v, uint32_t *out)
 {
-    static const struct { const char *n; uint32_t c; } names[] = {
-        { "black", 0x000000 }, { "white", 0xFFFFFF }, { "red", 0xFF0000 },
-        { "green", 0x008000 }, { "blue", 0x0000FF }, { "gray", 0x808080 },
-        { "grey", 0x808080 }, { "orange", 0xFFA500 }, { "yellow", 0xFFFF00 },
-        { "purple", 0x800080 }, { "teal", 0x008080 }, { "navy", 0x000080 },
-        { "silver", 0xC0C0C0 }, { "maroon", 0x800000 }, { "olive", 0x808000 },
-        { "lime", 0x00FF00 }, { "aqua", 0x00FFFF }, { "fuchsia", 0xFF00FF },
-        { "brown", 0xA52A2A }, { "pink", 0xFFC0CB }, { "coral", 0xFF7F50 },
-        { "crimson", 0xDC143C }, { "gold", 0xFFD700 }, { "indigo", 0x4B0082 },
-        { "violet", 0xEE82EE }, { "khaki", 0xF0E68C }, { "salmon", 0xFA8072 },
-        { "tan", 0xD2B48C }, { "turquoise", 0x40E0D0 }, { "wheat", 0xF5DEB3 },
-        { "slate", 0x708090 }, { "steel", 0x4682B4 }, { "sky", 0x87CEEB },
-        { "beige", 0xF5F5DC }, { "ivory", 0xFFFFF0 }, { "azure", 0xF0FFFF },
-        { "magenta", 0xFF00FF }, { "cyan", 0x00FFFF }, { "darkgray", 0xA9A9A9 },
-        { "lightgray", 0xD3D3D3 }, { "dimgray", 0x696969 },
-        { "royalblue", 0x4169E1 }, { "tomato", 0xFF6347 },
-        { NULL, 0 }
-    };
     if (!v || !*v) return 0;
     while (*v == ' ' || *v == '\t') v++;
     if (v[0] == '#') {
@@ -851,8 +1077,44 @@ int k93css_color(const char *v, uint32_t *out)
         }
         return 0;
     }
-    for (int i = 0; names[i].n; i++)
-        if (!strcasecmp(names[i].n, v)) { *out = names[i].c; return 1; }
+    if (!strncasecmp(v, "rgb", 3) && (v[3] == '(' || v[3] == 'a')) {
+        if (v[3] == 'a' && v[4] != '(') return 0;
+        char t[4][40];
+        int n = func_args(v, t, 4);
+        if (n < 3) return 0;
+        int ch[3];
+        for (int i = 0; i < 3; i++) {
+            double d = strtod(t[i], NULL);
+            if (strchr(t[i], '%')) d = d * 255.0 / 100.0;
+            if (d < 0) d = 0;
+            if (d > 255) d = 255;
+            ch[i] = (int)(d + 0.5);
+        }
+        *out = ((uint32_t)ch[0] << 16) | ((uint32_t)ch[1] << 8) |
+               (uint32_t)ch[2];
+        return 1;
+    }
+    if (!strncasecmp(v, "hsl", 3) && (v[3] == '(' || v[3] == 'a')) {
+        if (v[3] == 'a' && v[4] != '(') return 0;
+        char t[4][40];
+        int n = func_args(v, t, 4);
+        if (n < 3) return 0;
+        double h = strtod(t[0], NULL);
+        double s = strtod(t[1], NULL);
+        double l = strtod(t[2], NULL);
+        if (strchr(t[1], '%')) s /= 100.0;
+        if (strchr(t[2], '%')) l /= 100.0;
+        if (s > 1.0) s /= 100.0;
+        if (l > 1.0) l /= 100.0;
+        *out = hsl2rgb(h, s, l);
+        return 1;
+    }
+    for (int i = 0; cnames[i].n; i++)
+        if (!strcasecmp(cnames[i].n, v)) {
+            if (!cnames[i].c && strcasecmp(v, "transparent")) return 0;
+            *out = cnames[i].c;
+            return 1;
+        }
     return 0;
 }
 
@@ -861,10 +1123,25 @@ static void apply_decl(k93cstyle *st, const char *prop, const char *val)
     uint32_t col;
     if (!strcasecmp(prop, "color")) {
         if (k93css_color(val, &col)) { st->fg = col; st->flags |= K93CSS_FG; }
-    } else if (!strcasecmp(prop, "background-color") ||
-               !strcasecmp(prop, "background")) {
+    } else if (!strcasecmp(prop, "background-color")) {
         if (strcasecmp(val, "transparent") && k93css_color(val, &col)) {
             st->bg = col; st->flags |= K93CSS_BG;
+        }
+    } else if (!strcasecmp(prop, "background")) {
+        /* shorthand: first color token wins; url()/gradient() tokens and
+         * position/size keywords skipped (ceiling: no gradient fills) */
+        const char *q = val;
+        while (*q) {
+            while (*q == ' ' || *q == ',') q++;
+            char tok[64]; size_t ti = 0;
+            while (*q && *q != ' ' && *q != ',' && ti < sizeof tok - 1)
+                tok[ti++] = *q++;
+            tok[ti] = 0;
+            if (!ti || strchr(tok, '(')) continue;
+            if (k93css_color(tok, &col) && strcasecmp(tok, "transparent")) {
+                st->bg = col; st->flags |= K93CSS_BG;
+                break;
+            }
         }
     } else if (!strcasecmp(prop, "font-weight")) {
         if (!strcasecmp(val, "bold") || !strcasecmp(val, "bolder") ||
@@ -873,13 +1150,56 @@ static void apply_decl(k93cstyle *st, const char *prop, const char *val)
             st->bold = 0; st->flags |= K93CSS_BOLD;
         }
     } else if (!strcasecmp(prop, "font-size")) {
-        int px = atoi(val);
+        int px = 0;
+        if (strchr(val, '%') || (strstr(val, "em") && !strstr(val, "px")))
+            px = (int)(strtod(val, NULL) * 16);    /* em/% of 16px base */
+        else if (isdigit((unsigned char)val[0]) || val[0] == '-' ||
+                 val[0] == '.')
+            px = atoi(val);
+        else if (!strcasecmp(val, "small")) px = 14;
+        else if (!strcasecmp(val, "medium")) px = 16;
+        else if (!strcasecmp(val, "large")) px = 18;
+        else if (!strcasecmp(val, "x-large")) px = 24;
+        else if (!strcasecmp(val, "xx-large")) px = 32;
         if (px >= 22) { st->scale = 2; st->flags |= K93CSS_SCALE; }
         else if (px > 0) { st->scale = 1; st->flags |= K93CSS_SCALE; }
+    } else if (!strcasecmp(prop, "font")) {
+        /* shorthand: [style] [weight] size[/lh] family */
+        const char *q = val;
+        const char *fam = NULL;
+        while (*q) {
+            while (*q == ' ' || *q == ',') q++;
+            char tok[64]; size_t ti = 0;
+            while (*q && *q != ' ' && ti < sizeof tok - 1) tok[ti++] = *q++;
+            tok[ti] = 0;
+            if (!ti) continue;
+            if (!strcasecmp(tok, "bold") || !strcasecmp(tok, "bolder")) {
+                st->bold = 1; st->flags |= K93CSS_BOLD;
+            } else if (strchr(tok, '/')) {          /* size/lh, family next */
+                fam = q;
+                apply_decl(st, "font-size", tok);
+                break;
+            } else if (isdigit((unsigned char)tok[0])) {
+                apply_decl(st, "font-size", tok);
+                fam = q;
+                break;
+            }
+        }
+        if (fam && *fam) {
+            char fambuf[64];
+            size_t fi = 0;
+            while (*fam && *fam != ',' && *fam != '/' && fi < sizeof fambuf - 1)
+                fambuf[fi++] = *fam++;
+            while (fi > 0 && (fambuf[fi - 1] == ' ' || fambuf[fi - 1] == ' '))
+                fi--;
+            fambuf[fi] = 0;
+            if (fi) apply_decl(st, "font-family", fambuf);
+        }
     } else if (!strcasecmp(prop, "text-align")) {
         if (!strcasecmp(val, "center")) {
             st->center = 1; st->flags |= K93CSS_CENTER;
-        } else if (!strcasecmp(val, "left") || !strcasecmp(val, "right")) {
+        } else if (!strcasecmp(val, "left") || !strcasecmp(val, "right") ||
+                   !strcasecmp(val, "justify")) {
             st->center = 0; st->flags |= K93CSS_CENTER;
         }
     } else if (!strcasecmp(prop, "display")) {
@@ -891,7 +1211,8 @@ static void apply_decl(k93cstyle *st, const char *prop, const char *val)
             st->hidden = 1; st->flags |= K93CSS_HIDDEN;
         }
     } else if (!strcasecmp(prop, "margin-left") ||
-               !strcasecmp(prop, "padding-left")) {
+               !strcasecmp(prop, "padding-left") ||
+               !strcasecmp(prop, "text-indent")) {
         int px = atoi(val);
         if (px > 0) { st->indent += px; st->flags |= K93CSS_INDENT; }
     } else if (!strcasecmp(prop, "margin") || !strcasecmp(prop, "padding")) {
@@ -911,7 +1232,123 @@ static void apply_decl(k93cstyle *st, const char *prop, const char *val)
         if (px > 0) { st->indent += px; st->flags |= K93CSS_INDENT; }
     } else if (!strcasecmp(prop, "text-decoration")) {
         st->underline = strstr(val, "underline") != NULL;
-        st->flags |= K93CSS_UNDERLINE;
+        st->strike = strstr(val, "line-through") != NULL;
+        st->flags |= K93CSS_UNDERLINE | K93CSS_STRIKE;
+    } else if (!strcasecmp(prop, "text-transform")) {
+        if (!strcasecmp(val, "uppercase") || !strcasecmp(val, "capitalize"))
+            st->xform = 1;
+        else if (!strcasecmp(val, "lowercase"))
+            st->xform = 2;
+        else
+            st->xform = 0;
+        st->flags |= K93CSS_XFORM;
+    } else if (!strcasecmp(prop, "line-height")) {
+        if (!strcasecmp(val, "normal")) {
+            st->lh = 0; st->flags |= K93CSS_LH;
+        } else if (strchr(val, 'p')) {
+            int px = atoi(val);
+            if (px > 0) { st->lh = px; st->flags |= K93CSS_LH; }
+        } else {
+            double d = strtod(val, NULL);          /* unitless factor */
+            if (d > 0) {
+                st->lh = (int)(d * 16.0 + 0.5);
+                st->flags |= K93CSS_LH;
+            }
+        }
+    } else if (!strcasecmp(prop, "opacity")) {
+        double d = strtod(val, NULL);
+        if (d < 0) d = 0;
+        int pct = d <= 1.0 ? (int)(d * 100.0 + 0.5) : (int)(d + 0.5);
+        if (pct > 100) pct = 100;
+        st->opacity = pct;
+        st->flags |= K93CSS_OPACITY;
+    } else if (!strcasecmp(prop, "width")) {
+        int px = atoi(val);                        /* px only; % ceiling */
+        if (px > 0) { st->width = px; st->flags |= K93CSS_WIDTH; }
+    } else if (!strcasecmp(prop, "list-style") ||
+               !strcasecmp(prop, "list-style-type")) {
+        const char *q = val;
+        while (*q) {
+            while (*q == ' ' || *q == ',') q++;
+            char tok[48]; size_t ti = 0;
+            while (*q && *q != ' ' && *q != ',' && ti < sizeof tok - 1)
+                tok[ti++] = *q++;
+            tok[ti] = 0;
+            int ls = -1;
+            if (!strcasecmp(tok, "disc")) ls = K93L_DISC;
+            else if (!strcasecmp(tok, "circle")) ls = K93L_CIRCLE;
+            else if (!strcasecmp(tok, "square")) ls = K93L_SQUARE;
+            else if (!strcasecmp(tok, "decimal")) ls = K93L_DECIMAL;
+            else if (!strcasecmp(tok, "lower-alpha") ||
+                     !strcasecmp(tok, "lower-latin")) ls = K93L_LALPHA;
+            else if (!strcasecmp(tok, "upper-alpha") ||
+                     !strcasecmp(tok, "upper-latin")) ls = K93L_UALPHA;
+            else if (!strcasecmp(tok, "lower-roman")) ls = K93L_LROMAN;
+            else if (!strcasecmp(tok, "upper-roman")) ls = K93L_UROMAN;
+            else if (!strcasecmp(tok, "none")) ls = K93L_NONE;
+            if (ls >= 0) {
+                st->lstyle = ls;
+                st->flags |= K93CSS_LSTYLE;
+            }
+        }
+    } else if (!strncasecmp(prop, "border", 6) &&
+               strcasecmp(prop, "border-radius") &&
+               strcasecmp(prop, "border-collapse") &&
+               strcasecmp(prop, "border-spacing") &&
+               strcasecmp(prop, "border-image")) {
+        if (!strcasecmp(prop, "border-width")) {
+            int px = atoi(val);
+            if (px > 0) { st->bordw = px; st->flags |= K93CSS_BORDER; }
+        } else if (!strcasecmp(prop, "border-color")) {
+            if (k93css_color(val, &col)) {
+                st->bordc = col;
+                st->flags |= K93CSS_BORDER;
+            }
+        } else if (!strcasecmp(prop, "border-style")) {
+            if (!strcasecmp(val, "none") || !strcasecmp(val, "hidden")) {
+                st->bordw = 0;
+                st->flags |= K93CSS_BORDER;
+            } else if (!st->bordw) {
+                st->bordw = 1;
+                st->flags |= K93CSS_BORDER;
+            }
+        } else {
+            /* border / border-<side> shorthand: width style color tokens;
+             * sides collapse into one box (layout is line-based) */
+            const char *q = val;
+            int got = 0;
+            while (*q) {
+                while (*q == ' ' || *q == ',') q++;
+                char tok[48]; size_t ti = 0;
+                while (*q && *q != ' ' && *q != ',' && ti < sizeof tok - 1)
+                    tok[ti++] = *q++;
+                tok[ti] = 0;
+                if (!ti) continue;
+                if (!strcasecmp(tok, "none") || !strcasecmp(tok, "hidden")) {
+                    st->bordw = 0; got = 1;
+                } else if (!strcasecmp(tok, "thin")) { st->bordw = 1; got = 1; }
+                else if (!strcasecmp(tok, "medium")) { st->bordw = 2; got = 1; }
+                else if (!strcasecmp(tok, "thick")) { st->bordw = 3; got = 1; }
+                else if (isdigit((unsigned char)tok[0])) {
+                    int px = atoi(tok);
+                    if (px > 0) { st->bordw = px; got = 1; }
+                } else if (k93css_color(tok, &col)) {
+                    if (strcasecmp(tok, "transparent")) st->bordc = col;
+                    got = 1;
+                } else if (!strcasecmp(tok, "solid") ||
+                           !strcasecmp(tok, "dashed") ||
+                           !strcasecmp(tok, "dotted") ||
+                           !strcasecmp(tok, "double") ||
+                           !strcasecmp(tok, "groove") ||
+                           !strcasecmp(tok, "ridge") ||
+                           !strcasecmp(tok, "inset") ||
+                           !strcasecmp(tok, "outset")) {
+                    if (st->bordw == 0) st->bordw = 1;
+                    got = 1;
+                }
+            }
+            if (got) st->flags |= K93CSS_BORDER;
+        }
     } else if (!strcasecmp(prop, "font-family")) {
         /* first family name, quotes stripped; unknown -> system default */
         char fam[48]; size_t fi = 0;
@@ -929,18 +1366,19 @@ static void apply_decl(k93cstyle *st, const char *prop, const char *val)
         st->flags |= K93CSS_FONT;
     } else if (!strcasecmp(prop, "font-style")) {
         /* italic/oblique: no italic faces rasterized (ceiling) - upright */
-    } else if (!strcasecmp(prop, "line-height")) {
-        /* ceiling: linear layout keeps fixed line pitch */
     }
+    /* unhandled props (float, position, overflow, box-shadow, cursor,
+     * transition, transform, ...) fall through: ignored by design */
 }
 
-/* rough specificity: ids*100 + (classes+attrs)*10 + tags; later wins ties */
+/* rough specificity: ids*100 + (classes+attrs+pseudos)*10 + tags; later wins
+ * ties */
 static int sel_spec(const char *s)
 {
     int spec = 0;
     for (const char *p = s; *p; p++) {
         if (*p == '#') spec += 100;
-        else if (*p == '.' || *p == '[') spec += 10;
+        else if (*p == '.' || *p == '[' || *p == ':') spec += 10;
         else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
                  *p == '*') {
             spec += 1;

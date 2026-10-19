@@ -217,10 +217,20 @@ static int browse_d(const char *url_in, int depth)
         if (rv < 0 || rv >= pg.nlinks) break;
         sf_link *L = &pg.links[rv];
         int handled = js_click(L);
-        if (js_tick()) continue;         /* DOM changed: re-render, stay */
         if (js_nav_url()) break;         /* location changed: navigate */
-        if (handled != 2 && L->url[0]) {
-            if (!strncmp(L->url, "javascript:", 11)) continue;
+        if (handled != 2 && L->url[0]) { /* (nav wins over dirty re-render) */
+            if (L->url[0] == '#') continue; /* fragment: no scroll-to-anchor */
+            if (!strncmp(L->url, "javascript:", 11)) {
+                js_run_url(L->url);
+                if (js_nav_url()) break;
+                continue;
+            }
+            const char *hs = strchr(L->url, '#');
+            if (hs && hs == L->url + strlen(B.base) &&
+                !strncmp(L->url, B.base, strlen(B.base)))
+                continue;               /* same-page fragment: stay */
+            if (strncmp(L->url, "http://", 7) && strncmp(L->url, "https://", 8))
+                continue;               /* mailto:/tel:/data: no handler */
             k93_strlcpy(navurl, L->url, sizeof navurl);
             nav = 1;
             break;

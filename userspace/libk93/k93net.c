@@ -115,6 +115,14 @@ void url_absolutize(const char *base, const char *rel, char *out, size_t cap)
         k93_strlcpy(out, rel, cap);
         return;
     }
+    if (rel[0] == '#') {                  /* fragment-only: base path + ref */
+        k93_strlcpy(out, base, cap);
+        char *hf = strchr(out, '#');
+        if (hf) *hf = 0;
+        size_t n = strlen(out);
+        snprintf(out + n, cap - n, "%s", rel);
+        return;
+    }
     struct url b;
     if (url_parse(base, &b) < 0) { k93_strlcpy(out, rel, cap); return; }
     char org[320];                        /* origin: scheme://host[:port] */
