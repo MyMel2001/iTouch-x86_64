@@ -185,6 +185,17 @@ console keeps the plain look, so headless autotests are unchanged):
   `ui_blit`/`ui_text*`/`ui_rgb`/`ui_tint` for custom drawing (see
   `app-sdk/README.md`); SDK apps get it too (no icon tables shipped in
   the SDK — apps bring their own art, no runtime image decoder).
+* **Mouse + super key** — libk93 opens every relative evdev pointer that
+  is not the keyboard (`mfd[]`) and sums deltas/buttons, so a PS/2 mouse
+  and a USB HID mouse coexist. Left = activate (hit-test launch on
+  SpringBoard, links in Safari), right = Esc/back, middle = home, wheel =
+  row/line scroll. A 12x16 arrow cursor is stamped straight into the
+  shadow scanout (live motion) and its position persists across app
+  launches via `/run/k93.cursor`. The Super/Windows key is intercepted:
+  tap = home screen, hold 5 s = iOS6-style multitasking tray of recent
+  apps (SpringBoard keeps a RAM-only MRU list and relaunches on click;
+  a frontmost app exits with status 2 so SpringBoard opens the tray).
+  Needs evdev; the serial console has no pointer.
 * **Validation** — `make qemu-test` phases 2/3 assert a full-width pure-
   white run in the expected orientation (`tools/check-screendump.py`),
   and manual QMP drive-by (`tools/qmp-input.py`) checks launched apps.

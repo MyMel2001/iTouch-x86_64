@@ -52,6 +52,7 @@ enum { BACK_NONE, BACK_FB, BACK_TEXT };
 
 static int drm_ioctl(int fd, unsigned long req, void *arg);
 static int kms_flip(void);
+static void cursor_stamp(int ox, int oy, int draw);
 
 static struct {
     int backend;
@@ -105,6 +106,15 @@ static const char sc_map_shift[128] = {
 static int evfd = -1;
 static int shift_down = 0;
 
+/* ---- mouse + super/Windows key ---------------------------------------- */
+static int mfd[8], nmfd;                /* relative mice (evdev), summed */
+static int m_x = -1, m_y = -1;          /* cursor px; -1 = never moved */
+static int m_click[3];                  /* pending presses: 0=left 1=right 2=mid */
+static int m_wheel = 0;                 /* pending lines: +down / -up */
+static int meta_held = 0, meta_fired = 0;
+static struct timespec meta_t0;         /* super-key press time */
+static int pending_key = -1;            /* key synthesized by policy, queued */
+
 static void input_open_evdev(void)
 {
     /* grab the first keyboard we can find */
@@ -123,12 +133,139 @@ static void input_open_evdev(void)
     }
 }
 
+static void input_open_mouse(void)
+{
+    /* Open EVERY relative-motion device that is not the keyboard: a plain
+     * PS/2 two/three-button mouse and a USB HID 3-button+wheel mouse can
+     * coexist; deltas from all of them are summed in mouse_pump().
+     * ponytail: absolute pointers (USB tablet/trackpad, ABS_X/ABS_Y) are
+     * not opened; add EV_ABS handling when such hardware matters. */
+    for (int i = 0; i < 16 && nmfd < (int)(sizeof mfd / sizeof mfd[0]); i++) {
+        char p[64];
+        snprintf(p, sizeof p, "/dev/input/event%d", i);
+        int fd = open(p, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+        if (fd < 0) continue;
+        struct stat st1, st2;
+        if (evfd >= 0 && fstat(fd, &st1) == 0 && fstat(evfd, &st2) == 0 &&
+            st1.st_rdev == st2.st_rdev) { close(fd); continue; }
+        unsigned long rel = 0;
+        if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof rel), &rel) < 0 ||
+            !(rel & (1UL << REL_X))) { close(fd); continue; }
+        mfd[nmfd++] = fd;
+    }
+}
+
+/* Cursor position survives process switches (app launch/re-launch, shell
+ * re-init) so the pointer does not teleport back to screen center.
+ * ponytail: RAM state only within one process; this small file bridges
+ * processes. Replace with a shared-memory page if writes ever matter. */
+static void cursor_state_write(void)
+{
+    if (m_x < 0) return;
+    FILE *f = fopen("/run/k93.cursor", "w");
+    if (!f) f = fopen("/tmp/k93.cursor", "w");
+    if (!f) return;
+    fprintf(f, "%d %d\n", m_x, m_y);
+    fclose(f);
+}
+
+static void cursor_state_read(void)
+{
+    FILE *f = fopen("/run/k93.cursor", "r");
+    if (!f) f = fopen("/tmp/k93.cursor", "r");
+    if (!f) return;
+    int x, y;
+    if (fscanf(f, "%d %d", &x, &y) == 2 && x >= 0 && y >= 0 &&
+        x < G.fbw_px && y < G.fbh_px) {
+        m_x = x;
+        m_y = y;
+    }
+    fclose(f);
+}
+
+static void mouse_pump(void)
+{
+    int dx = 0, dy = 0, moved = 0;
+    struct input_event ie;
+    for (int f = 0; f < nmfd; f++) {
+        while (read(mfd[f], &ie, sizeof ie) == sizeof ie) {
+            if (ie.type == EV_REL) {
+                if (ie.code == REL_X) { dx += ie.value; moved = 1; }
+                else if (ie.code == REL_Y) { dy += ie.value; moved = 1; }
+                else if (ie.code == REL_WHEEL) m_wheel -= (int)ie.value;
+            } else if (ie.type == EV_KEY) {
+                int b = ie.code == BTN_LEFT ? 0 : ie.code == BTN_RIGHT ? 1 :
+                        ie.code == BTN_MIDDLE ? 2 : -1;
+                if (b >= 0 && ie.value == 1 && m_click[b] < 8) m_click[b]++;
+            }
+        }
+    }
+    if (!moved) return;
+    int ox = m_x, oy = m_y;
+    if (m_x < 0) {                       /* first motion: spawn at center */
+        ox = m_x = G.fbw_px / 2;
+        oy = m_y = G.fbh_px / 2;
+    }
+    m_x += dx; m_y += dy;
+    if (m_x < 0) m_x = 0;
+    if (m_y < 0) m_y = 0;
+    if (m_x >= G.fbw_px) m_x = G.fbw_px - 1;
+    if (m_y >= G.fbh_px) m_y = G.fbh_px - 1;
+    if (m_x == ox && m_y == oy) return;
+    /* live motion: erase the old stamp and draw the new one straight into
+     * the scanout so the cursor tracks without waiting for an app redraw */
+    if (G.backend == BACK_FB) {
+        cursor_stamp(ox, oy, 0);
+        cursor_stamp(m_x, m_y, 1);
+        if (G.drmfb > 0 && G.fbfd >= 0) kms_flip();
+        cursor_state_write();
+    }
+}
+
+/* Super/Windows key tap and middle click = "go home". SpringBoard sets
+ * K93_NO_SUPER_EXIT so the shell itself survives and gets a synthetic
+ * UI_KEY_HOME instead; a frontmost app quits back to the home screen.
+ * Exit status 2 tells SpringBoard to open the multitasking view. */
+static void super_home(void)
+{
+    if (getenv("K93_NO_SUPER_EXIT")) { pending_key = UI_KEY_HOME; return; }
+    ui_shutdown();
+    exit(0);
+}
+
+static void super_switcher(void)
+{
+    if (getenv("K93_NO_SUPER_EXIT")) { pending_key = UI_KEY_SWITCHER; return; }
+    ui_shutdown();
+    exit(2);
+}
+
+static void super_pump(void)
+{
+    if (!meta_held || meta_fired) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (now.tv_sec - meta_t0.tv_sec) * 1000L +
+              (now.tv_nsec - meta_t0.tv_nsec) / 1000000L;
+    if (ms >= 5000) { meta_fired = 1; super_switcher(); }
+}
+
 static int key_from_evdev(void)
 {
     struct input_event ie;
     if (evfd < 0) return -1;
     while (read(evfd, &ie, sizeof ie) == sizeof ie) {
         if (ie.type != EV_KEY) continue;
+        if (ie.code == KEY_LEFTMETA || ie.code == KEY_RIGHTMETA) {
+            if (ie.value == 1) {
+                meta_held = 1; meta_fired = 0;
+                clock_gettime(CLOCK_MONOTONIC, &meta_t0);
+            } else if (ie.value == 0 && meta_held) {
+                meta_held = 0;
+                if (!meta_fired) super_home();   /* tap: home */
+            }
+            continue;
+        }
         if (ie.value == 0) {                       /* release */
             if (ie.code == KEY_LEFTSHIFT || ie.code == KEY_RIGHTSHIFT) shift_down = 0;
             continue;
@@ -225,21 +362,56 @@ static int key_from_stdin(int timeout_ms)
 
 int ui_getkey(int timeout_ms)
 {
-    /* 1) evdev (graphical/VT use) */
+    if (pending_key >= 0) { int k = pending_key; pending_key = -1; return k; }
+    /* 1) evdev (graphical/VT use); super-key policy runs inside */
     if (evfd >= 0) {
         struct pollfd p = { .fd = evfd, .events = POLLIN };
         if (poll(&p, 1, 0) > 0) {
             int k = key_from_evdev();
             if (k > 0) return k;
+            if (pending_key >= 0) { k = pending_key; pending_key = -1; return k; }
         }
     }
-    /* 2) stdin (serial console in QEMU, interactive tty) */
+    /* 2) mouse: pump motion/buttons, fire the super-key hold timer, then
+     * synthesize clicks/wheel for widgets that do not hit-test themselves */
+    mouse_pump();
+    super_pump();
+    if (m_click[2]) { m_click[2] = 0; super_home(); }   /* middle = home */
+    if (m_click[0]) { m_click[0]--; return UI_KEY_ENTER; }
+    if (m_click[1]) { m_click[1]--; return UI_KEY_ESC; }
+    if (m_wheel) {
+        int s = m_wheel > 0 ? 1 : -1;
+        m_wheel -= s;
+        return s > 0 ? UI_KEY_DOWN : UI_KEY_UP;
+    }
+    if (pending_key >= 0) { int k = pending_key; pending_key = -1; return k; }
+    /* 3) stdin (serial console in QEMU, interactive tty) */
     if (G.backend != BACK_NONE) {
         int k = key_from_stdin(timeout_ms);
         if (k > 0) return k;
     }
     if (timeout_ms > 0) usleep((useconds_t)timeout_ms * 1000);
     return UI_KEY_NONE;
+}
+
+/* ---- mouse state for widgets that hit-test (pageview, SpringBoard grid) */
+int ui_mouse_x(void) { mouse_pump(); return m_x; }
+int ui_mouse_y(void) { mouse_pump(); return m_y; }
+int ui_mouse_visible(void) { return m_x >= 0; }
+int ui_mouse_clicked(int btn)
+{
+    mouse_pump();
+    if ((unsigned)btn > 2) return 0;
+    int n = m_click[btn];
+    m_click[btn] = 0;
+    return n > 0;
+}
+int ui_mouse_scroll(void)
+{
+    mouse_pump();
+    int s = m_wheel;
+    m_wheel = 0;
+    return s;
 }
 
 /* ------------------------------------------------------------------ output */
@@ -413,16 +585,19 @@ void ui_frame(int x, int y, int w, int h, int r, int thick, uint32_t c)
     }
 }
 
-void ui_blit(int x, int y, int w, int h, const uint32_t *src)
+void ui_blit_scaled(int x, int y, int dw, int dh,
+                    const uint32_t *src, int sw, int sh)
 {
-    if (G.backend != BACK_FB || !src || w <= 0 || h <= 0) return;
-    for (int j = 0; j < h; j++) {
+    if (G.backend != BACK_FB || !src || dw <= 0 || dh <= 0 ||
+        sw <= 0 || sh <= 0) return;
+    for (int j = 0; j < dh; j++) {
         int yy = y + j;
         if ((unsigned)yy >= (unsigned)G.fbh_px) continue;
-        for (int i = 0; i < w; i++) {
+        size_t sy = (size_t)j * (size_t)sh / (size_t)dh;
+        for (int i = 0; i < dw; i++) {
             int xx = x + i;
             if ((unsigned)xx >= (unsigned)G.fbw_px) continue;
-            uint32_t c = src[(size_t)j * (size_t)w + (size_t)i];
+            uint32_t c = src[sy * (size_t)sw + (size_t)i * (size_t)sw / (size_t)dw];
             uint32_t a = c >> 24;
             if (a == 0) continue;
             if (a >= 255) { px_put(xx, yy, c & 0xFFFFFF); continue; }
@@ -433,6 +608,11 @@ void ui_blit(int x, int y, int w, int h, const uint32_t *src)
             px_put(xx, yy, ui_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b));
         }
     }
+}
+
+void ui_blit(int x, int y, int w, int h, const uint32_t *src)
+{
+    ui_blit_scaled(x, y, w, h, src, w, h);   /* 1:1 sampling == plain blit */
 }
 
 /* draw the 8x16 font at a pixel position, scale >= 1, opaque fg */
@@ -545,6 +725,72 @@ static void display_conf(char *mode, size_t mlen, char *orient, size_t olen)
     }
 }
 
+/* clean-room pointer cursor, drawn from code over the scanout after each
+ * shadow->scanout copy (the shadow buffer stays clean, so partial redraws
+ * never leave trails). B = black outline, W = white fill, . = clear. */
+static const char *cur_arrow[16] = {
+    "B...........",
+    "BB..........",
+    "BWB.........",
+    "BWWB........",
+    "BWWWB.......",
+    "BWWWWB......",
+    "BWWWWWB.....",
+    "BWWWWWWB....",
+    "BWWWWWWWB...",
+    "BWWWWWWWWB..",
+    "BWWWWWWWWWB.",
+    "BWWWWWBBBBB.",
+    "....BWWB....",
+    "....BWWB....",
+    ".....BWB....",
+    ".....BBB....",
+};
+
+/* stamp the arrow into the scanout at logical (ox,oy): draw=1 paints the
+ * cursor, draw=0 restores the clean shadow pixel underneath (live motion).
+ * fb_render_all stamps the current position after every full copy. */
+static void cursor_stamp(int ox, int oy, int draw)
+{
+    if (G.backend != BACK_FB || !G.fbr || !G.fbw || ox < 0) return;
+    int bpp = G.fbbpp / 8;
+    for (int ry = 0; ry < 16; ry++) {
+        for (int rx = 0; rx < 12; rx++) {
+            int lx = ox + rx, ly = oy + ry;
+            if ((unsigned)lx >= (unsigned)G.fbw_px ||
+                (unsigned)ly >= (unsigned)G.fbh_px) continue;
+            uint32_t col = 0;
+            if (draw) {
+                if (cur_arrow[ry][rx] == '.') continue;
+                col = cur_arrow[ry][rx] == 'B' ? 0u : 0xFFFFFFu;
+            } else {
+                const uint8_t *s = G.fbw + (size_t)ly * (size_t)G.wline +
+                                   (size_t)lx * (size_t)bpp;
+                col = s[0] | ((uint32_t)s[1] << 8) | ((uint32_t)s[2] << 16);
+            }
+            int px, py;
+            if (G.rot90) { px = G.sx - 1 - ly; py = lx; }  /* same transform
+                                                              as fb_render_all */
+            else { px = lx; py = ly; }
+            if ((unsigned)px >= (unsigned)G.sx ||
+                (unsigned)py >= (unsigned)G.sy) continue;
+            uint8_t *d = G.fbr + (size_t)py * (size_t)G.fbline +
+                         (size_t)px * (size_t)bpp;
+            if (bpp >= 3) {
+                d[0] = col & 0xFF;
+                d[1] = (col >> 8) & 0xFF;
+                d[2] = (col >> 16) & 0xFF;
+            }
+            if (bpp == 4) d[3] = 0xFF;
+        }
+    }
+}
+
+static void cursor_scanout(void)
+{
+    cursor_stamp(m_x, m_y, 1);
+}
+
 static void fb_render_all(void)
 {
     if (G.backend != BACK_FB || !G.fbw) return;
@@ -568,6 +814,7 @@ static void fb_render_all(void)
             memcpy(G.fbr + (size_t)y * (size_t)G.fbline,
                    G.fbw + (size_t)y * (size_t)G.wline, (size_t)bytes);
     }
+    cursor_scanout();
     if (G.drmfb > 0 && G.fbfd >= 0) {
         /* KMS: an atomic re-commit is the only thing that reaches the host.
          * mmap + DIRTYFB update KMS state but never drive the plane's
@@ -742,6 +989,17 @@ static void gui_navbar(const char *title)
 }
 
 /* light grouped page with a rounded white panel; returns panel rect */
+/* shared page-panel geometry (used by gui_page and the mouse hit test) */
+static void page_panel(int panel_h, int *px, int *py, int *pw, int *ph)
+{
+    int margin = 24;
+    if (panel_h > G.fbh_px - 64 - 24 - 40) panel_h = G.fbh_px - 64 - 24 - 40;
+    *px = margin;
+    *py = 88;
+    *pw = G.fbw_px - 2 * margin;
+    *ph = panel_h;
+}
+
 static void gui_page(const char *title, int panel_h, int *px, int *py,
                      int *pw, int *ph)
 {
@@ -749,13 +1007,9 @@ static void gui_page(const char *title, int panel_h, int *px, int *py,
     ui_statusbar(NULL);
     gui_navbar(title);
     ui_fill(0, 64, G.fbw_px, G.fbh_px - 64 - 24, ui_rgb(0xCB, 0xD2, 0xDC));
-    int margin = 24;
-    int w = G.fbw_px - 2 * margin;
-    int y = 88;
-    if (panel_h > G.fbh_px - 64 - 24 - 40) panel_h = G.fbh_px - 64 - 24 - 40;
-    ui_roundrect(margin, y, w, panel_h, 12, ui_rgb(0xFF, 0xFF, 0xFF),
+    page_panel(panel_h, px, py, pw, ph);
+    ui_roundrect(*px, *py, *pw, *ph, 12, ui_rgb(0xFF, 0xFF, 0xFF),
                  ui_rgb(0xEC, 0xEF, 0xF4));
-    *px = margin; *py = y; *pw = w; *ph = panel_h;
 }
 
 /* one row inside a grouped panel; sel draws the iOS blue capsule with a
@@ -1431,6 +1685,10 @@ int ui_init(const char *appname)
     }
     stdin_raw();
     input_open_evdev();
+    if (G.backend == BACK_FB) {
+        input_open_mouse();
+        cursor_state_read();          /* keep pointer where the last app left it */
+    }
     ui_clear();
     return 0;
 }
@@ -1446,6 +1704,12 @@ void ui_shutdown(void)
     if (G.fbr) { munmap(G.fbr, G.fblen); G.fbr = NULL; }
     if (G.fbfd > 0) { close(G.fbfd); G.fbfd = -1; }
     if (evfd >= 0) { close(evfd); evfd = -1; shift_down = 0; }
+    for (int f = 0; f < nmfd; f++) close(mfd[f]);
+    nmfd = 0;
+    if (G.backend == BACK_FB) cursor_state_write();
+    m_x = m_y = -1;
+    m_click[0] = m_click[1] = m_click[2] = 0;
+    m_wheel = 0; meta_held = 0; meta_fired = 0; pending_key = -1;
     if (infd > 2 && infd != G.outfd) close(infd);
     infd = 0;
     if (G.outfd > 2) close(G.outfd);
@@ -1837,6 +2101,24 @@ static void page_render(const char *title, ui_page *p, int top, int sel)
     ui_flush();
 }
 
+/* mouse hit test: which rendered line covers (x,y)? Same walk as page_render. */
+static int page_hit(ui_page *p, int top, int x, int y)
+{
+    if (!p || p->n < 1) return -1;
+    int px, py, pw, ph;
+    page_panel(G.fbh_px - 64 - 24 - 12, &px, &py, &pw, &ph);
+    if (x < px || x >= px + pw) return -1;
+    int viewh = ph - 8;
+    int ly = py + 4;
+    for (int i = top; i < p->n && ly < py + ph; i++) {
+        int lh = page_h(&p->lines[i], 0);
+        if (lh > viewh) lh = viewh;
+        if (y >= ly && y < ly + lh) return i;
+        ly += lh;
+    }
+    return -1;
+}
+
 int ui_pageview(const char *title, ui_page *p,
                 int (*tick)(ui_page *p, void *ctx), void *ctx)
 {
@@ -1848,7 +2130,27 @@ int ui_pageview(const char *title, ui_page *p,
     for (;;) {
         page_render(title, p, top, sel);
         if (sel >= p->n) sel = p->n - 1;
-        int k = ui_getkey(250);
+        /* mouse: right = back, wheel scrolls, left activates the link under
+         * the cursor. Clicks are consumed here so ui_getkey cannot turn them
+         * into Enter on the selection. */
+        int handled = 0;
+        if (ui_mouse_clicked(1)) { p->sel = sel; p->top = top; return -1; }
+        int mw = ui_mouse_scroll();
+        if (mw) {
+            sel += mw;
+            if (sel < 0) sel = 0;
+            if (sel > p->n - 1) sel = p->n - 1;
+            handled = 1;
+        }
+        if (ui_mouse_clicked(0)) {
+            handled = 1;
+            int li = page_hit(p, top, ui_mouse_x(), ui_mouse_y());
+            if (li >= 0 && p->lines[li].link >= 0) {
+                p->sel = li; p->top = top;
+                return p->lines[li].link;
+            }
+        }
+        int k = handled ? UI_KEY_NONE : ui_getkey(250);
         int view, viewh = 0;
         if (G.backend == BACK_FB) {
             viewh = (G.fbh_px - 64 - 24 - 12 - 8);
@@ -1936,6 +2238,8 @@ int ui_editbox(const char *title, char *buf, size_t cap)
         }
         ui_statusmsg("Enter=newline  Esc=save+close  (type to edit)");
         ui_flush();
+        ui_mouse_clicked(0);                       /* clicks are inert here */
+        ui_mouse_clicked(1);
         int k = ui_getkey(250);
         char *cl = lines[cur_line];
         int cl_len = (int)strlen(cl);

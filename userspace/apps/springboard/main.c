@@ -81,7 +81,7 @@ static void draw_home_gui(const k93_app *apps, int n, int sel, const char *hint)
     char title[64];
     snprintf(title, sizeof title, "SpringBoard");
     ui_statusbar(title);
-    ui_statusmsg(hint ? hint : "Arrows  Enter launch  F12 shell  Esc exit");
+    ui_statusmsg(hint ? hint : "Arrows/Click launch  Win=home  F12  Esc");
     ui_flush();
 }
 
@@ -110,9 +110,202 @@ static void draw_home(const k93_app *apps, int n, int sel, const char *hint)
     ui_flush();
 }
 
+/* ---- mouse ------------------------------------------------------------- */
+
+/* home grid hit test; same trow math as draw_home_gui */
+static int gui_hit_icon(int n, int sel)
+{
+    int W = ui_px_width(), H = ui_px_height();
+    int cw = W / GRID_COLS, top = 28, rowh = ICON_PX + 40;
+    int view = (H - top - 36) / rowh;
+    if (view < 1) view = 1;
+    int trow = 0;
+    if (sel / GRID_COLS >= view) trow = sel / GRID_COLS - view + 1;
+    int mx = ui_mouse_x(), my = ui_mouse_y();
+    if (mx < 0 || my < top) return -1;
+    int col = mx / cw, row = (my - top) / rowh;
+    if (col >= GRID_COLS || row >= view) return -1;
+    int idx = trow * GRID_COLS + row * GRID_COLS + col;
+    if (idx < 0 || idx >= n) return -1;
+    return idx;
+}
+
+/* ---- multitasking tray (iOS-6-style bottom bar of recent apps) --------- */
+
+#define TRAY_MAX  8
+#define TRAY_PX   64                     /* tray icon size */
+#define TRAY_STEP 84
+#define TRAY_H    116
+
+static char recent[TRAY_MAX][128];
+static int nrecent;
+
+static void recent_add(const char *ident)
+{
+    int i, j;
+    for (i = 0; i < nrecent; i++)
+        if (!strcmp(recent[i], ident)) break;
+    if (i == nrecent && nrecent == TRAY_MAX) i = TRAY_MAX - 1; /* drop oldest */
+    for (j = i; j > 0; j--) memcpy(recent[j], recent[j - 1], sizeof recent[0]);
+    k93_strlcpy(recent[0], ident, sizeof recent[0]);
+    if (nrecent < TRAY_MAX) nrecent++;
+}
+
+/* recent apps still installed -> indices; returns count */
+static int tray_index(const k93_app *apps, int n, int idxs[TRAY_MAX])
+{
+    int cnt = 0;
+    for (int i = 0; i < nrecent && cnt < TRAY_MAX; i++)
+        for (int j = 0; j < n; j++)
+            if (!strcmp(apps[j].ident, recent[i])) { idxs[cnt++] = j; break; }
+    return cnt;
+}
+
+static void tray_geom(int cnt, int *x0, int *iy)
+{
+    int W = ui_px_width(), H = ui_px_height();
+    *x0 = (W - (cnt * TRAY_STEP - (TRAY_STEP - TRAY_PX))) / 2;
+    *iy = H - 24 - TRAY_H + (TRAY_H - TRAY_PX - 20) / 2;
+}
+
+static void draw_tray(const k93_app *apps, int n, int tsel)
+{
+    int W = ui_px_width(), H = ui_px_height();
+    int idxs[TRAY_MAX];
+    int cnt = tray_index(apps, n, idxs);
+    if (tsel >= cnt) tsel = cnt - 1;
+    draw_home_gui(apps, n, -1, "");            /* home screen behind */
+    int y0 = H - 24 - TRAY_H;
+    uint32_t bar0 = ui_rgb(0x3B, 0x43, 0x52), bar1 = ui_rgb(0x15, 0x1A, 0x23);
+    ui_fill_grad(0, y0, W, TRAY_H, bar0, bar1);
+    uint32_t sheen = ui_tint(bar0, 108, 100);  /* faint linen bands, code-only */
+    for (int y = y0 + 6; y < y0 + TRAY_H - 4; y += 8)
+        ui_fill(0, y, W, 3, sheen);
+    ui_fill(0, y0, W, 1, ui_rgb(0x93, 0x9E, 0xAE));
+    int x0, iy;
+    tray_geom(cnt, &x0, &iy);
+    for (int i = 0; i < cnt; i++) {
+        const k93_app *a = &apps[idxs[i]];
+        int iw = ICON_PX, ih = ICON_PX;
+        const uint32_t *img = k93_icon_by_name(a->ident, &iw, &ih);
+        int x = x0 + i * TRAY_STEP;
+        ui_blit_scaled(x, iy, TRAY_PX, TRAY_PX, img, iw, ih);
+        if (i == tsel)
+            ui_frame(x - 2, iy - 2, TRAY_PX + 4, TRAY_PX + 4, 12, 2,
+                     ui_rgb(0xFF, 0xFF, 0xFF));
+        char lab[16];
+        snprintf(lab, sizeof lab, "%.9s", a->name);
+        ui_text_sh(x + (TRAY_PX - ui_text_width(1, lab)) / 2, iy + TRAY_PX + 4,
+                   1, lab, ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+    }
+    if (cnt == 0) {
+        const char *msg = "No recent apps";
+        ui_text_bold((W - ui_text_width(1, msg)) / 2, iy, 1, msg,
+                     ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+    }
+    ui_statusbar("SpringBoard");
+    ui_statusmsg("Left/Right  Enter open  Esc close");
+    ui_flush();
+}
+
+static int tray_hit(int cnt, int mx, int my)
+{
+    if (cnt < 1 || mx < 0) return -1;
+    int x0, iy;
+    tray_geom(cnt, &x0, &iy);
+    if (mx < x0 || my < iy - 4 || my > iy + TRAY_PX + 20) return -1;
+    int i = (mx - x0) / TRAY_STEP;
+    if (i >= cnt || mx > x0 + i * TRAY_STEP + TRAY_PX + 4) return -1;
+    return i;
+}
+
+/* launching splash + foreground launch + bundle rescan. Returns the app's
+ * exit status (2 = the app asked for the multitasking view). */
+static int launch_sel(k93_app **papps, int *pn, int *psel)
+{
+    k93_app *apps = *papps;
+    int sel = *psel;
+    if (ui_is_graphical()) {
+        draw_wallpaper();
+        int W = ui_px_width();
+        const uint32_t *img = k93_icon_by_name(apps[sel].ident, NULL, NULL);
+        ui_blit((W - ICON_PX) / 2, (ui_px_height() - ICON_PX) / 2 - 20,
+                ICON_PX, ICON_PX, img);
+        char msg[64];
+        snprintf(msg, sizeof msg, "Launching %.40s", apps[sel].name);
+        ui_text_bold((W - ui_text_width(1, msg)) / 2,
+                     (ui_px_height() + ICON_PX) / 2, 1, msg,
+                     ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+        ui_flush();
+    } else {
+        ui_clear();
+        ui_printf(1, 2, "Launching %s ...", apps[sel].name);
+        ui_flush();
+    }
+    usleep(150000);
+    recent_add(apps[sel].ident);
+    unsetenv("K93_NO_SUPER_EXIT");        /* the child gets normal home policy */
+    ui_shutdown();
+    int rc = k93_app_launch(&apps[sel]);
+    ui_init("SpringBoard");
+    setenv("K93_NO_SUPER_EXIT", "1", 1);
+    int st = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+    if (rc != 0 && st != 2) {
+        char msg[192];
+        snprintf(msg, sizeof msg, "%s exited with status %d",
+                 apps[sel].name, st > 0 ? st : rc);
+        ui_msgbox("Application", msg);
+    }
+    /* refresh list: sideloaded apps may have appeared */
+    free(apps);
+    *papps = k93_xmalloc(sizeof(k93_app) * 256);
+    *pn = k93_app_scan(*papps, 256);
+    if (*psel >= *pn) *psel = *pn > 0 ? *pn - 1 : 0;
+    return st;
+}
+
+/* iOS-6-style app switcher; returns when the tray is closed */
+static void tray_loop(k93_app **papps, int *pn, int *psel)
+{
+    int tsel = 0;
+    for (;;) {
+        int idxs[TRAY_MAX];
+        int cnt = tray_index(*papps, *pn, idxs);
+        if (tsel > cnt - 1) tsel = cnt - 1;
+        if (tsel < 0) tsel = 0;
+        draw_tray(*papps, *pn, tsel);
+        int k = UI_KEY_NONE;
+        if (ui_is_graphical()) {
+            int clk = ui_mouse_clicked(0);
+            if (ui_mouse_clicked(1)) k = UI_KEY_ESC;      /* right = close */
+            else if (clk) {
+                int i = tray_hit(cnt, ui_mouse_x(), ui_mouse_y());
+                if (i >= 0) { tsel = i; k = UI_KEY_ENTER; }
+            }
+        }
+        if (k == UI_KEY_NONE) k = ui_getkey(250);
+        switch (k) {
+        case UI_KEY_LEFT:  case UI_KEY_UP:   if (tsel > 0) tsel--; break;
+        case UI_KEY_RIGHT: case UI_KEY_DOWN: if (tsel < cnt - 1) tsel++; break;
+        case UI_KEY_ENTER:
+            if (cnt < 1 || tsel >= cnt) break;
+            *psel = idxs[tsel];
+            if (launch_sel(papps, pn, psel) == 2)
+                continue;                /* app wants the switcher: stay */
+            return;
+        case UI_KEY_ESC: case UI_KEY_CTRL_C: case UI_KEY_HOME:
+        case UI_KEY_SWITCHER:
+            return;
+        default: break;
+        }
+    }
+}
+
 int main(void)
 {
     if (ui_init("SpringBoard") < 0) return 1;
+    setenv("K93_NO_SUPER_EXIT", "1", 1); /* super key here: tap=page 1,
+                                            hold=multitasking tray */
     k93_app *apps = k93_xmalloc(sizeof(k93_app) * 256);
     int n = k93_app_scan(apps, 256);
     k93_log("springboard", "scanned %d application bundles", n);
@@ -138,6 +331,7 @@ int main(void)
                 ui_statusmsg("Esc exit");
                 ui_flush();
             }
+            if (ui_is_graphical()) { ui_mouse_clicked(0); ui_mouse_clicked(1); }
             int k = ui_getkey(250);
             if (k == UI_KEY_ESC || k == UI_KEY_CTRL_C) break;
             if (k == UI_KEY_F12) break;
@@ -145,7 +339,16 @@ int main(void)
         }
         if (ui_is_graphical()) draw_home_gui(apps, n, sel, hint);
         else draw_home(apps, n, sel, hint);
-        int k = ui_getkey(250);
+        int k = UI_KEY_NONE;
+        if (ui_is_graphical()) {
+            if (ui_mouse_clicked(1)) continue;       /* right: nothing to
+                                                        go back to */
+            if (ui_mouse_clicked(0)) {
+                int idx = gui_hit_icon(n, sel);
+                if (idx >= 0) { sel = idx; k = UI_KEY_ENTER; }
+            }
+        }
+        if (k == UI_KEY_NONE) k = ui_getkey(250);
         hint[0] = 0;
         int cols = ui_is_graphical() ? GRID_COLS : 1;
         switch (k) {
@@ -172,39 +375,10 @@ int main(void)
             ui_init("SpringBoard");
             break;
         }
+        case UI_KEY_SWITCHER: tray_loop(&apps, &n, &sel); break;
         case UI_KEY_ENTER: {
-            if (ui_is_graphical()) {
-                draw_wallpaper();
-                int W = ui_px_width();
-                const uint32_t *img = k93_icon_by_name(apps[sel].ident, NULL, NULL);
-                int iw = ICON_PX, ih = ICON_PX;
-                ui_blit((W - iw) / 2, (ui_px_height() - ih) / 2 - 20, iw, ih, img);
-                char msg[64];
-                snprintf(msg, sizeof msg, "Launching %s", apps[sel].name);
-                ui_text_bold((W - ui_text_width(1, msg)) / 2,
-                             (ui_px_height() + ICON_PX) / 2, 1, msg,
-                             ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
-                ui_flush();
-            } else {
-                ui_clear();
-                ui_printf(1, 2, "Launching %s ...", apps[sel].name);
-                ui_flush();
-            }
-            usleep(150000);
-            ui_shutdown();
-            int rc = k93_app_launch(&apps[sel]);
-            ui_init("SpringBoard");
-            if (rc != 0) {
-                char msg[192];
-                snprintf(msg, sizeof msg, "%s exited with status %d",
-                         apps[sel].name, WEXITSTATUS(rc) ? WEXITSTATUS(rc) : rc);
-                ui_msgbox("Application", msg);
-            }
-            /* refresh list: sideloaded apps may have appeared */
-            free(apps);
-            apps = k93_xmalloc(sizeof(k93_app) * 256);
-            n = k93_app_scan(apps, 256);
-            if (sel >= n) sel = n > 0 ? n - 1 : 0;
+            if (launch_sel(&apps, &n, &sel) == 2)
+                tray_loop(&apps, &n, &sel);   /* app asked for multitasking */
             break;
         }
         default: break;

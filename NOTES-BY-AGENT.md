@@ -401,3 +401,33 @@ keeping AdSheet provider-neutral.
 * Input note: `ui_shutdown()` now closes the evdev fd (it leaked across
   SpringBoard launches). SpringBoard's `esc` = quit is pre-existing —
   one key per step with screendumps between when driving via QMP.
+* Mouse + super key (this round): libk93 `k93ui.c` opens all non-keyboard
+  relative evdev nodes into `mfd[8]` and `mouse_pump()` sums deltas /
+  ORs buttons+wheel across them, so PS/2 (2/3-button) and USB HID
+  (3-button + wheel) coexist in one guest. Left click is synthesized to
+  ENTER inside `ui_getkey` after the app consumed the click counter, so
+  existing key-driven widgets keep working; right = ESC, middle = home,
+  wheel = UP/DOWN or one list line per 250 ms in text lists. Cursor:
+  12x16 arrow `cursor_stamp()`ed into the shadow copy on every
+  `fb_render_all` (`cursor_scanout()`, rot90-aware) — live motion, not
+  only on redraws. Position persists across app switches through a tiny
+  `/run/k93.cursor` file (else the fresh process respawns the pointer at
+  canvas center and it "teleports"). Super/Windows key is intercepted in
+  the evdev loop: tap = home, hold >= 5 s = `UI_KEY_SWITCHER`;
+  `K93_NO_SUPER_EXIT` (SpringBoard) turns both into synthetic keys, a
+  frontmost app does real `exit(0)`/`exit(2)` and SpringBoard's
+  `launch_sel` opens the RAM-only recents tray on status 2.
+  QEMU v11.1.2 drive-by gotchas, all validated by `build/scratch/drive3.py`
+  screenshots (m00..m15): do NOT pass `-mouse none` (v11 refuses/ignores
+  when `usb-mouse` exists), qcodes for wheel are btn events
+  (`scroll +1/-1`), super = `meta_l` (one word, not `meta-l`), and the
+  Fedora host kernel `CONFIG_MOUSE_PS2_VMMOUSE=y` autograbs PS/2 — boot
+  with `-machine pc,vmport=off` or QEMU's `current:true` pointer is the
+  invisible vmmouse and every injected rel/btn event is dropped.
+  `usb-mouse` stores buttons as LEVELS: press+release inside one
+  `input-send-event` (or <1 HID frame apart) collapses and the click is
+  lost — `tools/qmp-mouse.py click` now splits them 80 ms apart (PS/2
+  would queue both packets; the wheel survives batching because QEMU
+  converts wheel buttons to queued REL events immediately).
+  QMP accepts only one live client per socket: close before spawning
+  `qmp-screendump.py`, or its connect hangs forever.
