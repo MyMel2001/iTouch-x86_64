@@ -19,6 +19,18 @@ size_t sf_fetch_len(void);
 
 typedef struct { char url[1280]; char text[128]; k93node *node; } sf_link;
 
+/* canvas 2D surface: pixels owned by the page, drawn via js.c */
+typedef struct {
+    k93node *node;
+    uint32_t *px;                      /* opaque RGB, row-major */
+    int w, h;
+    int has_rect;                      /* pending fill() rect */
+    int rx, ry, rw, rh;
+    int np;                            /* polyline points, max 64 */
+    int ptx[64], pty[64];
+    uint32_t prevcp;                   /* kerning pen */
+} sf_cv;
+
 typedef struct sf_page {
     ui_page pg;
     ui_pline *lbuf;
@@ -35,6 +47,16 @@ typedef struct sf_page {
     int width_px;
     struct { char url[1280]; uint32_t *px; int w, h; } img[SF_MAXIMG];
     int nimg;
+    /* embedded documents (<iframe src>, <object> html): owned here so
+     * link/JS node pointers into them stay valid until page free */
+    #define SF_MAXDOC 8
+    k93node *fdoc[SF_MAXDOC];
+    int nfdoc;
+    /* canvas 2D buffers keyed by canvas node (drawn by js.c, shown by
+     * render.c; opaque white bg - no alpha compositing) */
+    #define SF_MAXCV 8
+    sf_cv cv[SF_MAXCV];
+    int ncv;
 } sf_page;
 
 void sf_page_init(sf_page *p, int width_px);
@@ -42,6 +64,7 @@ void sf_page_free(sf_page *p);
 void sf_render(sf_page *p, k93node *doc);   /* rebuild lines from DOM */
 k93node *sf_body(k93node *doc);
 const char *sf_title(k93node *doc, char *buf, size_t cap);
+void sf_details_toggle(k93node *details);   /* flip the open attribute */
 
 /* ---- js.c (QuickJS) ---- */
 int  js_open(sf_page *p, k93node *doc, const char *base);

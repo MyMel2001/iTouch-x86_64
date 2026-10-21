@@ -6,9 +6,15 @@
  *     line renderer with inline runs, links, <img> (stb_image) and SVG
  *     (k93svg, linked + inline) in k93ui's ui_pageview
  *   - JavaScript via QuickJS (MIT, vendored): DOM bindings, timers, fetch,
- *     XHR, events, classList/dataset/style, DOMContentLoaded
- * Ceiling: no canvas/WebGL, no frames; images fetched synchronously when a
- * page renders. */
+ *     XHR, events, classList/dataset/style, DOMContentLoaded,
+ *     canvas 2D subset (fillRect/clearRect/strokeRect/fillText/paths)
+ *   - media/frames: <iframe> documents render inline (scripts inside frames
+ *     do not run), <video>/<audio> show poster + metadata (no codecs in the
+ *     OS, playback unsupported), <object>/<embed> decode images or show
+ *     metadata + fallback content, <details>/<summary> toggle on click
+ * Ceiling: no WebGL/2D-extras (no transforms/fonts API), no media playback,
+ * no plugins (PDF), frames run no scripts; images fetched synchronously
+ * when a page renders. */
 #define _GNU_SOURCE
 #include "safari.h"
 #include "k93ui.h"
@@ -25,10 +31,42 @@ static struct {
     char base[1280];                     /* absolute base for relative links */
 } B;
 
-/* sf_fetch: GET url (k93net follows redirects, capped) */
+/* sf_fetch: GET url (k93net follows redirects, capped); file:// reads
+ * local files (all real browsers support this) */
 static size_t sf_last_len;
 char *sf_fetch(const char *url, int *status, char *err, size_t errlen)
 {
+    if (!strncmp(url, "file://", 7)) {
+        FILE *f = fopen(url + 7, "rb");
+        if (!f) {
+            *status = 0;
+            sf_last_len = 0;
+            snprintf(err, errlen, "cannot open %.40s", url + 7);
+            return NULL;
+        }
+        size_t cap = 65536, n = 0;
+        char *buf = malloc(cap);
+        while (buf) {
+            n += fread(buf + n, 1, cap - n - 1, f);
+            if (n + 1 < cap) break;
+            char *nb = realloc(buf, cap * 2);
+            if (!nb) { free(buf); buf = NULL; break; }
+            buf = nb;
+            cap *= 2;
+        }
+        fclose(f);
+        if (!buf) {
+            *status = 0;
+            sf_last_len = 0;
+            snprintf(err, errlen, "out of memory");
+            return NULL;
+        }
+        buf[n] = 0;
+        sf_last_len = n;
+        *status = 200;
+        err[0] = 0;
+        return buf;
+    }
     return k93net_get(url, &sf_last_len, status, err, errlen);
 }
 
@@ -102,32 +140,48 @@ static int browse_d(const char *url_in, int depth)
     char url[1280];
     k93_strlcpy(url, url_in, sizeof url);
     k93_trim(url);
-    if (url_parse(url, &u) < 0) {
-        ui_msgbox("Safari", "Cannot parse URL");
-        return -1;
-    }
-    B.base[0] = 0;
-    snprintf(B.base, sizeof B.base, "%s://%s:%d%s", u.scheme, u.host, u.port, u.path);
-
-    ui_statusmsg("Contacting host ...");
     int status = 0;
     char err[128] = "";
-    struct k93conn *kc = k93net_open(&u, err, sizeof err);
-    if (!kc) {
-        char m[256];
-        snprintf(m, sizeof m,
-                 "Cannot connect to %s:%d\n\n%s\n\n(check network and proxy in Settings)",
-                 u.host, u.port, err[0] ? err : "cannot connect");
-        ui_msgbox("Safari", m);
-        return -1;
-    }
-    char *raw = k93net_read_http(kc, &u, &status, err, sizeof err);
-    k93net_close(kc);
-    if (!raw) {
-        char m[192];
-        snprintf(m, sizeof m, "Fetch failed: %s", err[0] ? err : "unknown error");
-        ui_msgbox("Safari", m);
-        return -1;
+    char *raw = NULL;
+    int local = !strncmp(url, "file://", 7);
+    if (local) {                         /* local file: no network involved */
+        memset(&u, 0, sizeof u);
+        k93_strlcpy(B.base, url, sizeof B.base);
+        raw = sf_fetch(url, &status, err, sizeof err);
+        if (!raw) {
+            char m[256];
+            snprintf(m, sizeof m, "Cannot open file:\n\n%.80s\n\n%s",
+                     url + 7, err[0] ? err : "unreadable");
+            ui_msgbox("Safari", m);
+            return -1;
+        }
+    } else {
+        if (url_parse(url, &u) < 0) {
+            ui_msgbox("Safari", "Cannot parse URL");
+            return -1;
+        }
+        B.base[0] = 0;
+        snprintf(B.base, sizeof B.base, "%s://%s:%d%s",
+                 u.scheme, u.host, u.port, u.path);
+
+        ui_statusmsg("Contacting host ...");
+        struct k93conn *kc = k93net_open(&u, err, sizeof err);
+        if (!kc) {
+            char m[256];
+            snprintf(m, sizeof m,
+                     "Cannot connect to %s:%d\n\n%s\n\n(check network and proxy in Settings)",
+                     u.host, u.port, err[0] ? err : "cannot connect");
+            ui_msgbox("Safari", m);
+            return -1;
+        }
+        raw = k93net_read_http(kc, &u, &status, err, sizeof err);
+        k93net_close(kc);
+        if (!raw) {
+            char m[192];
+            snprintf(m, sizeof m, "Fetch failed: %s", err[0] ? err : "unknown error");
+            ui_msgbox("Safari", m);
+            return -1;
+        }
     }
     if (status >= 300 && status < 400 && k93net_last_location()[0]) {
         if (depth >= 8) {
@@ -216,6 +270,13 @@ static int browse_d(const char *url_in, int depth)
         int rv = ui_pageview(title[0] ? title : "Safari", &pg.pg, pview_tick, &pg);
         if (rv < 0 || rv >= pg.nlinks) break;
         sf_link *L = &pg.links[rv];
+        if (L->node && !strcmp(L->node->tag, "summary")) {   /* details toggle */
+            k93node *d = L->node->parent;
+            if (d && !strcmp(d->tag, "details")) {
+                sf_details_toggle(d);
+                continue;                  /* rebuild + redraw */
+            }
+        }
         int handled = js_click(L);
         if (js_nav_url()) break;         /* location changed: navigate */
         if (handled != 2 && L->url[0]) { /* (nav wins over dirty re-render) */
@@ -252,7 +313,12 @@ static int browse_d(const char *url_in, int depth)
 
 static int browse(const char *url_in) { return browse_d(url_in, 0); }
 
-static int url_ok(const char *s) { struct url t; return url_parse(s, &t) == 0; }
+static int url_ok(const char *s)
+{
+    if (!strncmp(s, "file://", 7)) return 1;
+    struct url t;
+    return url_parse(s, &t) == 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -282,7 +348,7 @@ int main(int argc, char **argv)
     for (;;) {
         char input[1280];
         k93_strlcpy(input, cur, sizeof input);
-        if (ui_input("Address (URL)", input, sizeof input) < 0) break;
+        if (ui_input("Address (URL)", input, sizeof input) != 0) break; /* ESC/cancel returns 1 */
         k93_trim(input);
         if (!input[0]) continue;
         if (url_ok(input)) {

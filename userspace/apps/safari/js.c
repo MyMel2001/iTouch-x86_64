@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include "safari.h"
 #include "k93util.h"
+#include "k93font.h"
 #include "quickjs.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1000,7 +1001,324 @@ static JSValue n_click(JSContext *c, JSValueConst thisv, int argc,
     return JS_UNDEFINED;
 }
 
+/* ---------------------------------------------------- canvas 2D (ctx) */
+/* getContext("2d") surfaces live in PG->cv[] (page-owned pixels, opaque
+ * white background). Real drawing: fillRect/strokeRect/clearRect,
+ * fillText (TTF glyph coverage blended), moveTo/lineTo/stroke polyline,
+ * rect/fill. Ceiling: fill() handles rects only, no transforms, no
+ * curves, no canvas images; other contexts return null (no WebGL). */
+
+static JSClassID ctx2d_class;
+
+static void cv_dot(sf_cv *e, int x, int y, uint32_t col)
+{
+    if (!e->px || x < 0 || y < 0 || x >= e->w || y >= e->h) return;
+    e->px[(size_t)y * e->w + x] = 0xFF000000u | (col & 0xFFFFFF);
+}
+
+static void cv_fillbox(sf_cv *e, int x, int y, int w, int h, uint32_t col)
+{
+    for (int yy = 0; yy < h; yy++)
+        for (int xx = 0; xx < w; xx++)
+            cv_dot(e, x + xx, y + yy, col);
+}
+
+static void cv_strokebox(sf_cv *e, int x, int y, int w, int h, uint32_t col)
+{
+    for (int xx = 0; xx < w; xx++) {
+        cv_dot(e, x + xx, y, col);
+        cv_dot(e, x + xx, y + h - 1, col);
+    }
+    for (int yy = 0; yy < h; yy++) {
+        cv_dot(e, x, y + yy, col);
+        cv_dot(e, x + w - 1, y + yy, col);
+    }
+}
+
+static void cv_line(sf_cv *e, int x0, int y0, int x1, int y1, uint32_t col)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        cv_dot(e, x0, y0, col);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+    }
+}
+
+static uint32_t cv_style(JSContext *c, JSValueConst obj, const char *prop)
+{
+    uint32_t col = 0;
+    JSValue v = JS_GetPropertyStr(c, obj, prop);
+    if (!JS_IsException(v)) {
+        const char *s = JS_ToCString(c, v);
+        if (s) { k93css_color(s, &col); JS_FreeCString(c, s); }
+        JS_FreeValue(c, v);
+    }
+    return col;
+}
+
+static sf_cv *cv_of(JSContext *c, JSValueConst thisv)
+{
+    return JS_GetOpaque2(c, thisv, ctx2d_class);
+}
+
+/* argv[0..3] = x, y, w, h; negative w/h normalized like browsers */
+static void cv_rect_args(JSContext *c, JSValueConst *argv, int argc,
+                         int *x, int *y, int *w, int *h)
+{
+    int64_t v;
+    *x = *y = *w = *h = 0;
+    if (argc > 0 && JS_ToInt64(c, &v, argv[0]) == 0) *x = (int)v;
+    if (argc > 1 && JS_ToInt64(c, &v, argv[1]) == 0) *y = (int)v;
+    if (argc > 2 && JS_ToInt64(c, &v, argv[2]) == 0) *w = (int)v;
+    if (argc > 3 && JS_ToInt64(c, &v, argv[3]) == 0) *h = (int)v;
+    if (*w < 0) { *x += *w; *w = -*w; }
+    if (*h < 0) { *y += *h; *h = -*h; }
+}
+
+static JSValue c2_fillRect(JSContext *c, JSValueConst thisv, int argc,
+                           JSValueConst *argv)
+{
+    sf_cv *e = cv_of(c, thisv);
+    if (!e) return JS_UNDEFINED;
+    int x, y, w, h;
+    cv_rect_args(c, argv, argc, &x, &y, &w, &h);
+    cv_fillbox(e, x, y, w, h, cv_style(c, thisv, "fillStyle"));
+    dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_clearRect(JSContext *c, JSValueConst thisv, int argc,
+                            JSValueConst *argv)
+{
+    /* no alpha channel in the surface: clear to white (page background) */
+    sf_cv *e = cv_of(c, thisv);
+    if (!e) return JS_UNDEFINED;
+    int x, y, w, h;
+    cv_rect_args(c, argv, argc, &x, &y, &w, &h);
+    cv_fillbox(e, x, y, w, h, 0xFFFFFF);
+    dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_strokeRect(JSContext *c, JSValueConst thisv, int argc,
+                             JSValueConst *argv)
+{
+    sf_cv *e = cv_of(c, thisv);
+    if (!e) return JS_UNDEFINED;
+    int x, y, w, h;
+    cv_rect_args(c, argv, argc, &x, &y, &w, &h);
+    if (w > 0 && h > 0)
+        cv_strokebox(e, x, y, w, h, cv_style(c, thisv, "strokeStyle"));
+    dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_fillText(JSContext *c, JSValueConst thisv, int argc,
+                           JSValueConst *argv)
+{
+    sf_cv *e = cv_of(c, thisv);
+    if (!e || argc < 1) return JS_UNDEFINED;
+    const char *s = JS_ToCString(c, argv[0]);
+    if (!s) return JS_UNDEFINED;
+    int x = 0, y = 0;
+    int64_t v;
+    if (argc > 1 && JS_ToInt64(c, &v, argv[1]) == 0) x = (int)v;
+    if (argc > 2 && JS_ToInt64(c, &v, argv[2]) == 0) y = (int)v;
+    uint32_t col = cv_style(c, thisv, "fillStyle");
+    k93font_select(k93font_default_id());
+    int base = k93font_baseline(1);
+    int pen = x;
+    uint32_t prev = 0;
+    for (int i = 0; s[i]; ) {
+        uint32_t cp = k93_utf8_next(s, &i);
+        int gw = 0, gh = 0, xo = 0, yo = 0;
+        float adv = 0;
+        uint8_t *bm = k93font_glyph(prev, cp, 1, 0, &gw, &gh, &xo, &yo, &adv);
+        if (bm) {
+            for (int gy = 0; gy < gh; gy++)
+                for (int gx = 0; gx < gw; gx++) {
+                    int cov = bm[(size_t)gy * gw + gx];
+                    if (!cov) continue;
+                    int dx = pen + xo + gx, dy = y - base + yo + gy;
+                    if (dx < 0 || dy < 0 || dx >= e->w || dy >= e->h) continue;
+                    uint32_t *d = &e->px[(size_t)dy * e->w + dx];
+                    uint32_t dr = (*d >> 16) & 255, dg = (*d >> 8) & 255,
+                             db = *d & 255;
+                    uint32_t r = (((col >> 16) & 255) * cov + dr * (255 - cov)) / 255;
+                    uint32_t g = (((col >> 8) & 255) * cov + dg * (255 - cov)) / 255;
+                    uint32_t b = ((col & 255) * cov + db * (255 - cov)) / 255;
+                    *d = 0xFF000000u | (r << 16) | (g << 8) | b;
+                }
+            k93font_glyph_free(bm);
+        }
+        pen += (int)adv;
+        prev = cp;
+    }
+    JS_FreeCString(c, s);
+    dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_beginPath(JSContext *c, JSValueConst thisv, int argc,
+                            JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    sf_cv *e = cv_of(c, thisv);
+    if (e) { e->np = 0; e->has_rect = 0; }
+    return JS_UNDEFINED;
+}
+
+static void cv_pt(sf_cv *e, int x, int y)
+{
+    if (e->np < 64) { e->ptx[e->np] = x; e->pty[e->np] = y; e->np++; }
+}
+
+static int cv_xy(JSContext *c, JSValueConst *argv, int argc, int *x, int *y)
+{
+    int64_t v;
+    *x = *y = 0;
+    int ok = 0;
+    if (argc > 0 && JS_ToInt64(c, &v, argv[0]) == 0) { *x = (int)v; ok++; }
+    if (argc > 1 && JS_ToInt64(c, &v, argv[1]) == 0) { *y = (int)v; ok++; }
+    return ok == 2;
+}
+
+static JSValue c2_moveTo(JSContext *c, JSValueConst thisv, int argc,
+                         JSValueConst *argv)
+{
+    sf_cv *e = cv_of(c, thisv);
+    int x, y;
+    if (e && cv_xy(c, argv, argc, &x, &y)) { e->np = 0; cv_pt(e, x, y); }
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_lineTo(JSContext *c, JSValueConst thisv, int argc,
+                         JSValueConst *argv)
+{
+    sf_cv *e = cv_of(c, thisv);
+    int x, y;
+    if (e && cv_xy(c, argv, argc, &x, &y)) cv_pt(e, x, y);
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_closePath(JSContext *c, JSValueConst thisv, int argc,
+                            JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    sf_cv *e = cv_of(c, thisv);
+    if (e && e->np > 1) cv_pt(e, e->ptx[0], e->pty[0]);
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_stroke(JSContext *c, JSValueConst thisv, int argc,
+                         JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    sf_cv *e = cv_of(c, thisv);
+    if (e && e->np > 1) {
+        uint32_t col = cv_style(c, thisv, "strokeStyle");
+        for (int i = 1; i < e->np; i++)
+            cv_line(e, e->ptx[i - 1], e->pty[i - 1], e->ptx[i], e->pty[i], col);
+        dirty = 1;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_rect(JSContext *c, JSValueConst thisv, int argc,
+                       JSValueConst *argv)
+{
+    sf_cv *e = cv_of(c, thisv);
+    if (!e) return JS_UNDEFINED;
+    int x, y, w, h;
+    cv_rect_args(c, argv, argc, &x, &y, &w, &h);
+    if (w <= 0 || h <= 0) return JS_UNDEFINED;
+    e->has_rect = 1;
+    e->rx = x; e->ry = y; e->rw = w; e->rh = h;
+    cv_pt(e, x, y);
+    cv_pt(e, x + w, y);
+    cv_pt(e, x + w, y + h);
+    cv_pt(e, x, y + h);
+    cv_pt(e, x, y);
+    return JS_UNDEFINED;
+}
+
+static JSValue c2_fill(JSContext *c, JSValueConst thisv, int argc,
+                       JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    sf_cv *e = cv_of(c, thisv);
+    if (e && e->has_rect) {            /* polygon fill: rects only (ceiling) */
+        cv_fillbox(e, e->rx, e->ry, e->rw, e->rh,
+                   cv_style(c, thisv, "fillStyle"));
+        dirty = 1;
+    }
+    return JS_UNDEFINED;
+}
+
+static const JSCFunctionListEntry ctx2d_proto_list[] = {
+    JS_CFUNC_DEF("fillRect", 4, c2_fillRect),
+    JS_CFUNC_DEF("clearRect", 4, c2_clearRect),
+    JS_CFUNC_DEF("strokeRect", 4, c2_strokeRect),
+    JS_CFUNC_DEF("fillText", 3, c2_fillText),
+    JS_CFUNC_DEF("beginPath", 0, c2_beginPath),
+    JS_CFUNC_DEF("moveTo", 2, c2_moveTo),
+    JS_CFUNC_DEF("lineTo", 2, c2_lineTo),
+    JS_CFUNC_DEF("closePath", 0, c2_closePath),
+    JS_CFUNC_DEF("stroke", 0, c2_stroke),
+    JS_CFUNC_DEF("rect", 4, c2_rect),
+    JS_CFUNC_DEF("fill", 0, c2_fill),
+};
+
+static JSValue n_getContext(JSContext *c, JSValueConst thisv, int argc,
+                            JSValueConst *argv)
+{
+    k93node *n = node_of(c, thisv);
+    if (!n || strcmp(n->tag, "canvas") || !PG) return JS_NULL;
+    const char *type = argc > 0 ? JS_ToCString(c, argv[0]) : NULL;
+    int is2d = type && !strcmp(type, "2d");
+    if (type) JS_FreeCString(c, type);
+    if (!is2d) return JS_NULL;                 /* no WebGL/other contexts */
+    int idx = -1;
+    for (int i = 0; i < PG->ncv; i++)
+        if (PG->cv[i].node == n) { idx = i; break; }
+    if (idx < 0) {
+        if (PG->ncv >= SF_MAXCV) return JS_NULL;
+        int w = 300, h = 150;                  /* spec defaults */
+        const char *a = k93html_attr(n, "width");
+        if (a && *a) w = atoi(a);
+        a = k93html_attr(n, "height");
+        if (a && *a) h = atoi(a);
+        if (w < 1) w = 1;
+        if (w > PG->width_px - 24) w = PG->width_px - 24;
+        if (h < 1) h = 1;
+        if (h > 400) h = 400;
+        idx = PG->ncv++;
+        sf_cv *e = &PG->cv[idx];
+        memset(e, 0, sizeof *e);
+        e->node = n;
+        e->px = malloc((size_t)w * (size_t)h * 4);
+        if (!e->px) { PG->ncv--; return JS_NULL; }
+        for (size_t i = 0; i < (size_t)w * (size_t)h; i++)
+            e->px[i] = 0xFFFFFFFFu;
+        e->w = w;
+        e->h = h;
+    }
+    JSValue obj = JS_NewObjectClass(c, ctx2d_class);
+    if (JS_IsException(obj)) return JS_NULL;
+    JS_SetOpaque(obj, &PG->cv[idx]);
+    JS_SetPropertyStr(c, obj, "fillStyle", JS_NewString(c, "#000000"));
+    JS_SetPropertyStr(c, obj, "strokeStyle", JS_NewString(c, "#000000"));
+    return obj;
+}
+
 static const JSCFunctionListEntry node_proto_list[] = {
+    JS_CFUNC_DEF("getContext", 1, n_getContext),
     JS_CFUNC_DEF("getAttribute", 1, n_getAttribute),
     JS_CFUNC_DEF("setAttribute", 2, n_setAttribute),
     JS_CFUNC_DEF("removeAttribute", 1, n_removeAttribute),
@@ -1723,6 +2041,16 @@ int js_open(sf_page *p, k93node *doc, const char *base)
                                (int)(sizeof node_proto_list /
                                      sizeof node_proto_list[0]));
     JS_SetClassProto(ctx, node_class, proto);
+
+    JS_NewClassID(&ctx2d_class);
+    static JSClassDef c2def = { .class_name = "CanvasRenderingContext2D" };
+    JS_NewClass(rt, ctx2d_class, &c2def);
+    JSValue c2proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, c2proto, ctx2d_proto_list,
+                               (int)(sizeof ctx2d_proto_list /
+                                     sizeof ctx2d_proto_list[0]));
+    JS_SetClassProto(ctx, ctx2d_class, c2proto);
+
     JSValue g = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, g, "__sf_proto", JS_DupValue(ctx, proto));
 

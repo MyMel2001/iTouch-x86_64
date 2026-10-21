@@ -106,7 +106,8 @@ int url_parse(const char *s, struct url *u)
 void url_absolutize(const char *base, const char *rel, char *out, size_t cap)
 {
     while (*rel == ' ') rel++;
-    if (!strncmp(rel, "http://", 7) || !strncmp(rel, "https://", 8)) {
+    if (!strncmp(rel, "http://", 7) || !strncmp(rel, "https://", 8) ||
+        !strncmp(rel, "file://", 7)) {
         k93_strlcpy(out, rel, cap);
         return;
     }
@@ -121,6 +122,19 @@ void url_absolutize(const char *base, const char *rel, char *out, size_t cap)
         if (hf) *hf = 0;
         size_t n = strlen(out);
         snprintf(out + n, cap - n, "%s", rel);
+        return;
+    }
+    if (!strncmp(base, "file://", 7)) {  /* local file: plain dir join */
+        char dir[1280];
+        if (rel[0] == '/') {
+            snprintf(out, cap, "file://%s", rel);
+            return;
+        }
+        k93_strlcpy(dir, base + 7, sizeof dir);
+        char *dslash = strrchr(dir, '/');
+        if (dslash) dslash[1] = 0;
+        else k93_strlcpy(dir, "/", sizeof dir);
+        snprintf(out, cap, "file://%s%s", dir, rel);
         return;
     }
     struct url b;

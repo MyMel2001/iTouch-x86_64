@@ -280,6 +280,7 @@ if [ ! -f "$TOP/fixtures/test.ipa" ]; then
     python3 "$TOP/tools/mkfixtures.py" "$TOP/fixtures"
 fi
 install -m 0644 "$TOP/fixtures/"*.ipa "$TOP/fixtures/"*.dmg "$TOP/fixtures/"*.deb "$ROOT/opt/k93/fixtures/"
+install -m 0644 "$TOP/fixtures/"*.html "$ROOT/opt/k93/fixtures/" 2>/dev/null || true
 
 # SDK smoke artifact: build + bundle the C example so the guest autotest can
 # sideload a real app-sdk product (skip gracefully without zig/cc)

@@ -54,8 +54,10 @@ explanation (K93OS runs native x86_64 ELF only).
   get/set, replaceChild/cloneNode; timers and DOM changes re-render in
   place while browsing. Deps are fetched pinned-sha256 by
   `scripts/build-deps.sh` into gitignored `third_party/_build/`.
-  Ceiling: no canvas/WebGL/frames, no CSS gradients, blocking image
-  fetches, `<pre>` wrap only
+  Ceiling: canvas is a clean-room 2D subset (no WebGL), iframes render
+  inline with scripts inert (srcdoc + src, http/file), media elements
+  label themselves (no codecs/plugins), no CSS gradients, blocking
+  image fetches, `<pre>` wrap only
 * Serial-console-first UI toolkit. Graphics stack is DRM/KMS (clean-room
   client in `libk93/k93ui.c`): init waits for `/dev/dri/card0`, loads the
   GPU driver, SpringBoard becomes DRM master, creates its own dumb buffer

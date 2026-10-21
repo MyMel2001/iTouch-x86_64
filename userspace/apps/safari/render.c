@@ -42,6 +42,7 @@ typedef struct {
     uint32_t segbg;                    /* run background (mark), 0 = none */
     int lstyle;                        /* K93L_* in effect for lists */
     int ltype;                         /* 0 none, 1 ul, 2 ol */
+    int depth;                         /* embedded-doc nesting, capped */
     char tbuf[8192];
     int tlen;
     struct seg segs[256];
@@ -66,6 +67,10 @@ void sf_page_free(sf_page *p)
 {
     for (int i = 0; i < p->nimg; i++) free(p->img[i].px);
     p->nimg = 0;
+    for (int i = 0; i < p->nfdoc; i++) k93html_free(p->fdoc[i]);
+    p->nfdoc = 0;
+    for (int i = 0; i < p->ncv; i++) { free(p->cv[i].px); p->cv[i].px = NULL; }
+    p->ncv = 0;
     free(p->lbuf);
     free(p->rbuf);
     free(p->pool);
@@ -425,6 +430,63 @@ static void img_place(rctx *ctx, const char *key,
     }
 }
 
+/* fetch + decode + cache + place one image URL (also used by <video>
+ * posters, <object>/<embed> image data). On failure the alt text, if any,
+ * is emitted inline - browsers show alt only when the image does not. */
+static void render_img_url(rctx *ctx, const char *abs, const char *alt)
+{
+    int placed = 0;
+    for (int i = 0; i < ctx->p->nimg; i++)   /* cache hit */
+        if (!strcmp(ctx->p->img[i].url, abs)) {
+            ui_pline *l = line_begin(ctx->p, 1, 0, ctx->indent, 0);
+            if (l) {
+                l->img = ctx->p->img[i].px;
+                l->imgw = ctx->p->img[i].w;
+                l->imgh = ctx->p->img[i].h;
+            }
+            return;
+        }
+    int status = 0;
+    char err[64] = "";
+    char *body = sf_fetch(abs, &status, err, sizeof err);
+    if (body && status >= 200 && status < 300 && ctx->p->nimg < SF_MAXIMG) {
+        int w = 0, h = 0, comp = 0;
+        size_t blen = sf_fetch_len();
+        unsigned char *rgba = NULL;
+        if (looks_svg(body, blen)) {
+            /* svg -> png (own encoder) -> the shared stb decode path */
+            size_t plen = 0;
+            int pw = 0, ph = 0;
+            uint8_t *png = k93svg_to_png(body, blen, &plen, &pw, &ph);
+            if (png) {
+                rgba = stbi_load_from_memory(png, (int)plen,
+                                             &w, &h, &comp, 4);
+                k93_log("safari", "img(svg): url=%s png=%zu -> %dx%d %s",
+                        abs, plen, w, h, rgba ? "decoded" : "fail");
+                free(png);
+            }
+        }
+        if (!rgba)
+            rgba = stbi_load_from_memory((const unsigned char *)body,
+                                         (int)blen, &w, &h, &comp, 4);
+        k93_log("safari", "img: url=%s status=%d len=%zu w=%d h=%d %s",
+                abs, status, blen, w, h,
+                rgba ? "decoded" : stbi_failure_reason());
+        free(body);
+        body = NULL;
+        if (rgba && w > 0 && h > 0) { img_place(ctx, abs, rgba, w, h); placed = 1; }
+    } else {
+        k93_log("safari", "img: url=%s fetch-fail status=%d err=%s",
+                abs, status, err);
+        free(body);
+    }
+    if (!placed && alt && alt[0]) {
+        add_str(ctx, "[");
+        add_str(ctx, alt);
+        add_str(ctx, "]");
+    }
+}
+
 static void render_img(rctx *ctx, k93node *n)
 {
     flush(ctx, 0);
@@ -433,50 +495,8 @@ static void render_img(rctx *ctx, k93node *n)
     if (src && src[0]) {
         char abs[1280];
         url_absolutize(ctx->p->base, src, abs, sizeof abs);
-        for (int i = 0; i < ctx->p->nimg; i++)   /* cache hit */
-            if (!strcmp(ctx->p->img[i].url, abs)) {
-                ui_pline *l = line_begin(ctx->p, 1, 0, ctx->indent, 0);
-                if (l) {
-                    l->img = ctx->p->img[i].px;
-                    l->imgw = ctx->p->img[i].w;
-                    l->imgh = ctx->p->img[i].h;
-                }
-                return;
-            }
-        int status = 0;
-        char err[64] = "";
-        char *body = sf_fetch(abs, &status, err, sizeof err);
-        if (body && status >= 200 && status < 300 && ctx->p->nimg < SF_MAXIMG) {
-            int w = 0, h = 0, comp = 0;
-            size_t blen = sf_fetch_len();
-            unsigned char *rgba = NULL;
-            if (looks_svg(body, blen)) {
-                /* svg -> png (own encoder) -> the shared stb decode path */
-                size_t plen = 0;
-                int pw = 0, ph = 0;
-                uint8_t *png = k93svg_to_png(body, blen, &plen, &pw, &ph);
-                if (png) {
-                    rgba = stbi_load_from_memory(png, (int)plen,
-                                                 &w, &h, &comp, 4);
-                    k93_log("safari", "img(svg): url=%s png=%zu -> %dx%d %s",
-                            abs, plen, w, h, rgba ? "decoded" : "fail");
-                    free(png);
-                }
-            }
-            if (!rgba)
-                rgba = stbi_load_from_memory((const unsigned char *)body,
-                                             (int)blen, &w, &h, &comp, 4);
-            k93_log("safari", "img: url=%s status=%d len=%zu w=%d h=%d %s",
-                    abs, status, blen, w, h,
-                    rgba ? "decoded" : stbi_failure_reason());
-            free(body);
-            body = NULL;
-            if (rgba && w > 0 && h > 0) img_place(ctx, abs, rgba, w, h);
-        } else {
-            k93_log("safari", "img: url=%s fetch-fail status=%d err=%s",
-                    abs, status, err);
-            free(body);
-        }
+        render_img_url(ctx, abs, alt);
+        return;
     }
     if (alt && alt[0]) {
         add_str(ctx, "[");
@@ -911,6 +931,247 @@ static void render_children(rctx *ctx, k93node *n)
     for (k93node *c = n->first; c; c = c->next) render_node(ctx, c);
 }
 
+/* ------------------------------------------------- embedded documents */
+/* Ownership: sub-document trees live in p->fdoc[] until page free, so
+ * link->node pointers into them stay valid across re-renders. Base URL is
+ * swapped so relative links/images inside resolve against the frame.
+ * Ceiling: scripts inside embedded docs do not run (one JS context). */
+
+static int fdoc_own(rctx *ctx, k93node *doc)
+{
+    if (ctx->p->nfdoc >= SF_MAXDOC) return 0;
+    ctx->p->fdoc[ctx->p->nfdoc++] = doc;
+    return 1;
+}
+
+static void render_embedded(rctx *ctx, k93node *doc, const char *base,
+                            const char *label)
+{
+    uint32_t og = ctx->fg;
+    ctx->fg = PAGE_SUB;
+    if (label && *label) { add_str(ctx, label); flush(ctx, 0); }
+    ctx->fg = og;
+    emit_rule(ctx, '-', 0x9AA3AEu);
+    char oldbase[1280];
+    k93_strlcpy(oldbase, ctx->p->base, sizeof oldbase);
+    if (base && *base) k93_strlcpy(ctx->p->base, base, sizeof ctx->p->base);
+    ctx->depth++;
+    ctx->indent += 12;
+    int ia = ctx->in_anchor, al = ctx->anchor_link;
+    ctx->in_anchor = 0;
+    ctx->anchor_link = -1;
+    render_children(ctx, sf_body(doc));
+    flush(ctx, 0);
+    ctx->in_anchor = ia;
+    ctx->anchor_link = al;
+    ctx->indent -= 12;
+    ctx->depth--;
+    emit_rule(ctx, '-', 0x9AA3AEu);
+    k93_strlcpy(ctx->p->base, oldbase, sizeof ctx->p->base);
+}
+
+static void frame_msg(rctx *ctx, const char *msg)
+{
+    uint32_t og = ctx->fg;
+    ctx->fg = PAGE_SUB;
+    add_str(ctx, msg);
+    ctx->fg = og;
+    flush(ctx, 0);
+}
+
+static void render_iframe(rctx *ctx, k93node *n)
+{
+    flush(ctx, 0);
+    const char *sd = k93html_attr(n, "srcdoc");
+    const char *src = k93html_attr(n, "src");
+    char abs[1280] = "";
+    char msg[240];
+    msg[0] = 0;
+    k93node *doc = NULL;
+    if (sd && *sd) {
+        doc = k93html_parse(sd);
+        if (doc && !fdoc_own(ctx, doc)) { k93html_free(doc); doc = NULL; }
+    } else if (!src || !*src) {
+        snprintf(msg, sizeof msg, "[iframe: no src]");
+    } else {
+        url_absolutize(ctx->p->base, src, abs, sizeof abs);
+        if (strncmp(abs, "http://", 7) && strncmp(abs, "https://", 8) &&
+            strncmp(abs, "file://", 7)) {
+            snprintf(msg, sizeof msg, "[iframe: unsupported scheme: %.150s]", abs);
+        } else if (ctx->depth >= 2) {
+            snprintf(msg, sizeof msg, "[iframe: nested too deep]");
+        } else {
+            int status = 0;
+            char err[64] = "";
+            char *body = sf_fetch(abs, &status, err, sizeof err);
+            if (body && status >= 200 && status < 300) {
+                doc = k93html_parse(body);
+                if (doc && !fdoc_own(ctx, doc)) { k93html_free(doc); doc = NULL; }
+            } else {
+                snprintf(msg, sizeof msg, "[iframe: %.60s status %d]",
+                         err[0] ? err : "fetch failed", status);
+            }
+            free(body);
+        }
+    }
+    if (!doc) {
+        if (msg[0]) frame_msg(ctx, msg);
+        return;
+    }
+    char label[200];
+    if (sd && *sd)
+        snprintf(label, sizeof label, "[iframe: srcdoc]");
+    else
+        snprintf(label, sizeof label, "[iframe: %.170s]", abs);
+    render_embedded(ctx, doc, sd && *sd ? NULL : abs, label);
+}
+
+/* magic sniff for <object>/<embed> image payloads (also used for posters) */
+static int img_bytes(const unsigned char *b, size_t n)
+{
+    if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) return 1;
+    if (n >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return 1;
+    if (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6))) return 1;
+    if (n >= 2 && b[0] == 'B' && b[1] == 'M') return 1;
+    if (looks_svg((const char *)b, n)) return 1;
+    return 0;
+}
+
+/* object/embed: image data via the real decode path, html via the frame
+ * path, anything else shows real metadata (type + size) plus the element's
+ * fallback children - there are no plugins in the OS. */
+static void render_object(rctx *ctx, k93node *n)
+{
+    flush(ctx, 0);
+    int rendered = 0;
+    const char *u = k93html_attr(n, "data");
+    if (!u || !*u) u = k93html_attr(n, "src");
+    char abs[1280] = "";
+    if (u && *u) url_absolutize(ctx->p->base, u, abs, sizeof abs);
+    if (abs[0] && ctx->depth < 2 &&
+        (!strncmp(abs, "http://", 7) || !strncmp(abs, "https://", 8))) {
+        int status = 0;
+        char err[64] = "";
+        char *body = sf_fetch(abs, &status, err, sizeof err);
+        size_t blen = body ? sf_fetch_len() : 0;
+        if (body && status >= 200 && status < 300 && blen) {
+            if (img_bytes((const unsigned char *)body, blen)) {
+                free(body);
+                body = NULL;
+                render_img_url(ctx, abs, "");
+                rendered = 1;
+            } else if (body[0] == '<') {
+                k93node *doc = k93html_parse(body);
+                free(body);
+                body = NULL;
+                if (doc && fdoc_own(ctx, doc)) {
+                    render_embedded(ctx, doc, abs, "[object]");
+                    rendered = 1;
+                } else {
+                    k93html_free(doc);
+                }
+            }
+            if (!rendered) {
+                const char *ty = k93html_attr(n, "type");
+                char msg[240];
+                snprintf(msg, sizeof msg,
+                         "[object: %.40s - %zu bytes unsupported (no plugins)]",
+                         (ty && *ty) ? ty : abs, blen);
+                frame_msg(ctx, msg);
+            }
+        } else {
+            char msg[160];
+            snprintf(msg, sizeof msg, "[object: fetch failed status %d]", status);
+            frame_msg(ctx, msg);
+        }
+        free(body);
+    }
+    if (!rendered && n->first)
+        render_children(ctx, n);          /* fallback content (spec) */
+}
+
+/* video/audio: poster images decode for real; playback itself is an OS
+ * ceiling - no audio/video codecs exist in K93OS. Metadata label shows the
+ * real file + type attr. */
+static void render_media(rctx *ctx, k93node *n)
+{
+    flush(ctx, 0);
+    int vid = !strcmp(n->tag, "video");
+    const char *src = k93html_attr(n, "src");
+    if (!src || !*src)
+        for (k93node *c = n->first; c && (!src || !*src); c = c->next)
+            if (!strcmp(c->tag, "source")) src = k93html_attr(c, "src");
+    if (vid) {
+        const char *poster = k93html_attr(n, "poster");
+        if (poster && *poster) {
+            char abs[1280];
+            url_absolutize(ctx->p->base, poster, abs, sizeof abs);
+            render_img_url(ctx, abs, "");
+            flush(ctx, 0);
+        }
+    }
+    char name[96] = "";
+    if (src && *src) {
+        const char *q = strrchr(src, '/');
+        k93_strlcpy(name, q ? q + 1 : src, sizeof name);
+        char *f = strpbrk(name, "?#");
+        if (f) *f = 0;
+    }
+    const char *ty = k93html_attr(n, "type");
+    char msg[240];
+    if (name[0] && ty && *ty)
+        snprintf(msg, sizeof msg,
+                 "[%s: %.60s (%.40s) - playback unsupported (no codec)]",
+                 vid ? "video" : "audio", name, ty);
+    else
+        snprintf(msg, sizeof msg,
+                 "[%s: %.60s - playback unsupported (no codec)]",
+                 vid ? "video" : "audio",
+                 name[0] ? name : (ty && *ty ? ty : "media"));
+    frame_msg(ctx, msg);
+}
+
+/* canvas: real pixels drawn by js.c getContext("2d") are shown 1:1; an
+ * untouched canvas is a transparent area of intrinsic size (browsers do
+ * the same). */
+static void render_canvas(rctx *ctx, k93node *n)
+{
+    flush(ctx, 0);
+    sf_page *p = ctx->p;
+    for (int i = 0; i < p->ncv; i++)
+        if (p->cv[i].node == n && p->cv[i].px) {
+            ui_pline *l = line_begin(p, 1, 0, ctx->indent, 0);
+            if (l) {
+                l->img = p->cv[i].px;
+                l->imgw = p->cv[i].w;
+                l->imgh = p->cv[i].h;
+            }
+            return;
+        }
+    int h = 150;
+    const char *a = k93html_attr(n, "height");
+    if (a && *a) h = atoi(a);
+    if (h < 16) h = 16;
+    if (h > 400) h = 400;
+    for (int i = 0; i < h / 16; i++)
+        line_begin(p, 1, 0, ctx->indent, 0);
+}
+
+void sf_details_toggle(k93node *d)
+{
+    if (!d) return;
+    for (int i = 0; i < d->nattr; i++)
+        if (!strcmp(d->ak[i], "open")) {      /* present -> remove */
+            free(d->ak[i]);
+            free(d->av[i]);
+            d->ak[i] = d->ak[d->nattr - 1];
+            d->av[i] = d->av[d->nattr - 1];
+            d->nattr--;
+            return;
+        }
+    k93html_set_attr(d, "open", "");          /* absent -> add */
+}
+
 static void render_node(rctx *ctx, k93node *n)
 {
     if (!strcmp(n->tag, "#text")) {
@@ -972,21 +1233,10 @@ static void render_node(rctx *ctx, k93node *n)
     }
     if (!strcmp(t, "img")) { render_img(ctx, n); return; }
     if (!strcmp(t, "svg")) { render_svg_inline(ctx, n); return; }
-    if (!strcmp(t, "iframe") || !strcmp(t, "canvas") || !strcmp(t, "object") ||
-        !strcmp(t, "embed") || !strcmp(t, "video") || !strcmp(t, "audio")) {
-        /* visible placeholders: media/frames/canvas live outside the engine */
-        const char *src = k93html_attr(n, "src");
-        flush(ctx, 0);
-        uint32_t og = ctx->fg;
-        char ph[192];
-        snprintf(ph, sizeof ph, "[%s%s%s]", t,
-                 (src && *src) ? " " : "", (src && *src) ? src : "");
-        ctx->fg = PAGE_SUB;
-        add_str(ctx, ph);
-        ctx->fg = og;
-        flush(ctx, 0);
-        return;
-    }
+    if (!strcmp(t, "iframe") || !strcmp(t, "frame")) { render_iframe(ctx, n); return; }
+    if (!strcmp(t, "video") || !strcmp(t, "audio")) { render_media(ctx, n); return; }
+    if (!strcmp(t, "canvas")) { render_canvas(ctx, n); return; }
+    if (!strcmp(t, "object") || !strcmp(t, "embed")) { render_object(ctx, n); return; }
     if (!strcmp(t, "input")) { render_widget(ctx, n); return; }
     if (!strcmp(t, "select")) { render_select(ctx, n); return; }
 
@@ -1020,6 +1270,17 @@ static void render_node(rctx *ctx, k93node *n)
     int heading = (t[0] == 'h' && t[1] >= '1' && t[1] <= '6' && t[2] == 0);
     int bordered = 0;                      /* px of border box indent */
 
+    if (!strcmp(t, "details")) {
+        int open = k93html_attr(n, "open") != NULL;
+        for (k93node *c = n->first; c; c = c->next)   /* summary always */
+            if (!strcmp(c->tag, "summary")) render_node(ctx, c);
+        flush(ctx, 0);
+        if (open)
+            for (k93node *c = n->first; c; c = c->next)
+                if (strcmp(c->tag, "summary")) render_node(ctx, c);
+        flush(ctx, 0);
+        goto out;
+    }
     if (block) flush(ctx, 0);
     if (heading) {
         ctx->scale = t[1] <= '2' ? 2 : 1;
@@ -1192,6 +1453,20 @@ static void render_node(rctx *ctx, k93node *n)
         render_children(ctx, n);
         ctx->in_anchor = 0;
         ctx->anchor_link = -1;
+        goto out;
+    }
+    if (!strcmp(t, "summary")) {           /* details toggle row */
+        flush(ctx, 0);
+        k93node *d = n->parent;
+        if (d && !strcmp(d->tag, "details")) {
+            add_str(ctx, k93html_attr(d, "open") ? "\xe2\x96\xbc " : "\xe2\x96\xb6 ");
+            int idx = link_register(ctx->p, "", n);   /* click = toggle */
+            if (idx >= 0) { ctx->in_anchor = 1; ctx->anchor_link = idx; }
+        }
+        render_children(ctx, n);
+        ctx->in_anchor = 0;
+        ctx->anchor_link = -1;
+        flush(ctx, 0);
         goto out;
     }
     if (!strcmp(t, "button")) {            /* clickable block */

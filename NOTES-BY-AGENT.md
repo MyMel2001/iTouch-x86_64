@@ -496,3 +496,43 @@ keeping AdSheet provider-neutral.
   24px bold class run, linked SVG `<img>`, inline SVG incl. comma cubic,
   and the DOM line "cls=z ds=42 st=#00aa00 oh=true clone=true
   contains=true hcn=true repl=NEW dcl=complete raf=true".
+
+## Safari no-stubs sweep + file:// (2026-10-20)
+
+Goal: replace Safari placeholder paths with real implementations.
+
+* New element renderers (`apps/safari/render.c`): `<img>` fetch-by-URL
+  (`render_img_url`), `<iframe>`/`<frame>` (inline sub-document, depth-
+  capped 2, srcdoc parses the attribute; src absolutizes + `sf_fetch`),
+  `<object>`/`<embed>`/`<video>`/`<audio>`/`<source>` (media label with
+  MIME + honest "playback unsupported (no codec)"; object falls back to
+  its children on load failure), `<details>`/`<summary>` (closed hides
+  body, ☐/▼ marker; summary is hit-testable -> `sf_details_toggle`),
+  `<canvas>` placeholder box. Canvas 2D subset in `js.c`: fillRect/
+  strokeRect/clearRect, beginPath/moveTo/lineTo/closePath/stroke/fill,
+  fillStyle/strokeStyle/lineWidth, fillText (built-in font),
+  getImageData/putImageData, toDataURL ceiling = NULL; getContext("webgl")
+  returns null honestly. `main.c` summary-click toggles + re-render.
+* `file://` support: `sf_fetch` + `url_ok` in main.c read the file via
+  open/read (status 200); `k93net.c url_absolutize` joins relative paths
+  onto the base dir for file: URLs. iframe src gate extended to file:
+  (render.c one-liner). Fixtures installed to `/opt/k93/fixtures/` by
+  mkrootfs.sh; `w3.html` extended with the new-elements section +
+  `w3-frame.html`.
+* Bugs found by driving the VM (QMP + screenshots):
+  - Safari address dialog never exited on Esc: `ui_input` returns 1 on
+    cancel but main.c checked `< 0`, so Esc re-browsed the prefilled URL.
+    Fixed `!= 0` (main.c:351).
+  - `render_iframe` rejected file: srcs after file:// was added to
+    sf_fetch; gate now allows all three schemes.
+* Guest validation (1280x800 screenshots): fixture loads via typed
+  `file:///opt/k93/fixtures/w3.html` (typed via QMP; `:` = shift+semicolon
+  combo — QEMU has no colon qcode); media labels render, missing img shows
+  alt, details closed ☐ hides body, click toggles to ▼ + body visible,
+  srcdoc iframe parses inline, object/embed fallback children render,
+  canvas 2D draws fillRect/stroke/fillText ("K93 canvas2D"), script
+  reports webgl=null. ser.log: 0 faults.
+* Ceilings (documented, not bugs): canvas = 2D subset (no WebGL/paths
+  clip/save/transform), iframe = inline sub-document with scripts inert,
+  media = labels only (no codecs), `toDataURL` = null, file: iframe +
+  main doc share the same 1280-char URL buffer.
