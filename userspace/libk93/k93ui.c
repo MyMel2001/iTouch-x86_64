@@ -401,13 +401,21 @@ static void stdin_raw(void)
 
 static int key_from_stdin(int timeout_ms)
 {
-    struct pollfd p = { .fd = infd, .events = POLLIN };
-    if (poll(&p, 1, timeout_ms) <= 0) return -1;
-    unsigned char b[16];
-    ssize_t n = read(infd, b, sizeof b);
-    if (n <= 0) return -1;
+    /* leftover bytes from a burst are kept here; a single read() may hold
+     * several keys and only the first may be returned per call */
+    static unsigned char pend[64];
+    static size_t pendlen = 0;
+    if (pendlen == 0) {
+        struct pollfd p = { .fd = infd, .events = POLLIN };
+        if (poll(&p, 1, timeout_ms) <= 0) return -1;
+        ssize_t n = read(infd, pend, sizeof pend);
+        if (n <= 0) return -1;
+        pendlen = (size_t)n;
+    }
     size_t used = 0;
-    int k = parse_bytes(b, (size_t)n, &used);
+    int k = parse_bytes(pend, pendlen, &used);
+    memmove(pend, pend + used, pendlen - used);
+    pendlen -= used;
     return k;
 }
 
@@ -2351,6 +2359,10 @@ int ui_pageview(const char *title, ui_page *p,
 /* multiline editor: buffer of lines, char insertion on current line */
 int ui_editbox(const char *title, char *buf, size_t cap)
 {
+    /* Lines are fixed-capacity buffers: insert paths memmove within them,
+     * so exact-size strdup allocations (which corrupt mallocng metadata by
+     * writing past small slots) are not usable here. */
+    enum { LINE_CAP = 1024 };
     int cap_lines = 64;
     char **lines = k93_xmalloc(sizeof(char *) * (size_t)cap_lines);
     int nlines = 0;
@@ -2360,13 +2372,14 @@ int ui_editbox(const char *title, char *buf, size_t cap)
         while (nlines < cap_lines) {
             char *nl = strchr(p, '\n');
             if (nl) *nl = 0;
-            lines[nlines++] = strdup(p);
+            lines[nlines] = k93_xmalloc(LINE_CAP);
+            k93_strlcpy(lines[nlines++], p, LINE_CAP);
             if (!nl) break;
             p = nl + 1;
         }
         free(copy);
     }
-    if (nlines == 0) lines[nlines++] = strdup("");
+    if (nlines == 0) { lines[nlines] = k93_xmalloc(LINE_CAP); lines[nlines++][0] = 0; }
     int cur_line = 0, cur_col = 0, top = 0;
     for (;;) {
         int view = G.rows - 4; if (view < 1) view = 1;
@@ -2393,8 +2406,8 @@ int ui_editbox(const char *title, char *buf, size_t cap)
         if (k == UI_KEY_ESC || k == UI_KEY_CTRL_C) break;
         else if (k == UI_KEY_ENTER) {
             if (nlines >= cap_lines) continue;
-            char *nw = k93_xmalloc((size_t)cl_len - cur_col + 2);
-            k93_strlcpy(nw, cl + cur_col, (size_t)(cl_len - cur_col + 1));
+            char *nw = k93_xmalloc(LINE_CAP);
+            k93_strlcpy(nw, cl + cur_col, LINE_CAP);
             cl[cur_col] = 0;
             for (int i = nlines; i > cur_line + 1; i--) lines[i] = lines[i - 1];
             lines[cur_line + 1] = nw;
@@ -2408,25 +2421,24 @@ int ui_editbox(const char *title, char *buf, size_t cap)
             } else if (cur_line > 0) {
                 char *prev = lines[cur_line - 1];
                 int plen = (int)strlen(prev);
-                char *merged = k93_xmalloc((size_t)(plen + cl_len + 1));
-                memcpy(merged, prev, (size_t)plen);
-                memcpy(merged + plen, cl, (size_t)cl_len + 1);
+                char *merged = k93_xmalloc(LINE_CAP);
+                k93_strlcpy(merged, prev, LINE_CAP);
+                strncat(merged, cl, LINE_CAP - strlen(merged) - 1);
                 free(prev); free(cl);
                 lines[cur_line - 1] = merged;
                 for (int i = cur_line; i < nlines - 1; i++) lines[i] = lines[i + 1];
                 nlines--;
                 cur_line--;
-                cur_col = plen;
+                cur_col = (int)strlen(merged); if (cur_col > plen) cur_col = plen;
             }
         } else if (k == UI_KEY_DELETE) {
             if (cur_col < cl_len) {
                 memmove(cl + cur_col, cl + cur_col + 1, (size_t)(cl_len - cur_col));
             } else if (cur_line + 1 < nlines) {
                 char *nx = lines[cur_line + 1];
-                int xl = (int)strlen(nx);
-                char *merged = k93_xmalloc((size_t)(cl_len + xl + 1));
-                memcpy(merged, cl, (size_t)cl_len);
-                memcpy(merged + cl_len, nx, (size_t)xl + 1);
+                char *merged = k93_xmalloc(LINE_CAP);
+                k93_strlcpy(merged, cl, LINE_CAP);
+                strncat(merged, nx, LINE_CAP - strlen(merged) - 1);
                 free(cl); free(nx);
                 lines[cur_line] = merged;
                 for (int i = cur_line + 1; i < nlines - 1; i++) lines[i] = lines[i + 1];
@@ -2437,7 +2449,7 @@ int ui_editbox(const char *title, char *buf, size_t cap)
         else if (k == UI_KEY_UP) { if (cur_line > 0) { cur_line--; int l = (int)strlen(lines[cur_line]); if (cur_col > l) cur_col = l; } }
         else if (k == UI_KEY_DOWN) { if (cur_line + 1 < nlines) { cur_line++; int l = (int)strlen(lines[cur_line]); if (cur_col > l) cur_col = l; } }
         else if (k >= UI_KEY_CHAR_BASE && k < UI_KEY_CHAR_BASE + 128) {
-            if (cl_len + 2 < 500) {
+            if (cl_len + 2 < LINE_CAP) {
                 memmove(cl + cur_col + 1, cl + cur_col, (size_t)(cl_len - cur_col) + 1);
                 cl[cur_col] = (char)(k - UI_KEY_CHAR_BASE);
                 cur_col++;
