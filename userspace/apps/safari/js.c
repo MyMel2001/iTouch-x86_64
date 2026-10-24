@@ -195,15 +195,23 @@ static JSValue c_fetch2(JSContext *c, JSValueConst thisv, int argc,
         JS_SetPropertyUint32(ctx, arr, 1, JS_NewString(c, ""));
         return arr;
     }
-    const char *u = JS_ToCString(ctx, argv[0]);
+    const char *method = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    const char *u = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
+    const char *reqbody = argc > 2 ? JS_ToCString(ctx, argv[2]) : NULL;
+    const char *ctype = argc > 3 ? JS_ToCString(ctx, argv[3]) : NULL;
     int status = 0;
     char err[64];
-    char *body = u ? sf_fetch(u, &status, err, sizeof err) : NULL;
+    char *body = u ? k93net_request(method ? method : "GET", u, reqbody,
+                                    reqbody ? strlen(reqbody) : 0, ctype,
+                                    NULL, &status, err, sizeof err) : NULL;
+    if (method) JS_FreeCString(ctx, method);
     if (u) JS_FreeCString(ctx, u);
+    if (reqbody) JS_FreeCString(ctx, reqbody);
+    if (ctype) JS_FreeCString(ctx, ctype);
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, status));
     if (body) {
         JS_SetPropertyUint32(ctx, arr, 1,
-                             js_str_sanitized(c, body, sf_fetch_len()));
+                             js_str_sanitized(c, body, k93net_last_len()));
         free(body);
     } else {
         JS_SetPropertyUint32(ctx, arr, 1, JS_NewString(c, ""));
@@ -505,11 +513,56 @@ static JSValue c_selectmenu(JSContext *c, JSValueConst thisv, int argc,
     return JS_NewInt32(c, r);
 }
 
-/* in-memory web storage: persists across navigation while the app runs.
- * JS side prefixes keys with the origin. Ceiling: RAM only. */
+/* web storage: keys prefixed with the origin by the JS side. localStorage is
+ * persisted to /var/mobile/Library/Safari/localstorage.txt across navigations
+ * and app restarts; sessionStorage shares the same store (ceiling). */
 #define MAXSTORE 64
+#define SF_STORE_FILE "/var/mobile/Library/Safari/localstorage.txt"
 static struct { char k[160]; char v[512]; } STORE[MAXSTORE];
 static int nstore, srot;
+
+static void store_load(void)
+{
+    size_t len = 0;
+    char *t = k93_read_file(SF_STORE_FILE, &len);
+    if (!t) return;
+    nstore = 0;
+    char *p = t, *end = t + len;
+    while (p < end && nstore < MAXSTORE) {
+        char *nl = memchr(p, '\n', (size_t)(end - p));
+        char *line = nl ? nl : end;
+        char *tab = memchr(p, '\t', (size_t)(line - p));
+        size_t kl = tab ? (size_t)(tab - p) : (size_t)(line - p);
+        size_t vl = tab ? (size_t)(line - tab - 1) : 0;
+        if (kl < sizeof STORE[0].k && vl < sizeof STORE[0].v) {
+            memcpy(STORE[nstore].k, p, kl); STORE[nstore].k[kl] = 0;
+            memcpy(STORE[nstore].v, tab ? tab + 1 : line, vl);
+            STORE[nstore].v[vl] = 0;
+            nstore++;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    free(t);
+}
+
+static void store_save(void)
+{
+    k93_mkdir_p("/var/mobile/Library/Safari", 0777);
+    size_t cap = 1;
+    for (int i = 0; i < nstore; i++)
+        cap += strlen(STORE[i].k) + strlen(STORE[i].v) + 3;
+    char *buf = k93_xmalloc(cap);
+    if (!buf) return;
+    size_t o = 0;
+    for (int i = 0; i < nstore; i++) {
+        if (!STORE[i].k[0]) continue;
+        o += (size_t)snprintf(buf + o, cap - o, "%s\t%s\n",
+                              STORE[i].k, STORE[i].v);
+    }
+    k93_write_file(SF_STORE_FILE, buf, o, 0);
+    free(buf);
+}
 
 static JSValue c_store_get(JSContext *c, JSValueConst thisv, int argc,
                            JSValueConst *argv)
@@ -1906,23 +1959,25 @@ static const char bootstrap_js[] =
 "  return ev.defaultPrevented ? 2 : 1;\n"
 "};\n"
 "function XMLHttpRequest() { this.readyState = 0; this.status = 0;\n"
-"  this.responseText = \"\"; this.onreadystatechange = null; this._u = \"\"; }\n"
-"XMLHttpRequest.prototype.open = function (m, u) { this._u = String(u); this.readyState = 1; };\n"
-"XMLHttpRequest.prototype.send = function () {\n"
-"  var a = sf_xhr(this._u);\n"
+"  this.responseText = \"\"; this.onreadystatechange = null; this._m = \"GET\"; this._u = \"\"; }\n"
+"XMLHttpRequest.prototype.open = function (m, u) {\n"
+"  this._m = String(m || \"GET\"); this._u = String(u); this.readyState = 1; };\n"
+"XMLHttpRequest.prototype.send = function (b) {\n"
+"  var a = sf_xhr(this._m, this._u, b == null ? null : String(b));\n"
 "  this.status = a[0]; this.responseText = a[1]; this.readyState = 4;\n"
 "  if (this.onreadystatechange) this.onreadystatechange();\n"
 "};\n"
 "XMLHttpRequest.prototype.setRequestHeader = function () {};\n"
 "XMLHttpRequest.prototype.getAllResponseHeaders = function () { return \"\"; };\n"
 "globalThis.XMLHttpRequest = XMLHttpRequest;\n"
-"function __resp(u) { var a = sf_xhr(u); return {\n"
+"function __resp(u, o) { o = o || {}; var a = sf_xhr(\n"
+"  o.method || \"GET\", String(u), o.body == null ? null : String(o.body)); return {\n"
 "  ok: a[0] >= 200 && a[0] < 300, status: a[0], url: u,\n"
 "  text: function () { return Promise.resolve(a[1]); },\n"
 "  json: function () { try { return Promise.resolve(JSON.parse(a[1])); }\n"
 "    catch (e) { return Promise.reject(e); } },\n"
 "  headers: { get: function () { return \"\"; } } }; }\n"
-"globalThis.fetch = function (u) { return Promise.resolve(__resp(String(u))); };\n"
+"globalThis.fetch = function (u, o) { return Promise.resolve(__resp(u, o)); };\n"
 "globalThis.setTimeout = function (f, ms) { return sf_setTimeout(f, ms || 0); };\n"
 "globalThis.clearTimeout = function (id) { sf_clearTimeout(id); };\n"
 "globalThis.setInterval = function (f, ms) { return sf_setInterval(f, ms || 0); };\n"
@@ -2028,6 +2083,7 @@ int js_open(sf_page *p, k93node *doc, const char *base)
     cookiejar[0] = 0;
     memset(T, 0, sizeof T);
     nwrap = 0;
+    store_load();
     rt = JS_NewRuntime();
     if (!rt) return -1;
     ctx = JS_NewContext(rt);
@@ -2098,6 +2154,7 @@ int js_open(sf_page *p, k93node *doc, const char *base)
 void js_close(void)
 {
     if (!rt) return;
+    store_save();
     for (int i = 0; i < MAXTIMERS; i++)
         if (T[i].active) timer_clear(ctx, i + 1);
     for (int i = 0; i < nwrap; i++) JS_FreeValue(ctx, wrap[i].v);

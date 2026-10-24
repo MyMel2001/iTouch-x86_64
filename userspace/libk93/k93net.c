@@ -574,35 +574,52 @@ void k93net_close(struct k93conn *c)
 size_t k93net_last_len(void) { return body_len; }
 const char *k93net_last_location(void) { return location; }
 
-char *k93net_read_http(struct k93conn *c, const struct url *u, int *status,
-                       char *err, size_t errlen)
+char *k93net_read_http(struct k93conn *c, const struct url *u, const char *method,
+                       const char *body, size_t bodylen, const char *ctype,
+                       int *status, char *err, size_t errlen)
 {
     char req[4096];
     char ace_host[256];
     char enc_path[3072];
     int n;
+    const char *m = (method && *method) ? method : "GET";
+    int with_body = body && bodylen > 0;
     location[0] = 0;
     if (k93_idn_to_ascii(u->host, ace_host, sizeof ace_host) < 0)
         k93_strlcpy(ace_host, u->host, sizeof ace_host);
     url_enc_path(u->path, enc_path, sizeof enc_path);
+    const char *hdr_extra = "";
+    char extra[160];
+    if (with_body)
+        snprintf(extra, sizeof extra, "Content-Type: %s\r\nContent-Length: %zu\r\n",
+                 ctype && *ctype ? ctype : "application/x-www-form-urlencoded",
+                 bodylen);
+    else
+        extra[0] = 0;
+    hdr_extra = extra;
     if (PX.proxy_enable && PX.proxy_host[0] && !strcmp(u->scheme, "http")) {
         n = snprintf(req, sizeof req,
-                     "GET %s://%s:%d%s HTTP/1.0\r\n"
+                     "%s %s://%s:%d%s HTTP/1.0\r\n"
                      "Host: %s\r\nUser-Agent: %s\r\n"
-                     "Accept: text/html,*/*\r\nConnection: close\r\n\r\n",
-                     u->scheme, ace_host, u->port, enc_path, ace_host, ua);
+                     "Accept: text/html,*/*\r\n%sConnection: close\r\n\r\n",
+                     m, u->scheme, ace_host, u->port, enc_path, ace_host, ua,
+                     hdr_extra);
     } else {
         n = snprintf(req, sizeof req,
-                     "GET %s HTTP/1.0\r\n"
+                     "%s %s HTTP/1.0\r\n"
                      "Host: %s\r\nUser-Agent: %s\r\n"
-                     "Accept: text/html,*/*\r\nConnection: close\r\n\r\n",
-                     enc_path, ace_host, ua);
+                     "Accept: text/html,*/*\r\n%sConnection: close\r\n\r\n",
+                     m, enc_path, ace_host, ua, hdr_extra);
     }
     if (n < 0 || n >= (int)sizeof req) {
         snprintf(err, errlen, "request too long");
         return NULL;
     }
     if (conn_write(c, req, (size_t)n) < 0) { snprintf(err, errlen, "write failed"); return NULL; }
+    if (with_body && conn_write(c, body, bodylen) < 0) {
+        snprintf(err, errlen, "write failed");
+        return NULL;
+    }
 
     size_t cap = 65536, len = 0;
     char *buf = k93_xmalloc(cap);
@@ -688,7 +705,7 @@ char *k93net_get(const char *url, size_t *blen, int *status,
     }
     struct k93conn *c = k93net_open(&u, err, errlen);
     if (!c) return NULL;
-    char *raw = k93net_read_http(c, &u, status, err, errlen);
+    char *raw = k93net_read_http(c, &u, "GET", NULL, 0, NULL, status, err, errlen);
     k93net_close(c);
     if (blen) *blen = k93net_last_len();
     if (raw && *status >= 300 && *status < 400 && location[0] && depth < 8) {
@@ -697,6 +714,38 @@ char *k93net_get(const char *url, size_t *blen, int *status,
         free(raw);
         depth++;
         raw = k93net_get(abs, blen, status, err, errlen);
+        depth--;
+        return raw;
+    }
+    return raw;
+}
+
+/* any method (POST/PUT/...); body/ctype optional; follows redirects (capped) */
+char *k93net_request(const char *method, const char *url,
+                     const char *body, size_t bodylen, const char *ctype,
+                     size_t *blen, int *status, char *err, size_t errlen)
+{
+    static int depth;
+    struct url u;
+    *status = 0;
+    if (blen) *blen = 0;
+    if (url_parse(url, &u) < 0) {
+        snprintf(err, errlen, "bad url");
+        return NULL;
+    }
+    struct k93conn *c = k93net_open(&u, err, errlen);
+    if (!c) return NULL;
+    char *raw = k93net_read_http(c, &u, method, body, bodylen, ctype,
+                                 status, err, errlen);
+    k93net_close(c);
+    if (blen) *blen = k93net_last_len();
+    if (raw && *status >= 300 && *status < 400 && location[0] && depth < 8) {
+        char abs[1280];
+        url_absolutize(url, location, abs, sizeof abs);
+        free(raw);
+        depth++;
+        raw = k93net_request(method, abs, body, bodylen, ctype,
+                             blen, status, err, errlen);
         depth--;
         return raw;
     }

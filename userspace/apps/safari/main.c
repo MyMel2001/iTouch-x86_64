@@ -324,7 +324,8 @@ static int browse_d(const char *url_in, int depth, int from_hist)
             ui_msgbox("Safari", m);
             return -1;
         }
-        raw = k93net_read_http(kc, &u, &status, err, sizeof err);
+        raw = k93net_read_http(kc, &u, "GET", NULL, 0, NULL,
+                               &status, err, sizeof err);
         k93net_close(kc);
         if (!raw) {
             char m[192];

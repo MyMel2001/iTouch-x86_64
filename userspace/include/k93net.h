@@ -3,7 +3,7 @@
  * Extracted from the Safari engine so any OS app can fetch URLs: url
  * helpers, proxy support (/etc/k93/proxy.conf), mbedTLS TLS with the
  * system CA store, chunked transfer decoding. All calls are synchronous.
- * Ceiling: GET only, no cookies/keep-alive, one connection per request. */
+ * Ceiling: no cookies/keep-alive, one connection per request. */
 #ifndef K93NET_H
 #define K93NET_H
 
@@ -30,8 +30,10 @@ void k93net_set_proxy(const char *host, int port);
 /* low level: one connection, one request (caller follows redirects) */
 struct k93conn;
 struct k93conn *k93net_open(const struct url *u, char *err, size_t errlen);
-char *k93net_read_http(struct k93conn *c, const struct url *u, int *status,
-                       char *err, size_t errlen);   /* body (NUL-terminated) */
+char *k93net_read_http(struct k93conn *c, const struct url *u, const char *method,
+                       const char *body, size_t bodylen, const char *ctype,
+                       int *status, char *err, size_t errlen);
+                       /* body (NUL-terminated) */
 void k93net_close(struct k93conn *c);
 size_t       k93net_last_len(void);       /* body bytes of last read_http */
 const char *k93net_last_location(void);   /* Location header, or "" */
@@ -40,5 +42,9 @@ const char *k93net_last_location(void);   /* Location header, or "" */
  * (binary bodies may contain NUL) */
 char *k93net_get(const char *url, size_t *blen, int *status,
                  char *err, size_t errlen);
+/* any method (POST/PUT/...): body/ctype optional; follows redirects (capped) */
+char *k93net_request(const char *method, const char *url,
+                     const char *body, size_t bodylen, const char *ctype,
+                     size_t *blen, int *status, char *err, size_t errlen);
 
 #endif
