@@ -98,6 +98,7 @@ typedef struct {
     ui_prun *runs;                   /* text runs (caller-owned) */
     int nruns;                       /* 0 => image line */
     uint32_t bg;                     /* band background, 0 = page white */
+    uint32_t bg2;                    /* gradient bottom color (bg + bg2 = grad) */
     int center, indent, scale;       /* scale 1 or 2 (font is 8x16 per unit) */
     int link;                        /* line's activatable link, or -1 */
     const uint32_t *img;             /* RGBA pixels for image lines or NULL */

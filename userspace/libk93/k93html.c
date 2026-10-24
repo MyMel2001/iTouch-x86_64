@@ -1118,18 +1118,58 @@ int k93css_color(const char *v, uint32_t *out)
     return 0;
 }
 
+/* linear-gradient([to <dir>,] c1 [, pos] [, c2 [, pos]]) -> top/bottom color.
+ * Only the two endpoint colors are kept (linear vertical gradient). */
+static int linear_gradient(const char *v, uint32_t *top, uint32_t *bot)
+{
+    const char *p = strcasestr(v, "linear-gradient(");
+    if (!p) return 0;
+    p += strlen("linear-gradient(");
+    char args[256];
+    size_t o = 0;
+    while (*p && *p != ')' && o < sizeof args - 1) args[o++] = *p++;
+    args[o] = 0;
+    char *save = NULL, *tok;
+    uint32_t cols[2];
+    int nc = 0;
+    for (tok = strtok_r(args, ",", &save); tok && nc < 2;
+         tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!strncasecmp(tok, "to ", 3)) continue;      /* direction */
+        uint32_t c;
+        if (k93css_color(tok, &c)) { cols[nc++] = c; continue; }
+        char lead[64];
+        size_t li = 0;
+        while (*tok && *tok != ' ' && li < sizeof lead - 1) lead[li++] = *tok++;
+        lead[li] = 0;
+        if (li && k93css_color(lead, &c)) cols[nc++] = c;  /* color stop */
+    }
+    if (nc < 1) return 0;
+    *top = cols[0];
+    *bot = nc > 1 ? cols[1] : cols[0];
+    return 1;
+}
+
 static void apply_decl(k93cstyle *st, const char *prop, const char *val)
 {
     uint32_t col;
+    uint32_t gt, gb;
     if (!strcasecmp(prop, "color")) {
         if (k93css_color(val, &col)) { st->fg = col; st->flags |= K93CSS_FG; }
     } else if (!strcasecmp(prop, "background-color")) {
-        if (strcasecmp(val, "transparent") && k93css_color(val, &col)) {
+        if (linear_gradient(val, &gt, &gb)) {
+            st->bg = gt; st->gbot = gb;
+            st->flags |= K93CSS_BG | K93CSS_GRAD;
+        } else if (strcasecmp(val, "transparent") && k93css_color(val, &col)) {
             st->bg = col; st->flags |= K93CSS_BG;
         }
     } else if (!strcasecmp(prop, "background")) {
+        if (linear_gradient(val, &gt, &gb)) {
+            st->bg = gt; st->gbot = gb;
+            st->flags |= K93CSS_BG | K93CSS_GRAD;
+        } else {
         /* shorthand: first color token wins; url()/gradient() tokens and
-         * position/size keywords skipped (ceiling: no gradient fills) */
+         * position/size keywords skipped */
         const char *q = val;
         while (*q) {
             while (*q == ' ' || *q == ',') q++;
@@ -1142,6 +1182,7 @@ static void apply_decl(k93cstyle *st, const char *prop, const char *val)
                 st->bg = col; st->flags |= K93CSS_BG;
                 break;
             }
+        }
         }
     } else if (!strcasecmp(prop, "font-weight")) {
         if (!strcasecmp(val, "bold") || !strcasecmp(val, "bolder") ||

@@ -112,6 +112,13 @@ int main(int argc, char **argv)
         chk((hst.flags & K93CSS_HIDDEN) && hst.hidden, "css display:none");
         uint32_t hcol = 0;
         chk(k93css_color("#f00", &hcol) && hcol == 0xff0000, "css #rgb");
+        k93css_add(hc, "div { background: linear-gradient(#0000ff, #ffffff) }");
+        k93node *hg = k93html_elem("div");
+        memset(&hst, 0, sizeof hst);
+        k93css_apply(hc, hg, &hst);
+        chk((hst.flags & K93CSS_GRAD) && hst.bg == 0x0000ff &&
+            hst.gbot == 0xffffff, "css linear-gradient endpoints");
+        k93html_free(hg);
         k93node *hw = k93html_elem("div");
         k93html_set_inner_html(hw, "<b>bold</b>text");
         char *hi = k93html_inner_html(hw);

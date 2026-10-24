@@ -50,13 +50,15 @@ enum {
     K93CSS_HIDDEN = 16, K93CSS_SCALE = 32, K93CSS_INDENT = 64,
     K93CSS_UNDERLINE = 128, K93CSS_FONT = 256, K93CSS_XFORM = 512,
     K93CSS_OPACITY = 1024, K93CSS_WIDTH = 2048, K93CSS_LH = 4096,
-    K93CSS_BORDER = 8192, K93CSS_LSTYLE = 16384, K93CSS_STRIKE = 32768
+    K93CSS_BORDER = 8192, K93CSS_LSTYLE = 16384, K93CSS_STRIKE = 32768,
+    K93CSS_GRAD = 65536
 };
 /* list-style-type values */
 enum { K93L_DISC, K93L_CIRCLE, K93L_SQUARE, K93L_DECIMAL, K93L_LALPHA,
        K93L_UALPHA, K93L_LROMAN, K93L_UROMAN, K93L_NONE };
 typedef struct {
     uint32_t fg, bg;
+    uint32_t gbot;                    /* gradient bottom (with K93CSS_GRAD) */
     int bold, center, hidden, scale, indent;
     int underline;                    /* text-decoration: underline */
     int strike;                       /* text-decoration: line-through */

@@ -26,7 +26,7 @@ struct lwitem { int off, len; uint32_t fg, bg; int bold, link, font, deco; };
 
 typedef struct {
     sf_page *p;
-    uint32_t fg, bg;
+    uint32_t fg, bg, gbot;
     int bold, center, scale, hidden, in_pre, in_anchor;
     int indent;                        /* px */
     int font;                          /* k93font id from CSS, -1 = default */
@@ -155,6 +155,7 @@ static void emit_line(rctx *ctx, int scale, struct lwitem *lw, int nlw)
     sf_page *p = ctx->p;
     ui_pline *l = line_begin(p, scale, ctx->center, ctx->indent, ctx->bg);
     if (!l) return;
+    l->bg2 = ctx->gbot;
     l->lh = ctx->lh;
     if (ctx->bord)
         line_run(p, l, "| ", 2, ctx->bordc, 0, -1, -1, 0, 0);
@@ -1200,12 +1201,14 @@ static void render_node(rctx *ctx, k93node *n)
     int sf_strike = ctx->strike, sf_xform = ctx->xform;
     int sf_op = ctx->op, sf_lh = ctx->lh, sf_width = ctx->width;
     int sf_lstyle = ctx->lstyle;
-    uint32_t sf_segbg = ctx->segbg;
+    uint32_t sf_segbg = ctx->segbg, sf_gbot = ctx->gbot;
     k93cstyle st;
     memset(&st, 0, sizeof st);
     k93css_apply(ctx->p->css, n, &st);
     if (st.flags & K93CSS_FG) sf_fg = st.fg;
     if (st.flags & K93CSS_BG) sf_bg = st.bg;
+    if (st.flags & K93CSS_GRAD) sf_gbot = st.gbot;
+    else if (st.flags & K93CSS_BG) sf_gbot = 0;
     if (st.flags & K93CSS_BOLD) sf_bold = st.bold;
     if (st.flags & K93CSS_CENTER) sf_center = st.center;
     if (st.flags & K93CSS_SCALE) sf_scale = st.scale;
@@ -1248,9 +1251,11 @@ static void render_node(rctx *ctx, k93node *n)
     int og_op = ctx->op, og_lh = ctx->lh, og_width = ctx->width;
     int og_lstyle = ctx->lstyle, og_ltype = ctx->ltype;
     uint32_t og_segbg = ctx->segbg, og_bordc = ctx->bordc;
+    uint32_t og_gbot = ctx->gbot;
     int og_olnum = ctx->ol_num, og_bord = ctx->bord;
     ctx->fg = fade_to_white(sf_fg, sf_op);
     ctx->bg = sf_bg ? fade_to_white(sf_bg, sf_op) : 0;
+    ctx->gbot = sf_gbot;
     ctx->bold = sf_bold;
     ctx->center = sf_center;
     ctx->scale = sf_scale;
@@ -1511,6 +1516,7 @@ out:
     ctx->lstyle = og_lstyle;
     ctx->ltype = og_ltype;
     ctx->segbg = og_segbg;
+    ctx->gbot = og_gbot;
     ctx->bord = og_bord;
     ctx->bordc = og_bordc;
     ctx->in_pre = og_pre;

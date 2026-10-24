@@ -2148,8 +2148,12 @@ static void page_render(const char *title, ui_page *p, int top, int sel)
                 if (l->imgw < pw - 28) ix = px + (pw - l->imgw) / 2;
                 ui_blit(ix, y + 3, l->imgw, l->imgh, l->img);
             } else {
-                if (l->bg && !issel)
-                    ui_fill(px + 2, y, pw - 4, lh, l->bg);
+                if (l->bg && !issel) {
+                    if (l->bg2)
+                        ui_fill_grad(px + 2, y, pw - 4, lh, l->bg, l->bg2);
+                    else
+                        ui_fill(px + 2, y, pw - 4, lh, l->bg);
+                }
                 int tw = 0;
                 int basef0 = k93font_default_id();
                 for (int r = 0; r < l->nruns; r++) {
