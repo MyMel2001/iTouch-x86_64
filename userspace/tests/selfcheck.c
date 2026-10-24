@@ -13,6 +13,7 @@
 #include "k93html.h"
 #include "k93font.h"
 #include "k93svg.h"
+#include "k93net.h"
 #include "k93ui.h"
 #include <linux/fb.h>
 #ifndef __user
@@ -178,6 +179,31 @@ int main(int argc, char **argv)
             "entities decode to UTF-8");
         k93html_free(doc3);
         printf("info - css combinators/specificity/entities ok\n");
+    }
+
+    /* --- url + IDN (iOS 4.2 "Chinese URL" support) --- */
+    {
+        char ace[256], uni[256];
+        chk(k93_idn_to_ascii("example.com", ace, sizeof ace) == 0 &&
+            !strcmp(ace, "example.com"), "idn ascii passthrough");
+        chk(k93_idn_to_ascii("b\xC3\xBC" "cher", ace, sizeof ace) == 1 &&
+            !strcmp(ace, "xn--bcher-kva"), "idn punycode encode");
+        chk(k93_idn_to_unicode("xn--bcher-kva", uni, sizeof uni) == 1 &&
+            !strcmp(uni, "b\xC3\xBC" "cher"), "idn punycode round-trip");
+        chk(k93_idn_to_unicode("example.com", uni, sizeof uni) == 0 &&
+            !strcmp(uni, "example.com"), "idn unicode passthrough");
+        chk(k93_idn_to_ascii("\xE4\xB8\xAD\xE6\x96\x87.example", ace,
+                             sizeof ace) == 1 &&
+            !strcmp(ace, "xn--fiq228c.example"), "idn dotted host punycode");
+        struct url u;
+        chk(url_parse("http://xn--fiq228c.example/\xE4\xB8\xAD", &u) == 0 &&
+            !strcmp(u.host, "xn--fiq228c.example"), "url_parse ace host");
+        chk(url_parse("http://\xE4\xB8\xAD\xE6\x96\x87.example/", &u) == 0 &&
+            !strcmp(u.host, "\xE4\xB8\xAD\xE6\x96\x87.example"),
+            "url_parse utf-8 host");
+        chk(k93_idn_to_ascii(u.host, ace, sizeof ace) == 1 &&
+            !strcmp(ace, "xn--fiq228c.example"), "url host punycoded");
+        printf("info - idn/url ok\n");
     }
 
     /* --- css level: colors, new properties, pseudo-classes --- */

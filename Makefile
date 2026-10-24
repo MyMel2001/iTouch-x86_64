@@ -114,7 +114,7 @@ $(GBIN)/%: $(TOP)/userspace/apps/%/main.c $(LIBK93) $(LIBK93_OBJ)
 
 $(GBIN)/k93selfcheck: $(TOP)/userspace/tests/selfcheck.c $(LIBK93)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS) $(LDLIBS_Z) -lm
+	$(CC) $(CFLAGS) -o $@ $< $(LIBK93) $(LDFLAGS) $(LDLIBS_Z) $(LDLIBS_TLS) -lm
 
 $(GBIN)/k93dmgtool: $(TOP)/userspace/tools/dmgtool.c $(LIBK93)
 	@mkdir -p $(@D)

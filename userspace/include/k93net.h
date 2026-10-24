@@ -14,6 +14,13 @@ struct url { char scheme[16]; char host[256]; int port; char path[1024]; };
 int  url_parse(const char *s, struct url *u);   /* 0 ok, -1 not http(s) */
 void url_absolutize(const char *base, const char *rel, char *out, size_t cap);
 
+/* IDN (RFC 3492 punycode) - iOS 4.2 "Chinese URL" support: turn a UTF-8 host
+ * into its ASCII-compatible "xn--" form for DNS/TLS, and back for display.
+ * k93_idn_to_ascii returns 1 = punycoded, 0 = plain ASCII copy, -1 = invalid.
+ * k93_idn_to_unicode returns 1 = decoded, 0 = plain ASCII copy, -1 = invalid. */
+int  k93_idn_to_ascii(const char *host, char *out, size_t cap);
+int  k93_idn_to_unicode(const char *ace, char *out, size_t cap);
+
 void k93net_init(void);           /* load proxy.conf; idempotent */
 void k93net_set_ua(const char *ua);   /* default "K93/1.0 (clean-room)" */
 /* set proxy programmatically (e.g. from HTTP(S)_PROXY env); ignored when

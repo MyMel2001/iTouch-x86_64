@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <netdb.h>
 #include <sys/socket.h>
@@ -157,6 +159,253 @@ void url_absolutize(const char *base, const char *rel, char *out, size_t cap)
     snprintf(out, cap, "%s%s%s", org, dir, rel);
 }
 
+/* --------------------------------------------------------------------- IDN */
+/* RFC 3492 punycode, clean-room. iOS 4.2 shipped "Chinese URL" support in
+ * Safari: internationalized hostnames must be punycoded (xn--...) before DNS
+ * and TLS, and non-ASCII request paths percent-encoded. */
+
+enum { PUNY_BASE = 36, PUNY_TMIN = 1, PUNY_TMAX = 26, PUNY_SKEW = 38,
+       PUNY_DAMP = 700, PUNY_BIAS = 72, PUNY_N0 = 128, PUNY_MAXCP = 256 };
+
+static int puny_adapt(int delta, int numpoints, int first)
+{
+    delta = first ? delta / PUNY_DAMP : delta / 2;
+    delta += delta / numpoints;
+    int k = 0;
+    while (delta > ((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX) / 2) {
+        delta /= PUNY_BASE - PUNY_TMIN;
+        k += PUNY_BASE;
+    }
+    return k + (((PUNY_BASE - PUNY_TMIN + 1) * delta) / (delta + PUNY_SKEW));
+}
+
+static int u32_decode(const char *s, size_t n, uint32_t *out)
+{
+    size_t i = 0;
+    int o = 0;
+    while (i < n && o < PUNY_MAXCP) {
+        unsigned c = (unsigned char)s[i];
+        uint32_t cp;
+        int extra;
+        if (c < 0x80) { cp = c; extra = 0; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu; extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu; extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u; extra = 3; }
+        else return -1;
+        if (i + (size_t)extra >= n) return -1;
+        for (int k = 0; k < extra; k++) {
+            unsigned cc = (unsigned char)s[i + 1 + k];
+            if ((cc & 0xC0) != 0x80) return -1;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (cp > 0x10FFFF) return -1;
+        i += (size_t)extra + 1;
+        out[o++] = (uint32_t)cp;
+    }
+    return o;
+}
+
+static int u32_encode(const uint32_t *in, int n, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t cp = in[i];
+        if (cp < 0x80) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = (char)cp;
+        } else {
+            int extra = cp < 0x800 ? 1 : (cp < 0x10000 ? 2 : 3);
+            if (o + (size_t)extra + 1 >= cap) return -1;
+            static const unsigned char m[4] = { 0, 0xC0, 0xE0, 0xF0 };
+            out[o++] = (char)(m[extra] | (cp >> (6 * extra)));
+            for (int k = extra - 1; k >= 0; k--)
+                out[o++] = (char)(0x80 | ((cp >> (6 * k)) & 0x3F));
+        }
+    }
+    out[o] = 0;
+    return (int)o;
+}
+
+static int puny_encode(const uint32_t *in, int n, char *out, size_t cap)
+{
+    size_t o = 0;
+    int nn = PUNY_N0, delta = 0, bias = PUNY_BIAS;
+    int h = 0;
+    for (int i = 0; i < n; i++)
+        if (in[i] < 128) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = (char)in[i];
+            h++;
+        }
+    int b = h;
+    if (b > 0) {                          /* delimiter after the literal part */
+        if (o + 1 >= cap) return -1;
+        out[o++] = '-';
+    }
+    while (h < n) {
+        uint32_t m = 0x7FFFFFFF;
+        for (int i = 0; i < n; i++) if (in[i] >= (uint32_t)nn && in[i] < m) m = in[i];
+        delta += (int)((m - (uint32_t)nn) * (uint32_t)(h + 1));
+        nn = (int)m;
+        for (int i = 0; i < n; i++) {
+            if (in[i] < (uint32_t)nn) { delta++; continue; }
+            if (in[i] != (uint32_t)nn) continue;
+            long q = delta;
+            for (int k = PUNY_BASE;; k += PUNY_BASE) {
+                int t = k <= bias ? PUNY_TMIN : (k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias);
+                if (q < t) break;
+                if (o + 1 >= cap) return -1;
+                out[o++] = "abcdefghijklmnopqrstuvwxyz0123456789"[(t + (int)((q - t) % (PUNY_BASE - t))) % 36];
+                q = (q - t) / (PUNY_BASE - t);
+            }
+            if (o + 1 >= cap) return -1;
+            out[o++] = "abcdefghijklmnopqrstuvwxyz0123456789"[q % 36];
+            bias = puny_adapt(delta, h + 1, h == b);
+            delta = 0;
+            h++;
+        }
+        delta++;
+        nn++;
+    }
+    out[o] = 0;
+    return (int)o;
+}
+
+static int puny_decode(const char *s, size_t n, uint32_t *out, int max)
+{
+    int o = 0;
+    /* literal (ASCII) part before the last '-'; none if there is no '-' */
+    const char *dash = NULL;
+    for (size_t i = 0; i < n; i++) if (s[i] == '-') dash = s + i;
+    size_t basic = dash ? (size_t)(dash - s) : 0;
+    for (size_t i = 0; i < basic; i++) {
+        if (o >= max) return -1;
+        out[o++] = (unsigned char)s[i];
+    }
+    int nn = PUNY_N0, i = 0, bias = PUNY_BIAS;
+    size_t p = dash ? basic + 1 : 0;      /* skip the delimiter */
+    while (p < n) {
+        int oldi = i, w = 1;
+        for (int k = PUNY_BASE;; k += PUNY_BASE) {
+            if (p >= n) return -1;
+            unsigned char c = (unsigned char)s[p++];
+            int digit;
+            if (c >= 'a' && c <= 'z') digit = c - 'a';
+            else if (c >= 'A' && c <= 'Z') digit = c - 'A';
+            else if (c >= '0' && c <= '9') digit = c - '0' + 26;
+            else return -1;
+            i += digit * w;
+            int t = k <= bias ? PUNY_TMIN : (k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias);
+            if (digit < t) break;
+            w *= PUNY_BASE - t;
+        }
+        bias = puny_adapt(i - oldi, o + 1, oldi == 0);
+        nn += i / (o + 1);
+        i %= (o + 1);
+        if (o >= max) return -1;
+        memmove(out + i + 1, out + i, (size_t)(o - i) * sizeof *out);
+        out[i++] = (uint32_t)nn;
+        o++;
+    }
+    return o;
+}
+
+/* One dotted host label (UTF-8 <-> punycode). */
+static int idn_label_ascii(const char *label, char *out, size_t cap)
+{
+    uint32_t cp[PUNY_MAXCP];
+    int n = u32_decode(label, strlen(label), cp);
+    if (n < 0) return -1;
+    int has_uni = 0;
+    for (int i = 0; i < n; i++) if (cp[i] >= 128) { has_uni = 1; break; }
+    if (!has_uni) { k93_strlcpy(out, label, cap); return 0; }
+    char body[512];
+    if (puny_encode(cp, n, body, sizeof body) < 0) return -1;
+    if (snprintf(out, cap, "xn--%s", body) >= (int)cap) return -1;
+    return 1;
+}
+
+static int idn_label_unicode(const char *label, char *out, size_t cap)
+{
+    if (strncasecmp(label, "xn--", 4)) { k93_strlcpy(out, label, cap); return 0; }
+    uint32_t cp[PUNY_MAXCP];
+    int n = puny_decode(label + 4, strlen(label + 4), cp, PUNY_MAXCP);
+    if (n < 0) return -1;
+    return u32_encode(cp, n, out, cap) < 0 ? -1 : 1;
+}
+
+int k93_idn_to_ascii(const char *host, char *out, size_t cap)
+{
+    if (!host || !cap) return -1;
+    size_t o = 0;
+    int any = 0;
+    const char *p = host;
+    for (;;) {
+        const char *dot = strchr(p, '.');
+        size_t ll = dot ? (size_t)(dot - p) : strlen(p);
+        char lab[128];
+        if (ll >= sizeof lab) return -1;
+        memcpy(lab, p, ll);
+        lab[ll] = 0;
+        char enc[192];
+        if (idn_label_ascii(lab, enc, sizeof enc) < 0) return -1;
+        if (o + strlen(enc) + 2 >= cap) return -1;
+        o += (size_t)sprintf(out + o, "%s%s", enc, dot ? "." : "");
+        if (strcmp(enc, lab)) any = 1;
+        if (!dot) break;
+        p = dot + 1;
+    }
+    return any;
+}
+
+int k93_idn_to_unicode(const char *ace, char *out, size_t cap)
+{
+    if (!ace || !cap) return -1;
+    size_t o = 0;
+    int any = 0;
+    const char *p = ace;
+    for (;;) {
+        const char *dot = strchr(p, '.');
+        size_t ll = dot ? (size_t)(dot - p) : strlen(p);
+        char lab[128];
+        if (ll >= sizeof lab) return -1;
+        memcpy(lab, p, ll);
+        lab[ll] = 0;
+        char dec[192];
+        if (idn_label_unicode(lab, dec, sizeof dec) < 0) return -1;
+        if (o + strlen(dec) + 2 >= cap) return -1;
+        o += (size_t)sprintf(out + o, "%s%s", dec, dot ? "." : "");
+        if (strcmp(dec, lab)) any = 1;
+        if (!dot) break;
+        p = dot + 1;
+    }
+    return any;
+}
+
+/* Percent-encode a request target: bytes >= 0x80, space and the URL
+ * delimiters get %XX; an existing %XX sequence is left alone. */
+static void url_enc_path(const char *in, char *out, size_t cap)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        unsigned char c = *p;
+        int enc = (c >= 0x80 || c <= 0x20 || c == '"' || c == '<' || c == '>' ||
+                   c == '`' || c == '{' || c == '}' || c == '|' || c == '\\' ||
+                   c == '^' || c == 0x7F);
+        if (enc) {
+            if (o + 4 >= cap) break;
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 15];
+        } else {
+            if (o + 2 >= cap) break;
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = 0;
+}
+
 /* ---------------------------------------------------------------- transport */
 
 struct k93conn {
@@ -169,11 +418,14 @@ static int dial(const char *host, int port)
 {
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
+    char ace[256];                        /* IDN hosts resolve as xn--... */
+    if (k93_idn_to_ascii(host, ace, sizeof ace) < 0)
+        k93_strlcpy(ace, host, sizeof ace);
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
+    if (getaddrinfo(ace, portstr, &hints, &res) != 0 || !res) return -1;
     int fd = -1;
     for (struct addrinfo *a = res; a; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
@@ -230,9 +482,12 @@ struct k93conn *k93net_open(const struct url *u, char *err, size_t errlen)
             close(c->fd); free(c); return NULL;
         }
         /* tunnel through the proxy first when one is configured */
+        char ace_host[256];
+        if (k93_idn_to_ascii(u->host, ace_host, sizeof ace_host) < 0)
+            k93_strlcpy(ace_host, u->host, sizeof ace_host);
         if (PX.proxy_enable && PX.proxy_host[0]) {
             char req[512];
-            int n = snprintf(req, sizeof req, "CONNECT %s:%d HTTP/1.0\r\n\r\n", u->host, u->port);
+            int n = snprintf(req, sizeof req, "CONNECT %s:%d HTTP/1.0\r\n\r\n", ace_host, u->port);
             if (write(c->fd, req, (size_t)n) != n) {
                 snprintf(err, errlen, "proxy write failed");
                 close(c->fd); free(c); return NULL;
@@ -256,7 +511,7 @@ struct k93conn *k93net_open(const struct url *u, char *err, size_t errlen)
             snprintf(err, errlen, "TLS setup failed");
             close(c->fd); free(c); return NULL;
         }
-        mbedtls_ssl_set_hostname(&c->ssl, u->host);
+        mbedtls_ssl_set_hostname(&c->ssl, ace_host);
         mbedtls_net_context nb;
         mbedtls_net_init(&nb);
         nb.fd = c->fd;
@@ -322,21 +577,30 @@ const char *k93net_last_location(void) { return location; }
 char *k93net_read_http(struct k93conn *c, const struct url *u, int *status,
                        char *err, size_t errlen)
 {
-    char req[2048];
+    char req[4096];
+    char ace_host[256];
+    char enc_path[3072];
     int n;
     location[0] = 0;
+    if (k93_idn_to_ascii(u->host, ace_host, sizeof ace_host) < 0)
+        k93_strlcpy(ace_host, u->host, sizeof ace_host);
+    url_enc_path(u->path, enc_path, sizeof enc_path);
     if (PX.proxy_enable && PX.proxy_host[0] && !strcmp(u->scheme, "http")) {
         n = snprintf(req, sizeof req,
                      "GET %s://%s:%d%s HTTP/1.0\r\n"
                      "Host: %s\r\nUser-Agent: %s\r\n"
                      "Accept: text/html,*/*\r\nConnection: close\r\n\r\n",
-                     u->scheme, u->host, u->port, u->path, u->host, ua);
+                     u->scheme, ace_host, u->port, enc_path, ace_host, ua);
     } else {
         n = snprintf(req, sizeof req,
                      "GET %s HTTP/1.0\r\n"
                      "Host: %s\r\nUser-Agent: %s\r\n"
                      "Accept: text/html,*/*\r\nConnection: close\r\n\r\n",
-                     u->path, u->host, ua);
+                     enc_path, ace_host, ua);
+    }
+    if (n < 0 || n >= (int)sizeof req) {
+        snprintf(err, errlen, "request too long");
+        return NULL;
     }
     if (conn_write(c, req, (size_t)n) < 0) { snprintf(err, errlen, "write failed"); return NULL; }
 
