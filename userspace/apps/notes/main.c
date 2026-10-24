@@ -17,6 +17,17 @@ static void sanitize(char *s)
     for (; *s; s++) if (*s == '/' || *s == '\n' || *s == '\r') *s = '_';
 }
 
+/* iOS 4.0 spellcheck: after saving, list words the dictionary doesn't know */
+static void spell_report(const char *body)
+{
+    char unk[512];
+    if (k93_spell_unknown(body, unk, sizeof unk) > 0) {
+        char m[600];
+        snprintf(m, sizeof m, "Possible misspellings:\n\n%s", unk);
+        ui_msgbox("Notes", m);
+    }
+}
+
 int main(void)
 {
     if (ui_init("Notes") < 0) return 1;
@@ -62,6 +73,7 @@ int main(void)
                 char body[16000] = "";
                 ui_editbox(title, body, sizeof body);
                 k93_write_file(path, body, strlen(body), 0);
+                spell_report(body);
                 snprintf(msg, sizeof msg, "saved %s", title);
             }
             continue;
@@ -78,6 +90,7 @@ int main(void)
         else if (a == 1) {
             ui_editbox(names[sel], body, sizeof body);
             k93_write_file(path, body, strlen(body), 0);
+            spell_report(body);
             snprintf(msg, sizeof msg, "saved %s", names[sel]);
         } else if (a == 2) {
             if (ui_confirm("Delete", "Delete this note?")) {

@@ -23,6 +23,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -56,6 +57,7 @@ static struct {
     int zoom;                          /* 1,2,4,8 digital */
     int rec;
     int af_supported, af_on;
+    int flash;                        /* iOS 4.0 LED flash (sysfs LED node) */
     int fx, fy;                        /* tap-to-focus point, percent; -1 none */
     long fshow_until;
     int px0, py0, ppw, pph;            /* preview rect (for tap mapping) */
@@ -493,9 +495,29 @@ static void yuyv_to_rgba(const unsigned char *s, int sw, int sh,
 
 /* ------------------------------------------------------------- stills */
 
+/* iOS 4.0 LED flash: drive any sysfs LED node on during capture. Best effort -
+ * hardware without a controllable LED simply has nothing to light. */
+static void led_flash(int on)
+{
+    DIR *d = opendir("/sys/class/leds");
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char p[128];
+        snprintf(p, sizeof p, "/sys/class/leds/%s/brightness", e->d_name);
+        int fd = open(p, O_WRONLY);
+        if (fd >= 0) {
+            if (write(fd, on ? "255" : "0", on ? 3 : 1) < 0) { /* best effort */ }
+            close(fd);
+        }
+    }
+    if (d) closedir(d);
+}
+
 static void snapshot(void)
 {
     if (!K.prev || K.pw <= 0) { say("nothing to capture yet"); return; }
+    if (K.flash) led_flash(1);
     char path[256];
     time_t t = time(NULL);
     struct tm tm;
@@ -531,6 +553,7 @@ static void snapshot(void)
         free(row);
     }
     fclose(f);
+    if (K.flash) led_flash(0);
     char m[96];
     snprintf(m, sizeof m, "saved %s", strrchr(path, '/') + 1);
     say(m);
@@ -668,10 +691,11 @@ static void draw(int new_frame, long now)
 
     char hint[176];
     snprintf(hint, sizeof hint,
-             "%s  +/-:zoom  F:AF(%s)  C:cam  click:focus  SPACE:photo  %s  Q:quit",
+             "%s  +/-:zoom  F:AF(%s)  L:flash(%s)  C:cam  click:focus  SPACE:photo  %s  Q:quit",
              K.streaming ? K.dev[K.cur].path : "pattern",
              K.streaming ? (K.af_supported ? (K.af_on ? "auto" : "off")
                                            : "fixed") : "n/a",
+             K.flash ? "on" : "off",
              K.rec ? "R:stop" : "R:rec");
     ui_statusmsg(hint);
 
@@ -786,6 +810,9 @@ int main(void)
                 if (K.zoom > 1) K.zoom /= 2;
             } else if (k == UI_KEY_CHAR_BASE + 'f') {
                 set_af(!K.af_on);
+            } else if (k == UI_KEY_CHAR_BASE + 'l') {
+                K.flash = !K.flash;
+                say(K.flash ? "flash on" : "flash off");
             } else if (k == UI_KEY_CHAR_BASE + 'c') {
                 if (K.rec) say("stop recording before switching camera");
                 else { cam_cycle(); new_frame = 1; }

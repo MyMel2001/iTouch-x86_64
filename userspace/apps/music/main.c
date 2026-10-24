@@ -161,6 +161,39 @@ static void play_wav(const char *path)
     ui_statusmsg("Stopped");
 }
 
+/* iOS 4.3 iTunes Home Sharing: when enabled, export the whole library as a
+ * shared .m3u that other iTunes instances on the network can read. */
+static void home_sharing(void)
+{
+    size_t l = 0;
+    char *c = k93_read_file("/etc/k93/homesharing.conf", &l);
+    int on = 0;
+    if (c) {
+        for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n"))
+            if (!strncmp(line, "ENABLE=", 7)) on = atoi(line + 7);
+        free(c);
+    }
+    if (!on) {
+        ui_msgbox("Music", "Home Sharing is OFF.\nEnable it in Settings > Home Sharing.");
+        return;
+    }
+    char names[64][128];
+    int ns = list_songs(names, 64);
+    char path[256];
+    snprintf(path, sizeof path, "/var/mobile/Library/Playlists/Shared Library.m3u");
+    FILE *f = fopen(path, "w");
+    if (f) {
+        for (int i = 0; i < ns; i++) fprintf(f, "%s/%s\n", DIRN, names[i]);
+        fclose(f);
+    }
+    char body[384];
+    snprintf(body, sizeof body,
+             "Home Sharing ON.\n\nShared library written to:\n%s\n\n"
+             "A full iTunes share needs a DAAP/HTTP server\n"
+             "on the local network (see README ceilings).", path);
+    ui_msgbox("Music", body);
+}
+
 int main(void)
 {
     if (ui_init("Music") < 0) return 1;
@@ -189,6 +222,7 @@ int main(void)
             items[n++] = titles[i];
         }
         items[n++] = "All songs";
+        items[n++] = "Home Sharing";
         items[n++] = "Back";
 
         int sel = ui_menu("Music", items, n, 0);
@@ -211,26 +245,30 @@ int main(void)
             continue;
         }
         /* All songs */
-        char names[64][128];
-        const char *sitems[66];
-        int ns = list_songs(names, 64);
-        if (ns == 0) { ui_msgbox("Music", "No songs."); continue; }
-        for (int i = 0; i < ns; i++) sitems[i] = names[i];
-        sitems[ns] = "Cancel";
-        int s = ui_menu("All songs", sitems, ns + 1, 0);
-        if (s < 0 || s == ns) continue;
-        char path[256];
-        snprintf(path, sizeof path, "%s/%s", DIRN, names[s]);
-        struct stat st;
-        char info[256];
-        if (stat(path, &st) == 0) {
-            char h[32];
-            k93_human_size(h, sizeof h, (unsigned long long)st.st_size);
-            snprintf(info, sizeof info, "%s\n%s\n\nPlay this file?", names[s], h);
-        } else {
-            snprintf(info, sizeof info, "%s\n\nPlay this file?", names[s]);
+        if (sel == n - 3) {
+            char names[64][128];
+            const char *sitems[66];
+            int ns = list_songs(names, 64);
+            if (ns == 0) { ui_msgbox("Music", "No songs."); continue; }
+            for (int i = 0; i < ns; i++) sitems[i] = names[i];
+            sitems[ns] = "Cancel";
+            int s = ui_menu("All songs", sitems, ns + 1, 0);
+            if (s < 0 || s == ns) continue;
+            char path[256];
+            snprintf(path, sizeof path, "%s/%s", DIRN, names[s]);
+            struct stat st;
+            char info[256];
+            if (stat(path, &st) == 0) {
+                char h[32];
+                k93_human_size(h, sizeof h, (unsigned long long)st.st_size);
+                snprintf(info, sizeof info, "%s\n%s\n\nPlay this file?", names[s], h);
+            } else {
+                snprintf(info, sizeof info, "%s\n\nPlay this file?", names[s]);
+            }
+            if (ui_confirm("Music", info)) play_wav(path);
+            continue;
         }
-        if (ui_confirm("Music", info)) play_wav(path);
+        if (sel == n - 2) { home_sharing(); continue; }
     }
     ui_shutdown();
     return 0;

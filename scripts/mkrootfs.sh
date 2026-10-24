@@ -232,6 +232,14 @@ try_sans || true
 try_serif || true
 try_mono || true
 
+# spellcheck dictionary: the host's word list when present (clean-room apps
+# read it; absent dictionary = spellcheck accepts every word).
+mkdir -p "$ROOT/usr/share/dict"
+if [ -s /usr/share/dict/words ]; then
+    install -m 0644 /usr/share/dict/words "$ROOT/usr/share/dict/words"
+    echo "k93rootfs: spellcheck dictionary installed"
+fi
+
 # ------------------------------------------------------------- config
 cat > "$ROOT/etc/k93/proxy.conf" <<'EOF'
 # K93OS HTTP proxy configuration (read by Safari and network tools)
@@ -251,6 +259,36 @@ EOF
 cat > "$ROOT/etc/k93/accessibility.conf" <<'EOF'
 # K93OS accessibility settings (read by text apps)
 LARGE_TEXT=0
+EOF
+
+# iOS 4.2 AirPlay / AirPrint, 4.3 Home Sharing, 4.0 Spellcheck, 4.3 Personal
+# Hotspot, 4.2 Find My iPhone - on/off flags consumed by apps and SpringBoard.
+cat > "$ROOT/etc/k93/airplay.conf" <<'EOF'
+# K93OS AirPlay (Settings > AirPlay)
+ENABLE=0
+EOF
+cat > "$ROOT/etc/k93/airprint.conf" <<'EOF'
+# K93OS AirPrint (Settings > AirPrint)
+ENABLE=0
+EOF
+cat > "$ROOT/etc/k93/homesharing.conf" <<'EOF'
+# K93OS iTunes Home Sharing (Settings > Home Sharing)
+ENABLE=0
+EOF
+cat > "$ROOT/etc/k93/spellcheck.conf" <<'EOF'
+# K93OS spellcheck (Settings > Spellcheck)
+ENABLE=1
+EOF
+cat > "$ROOT/etc/k93/hotspot.conf" <<'EOF'
+# K93OS Personal Hotspot (Settings > Personal Hotspot)
+ENABLE=0
+SSID=K93OS
+PASSWORD=
+EOF
+cat > "$ROOT/etc/k93/findmy.conf" <<'EOF'
+# K93OS Find My iPhone flags (Settings > Find My iPhone)
+LOCK=0
+WIPE=0
 EOF
 
 # display: landscape default (spare-PC monitor stays physically landscape);

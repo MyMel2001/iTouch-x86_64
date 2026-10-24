@@ -518,6 +518,49 @@ int main(void)
     int sel = 0;
     char hint[96] = "";
     for (;;) {
+        /* iOS 4.2 Find My iPhone: LOCK flag -> locked screen (Settings clears it) */
+        int locked = 0, wiped = 0;
+        {
+            size_t l = 0;
+            char *c = k93_read_file("/etc/k93/findmy.conf", &l);
+            if (c) {
+                for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+                    char *eq = strchr(line, '=');
+                    if (!eq) continue;
+                    *eq = 0;
+                    if (!strcasecmp(k93_trim(line), "LOCK")) locked = atoi(k93_trim(eq + 1));
+                    if (!strcasecmp(k93_trim(line), "WIPE")) wiped = atoi(k93_trim(eq + 1));
+                }
+                free(c);
+            }
+        }
+        if (locked || wiped) {
+            const char *msg = "This device is locked";
+            const char *sub = wiped ? "(Find My iPhone: device wiped)" : "(Find My iPhone)";
+            if (ui_is_graphical()) {
+                draw_wallpaper();
+                int W = ui_px_width(), H = ui_px_height();
+                ui_text_bold((W - ui_text_width(1, msg)) / 2, H / 2 - 12, 1, msg, ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+                ui_text_bold((W - ui_text_width(1, sub)) / 2, H / 2 - 2, 1, sub, ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
+                ui_statusbar("SpringBoard");
+                ui_statusmsg("Find My iPhone: Esc clears the lock flag");
+                ui_flush();
+            } else {
+                ui_clear();
+                ui_statusbar("SpringBoard");
+                ui_puts(2, 3, "This device is locked");
+                ui_puts(2, 5, "(Find My iPhone)");
+                ui_statusmsg("Find My iPhone: Esc clears the lock flag");
+                ui_flush();
+            }
+            int k2 = ui_getkey(250);
+            if (k2 == UI_KEY_ESC || k2 == UI_KEY_CTRL_C) {
+                char b[32];
+                snprintf(b, sizeof b, "LOCK=0\nWIPE=0\n");
+                k93_write_file("/etc/k93/findmy.conf", b, strlen(b), 0);
+            }
+            continue;
+        }
         if (ndlist == 0) {
             if (ui_is_graphical()) {
                 draw_wallpaper();

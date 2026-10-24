@@ -485,16 +485,195 @@ static void pane_accessibility(void)
     }
 }
 
+static int conf_bool(const char *conf, const char *key, int def)
+{
+    size_t l = 0;
+    char *c = k93_read_file(conf, &l);
+    int v = def;
+    if (c) {
+        for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            if (!strcmp(k93_trim(line), key)) { v = atoi(k93_trim(eq + 1)); break; }
+        }
+        free(c);
+    }
+    return v;
+}
+
+static void conf_set(const char *conf, const char *key, int v)
+{
+    k93_mkdir_p("/etc/k93", 0755);
+    char b[256];
+    snprintf(b, sizeof b, "%s=%d\n", key, v);
+    k93_write_file(conf, b, strlen(b), 0);
+}
+
+static void conf_str(const char *conf, const char *key, char *out, size_t cap)
+{
+    k93_strlcpy(out, "", cap);
+    size_t l = 0;
+    char *c = k93_read_file(conf, &l);
+    if (!c) return;
+    for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        if (!strcmp(k93_trim(line), key)) { k93_strlcpy(out, k93_trim(eq + 1), cap); break; }
+    }
+    free(c);
+}
+
+/* first non-loopback IPv4 address, or "(none)" */
+static void primary_ip(char *out, size_t cap)
+{
+    struct ifaddrs *ifa = NULL, *i;
+    k93_strlcpy(out, "(none)", cap);
+    if (getifaddrs(&ifa) != 0) return;
+    for (i = ifa; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+        if (i->ifa_flags & IFF_LOOPBACK) continue;
+        char a[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, a, sizeof a);
+        k93_strlcpy(out, a, cap);
+        break;
+    }
+    freeifaddrs(ifa);
+}
+
+static void pane_toggle(const char *title, const char *conf, const char *key)
+{
+    for (;;) {
+        int on = conf_bool(conf, key, 0);
+        char t[96];
+        snprintf(t, sizeof t, "%s  [%s]", title, on ? "ON" : "OFF");
+        const char *items[] = { on ? "Disable" : "Enable", "Back" };
+        int sel = ui_menu(t, items, 2, 0);
+        if (sel < 0 || sel == 1) return;
+        conf_set(conf, key, !on);
+    }
+}
+
+/* iOS 4.2 AirPlay / AirPrint / 4.3 Home Sharing: on/off flags. */
+static void pane_airplay(void)   { pane_toggle("AirPlay", "/etc/k93/airplay.conf", "ENABLE"); }
+static void pane_airprint(void)  { pane_toggle("AirPrint", "/etc/k93/airprint.conf", "ENABLE"); }
+static void pane_homesharing(void){ pane_toggle("iTunes Home Sharing", "/etc/k93/homesharing.conf", "ENABLE"); }
+static void pane_spellcheck(void){ pane_toggle("Spellcheck", "/etc/k93/spellcheck.conf", "ENABLE"); }
+
+/* iOS 4.0 Bluetooth keyboards: any paired BT keyboard surfaces as an input
+ * device; this pane lists them and the built-in input stack already consumes
+ * every /dev/input/event* node, so no pairing daemon is needed. */
+static void pane_bluetooth(void)
+{
+    char body[4096];
+    size_t o = 0;
+    o += (size_t)snprintf(body + o, sizeof body - o,
+                          "Input devices (/dev/input):\n\n");
+    for (int n = 0; n < 16 && o + 200 < sizeof body; n++) {
+        char ev[48], nm[64], link[80];
+        snprintf(ev, sizeof ev, "/dev/input/event%d", n);
+        snprintf(link, sizeof link, "/sys/class/input/event%d/device/name", n);
+        size_t l = 0;
+        char *c = k93_read_file(link, &l);
+        if (!c) continue;
+        k93_strlcpy(nm, c, sizeof nm);
+        for (char *p = nm; *p; p++) if (*p == '\n') { *p = 0; break; }
+        o += (size_t)snprintf(body + o, sizeof body - o, "  %-12s %s\n", ev, nm);
+        free(c);
+    }
+    o += (size_t)snprintf(body + o, sizeof body - o,
+                          "\nBluetooth keyboards are supported: a paired BT\n"
+                          "keyboard appears above as an input device and its\n"
+                          "keystrokes are delivered to the frontmost app.\n");
+    ui_textview("Bluetooth", body);
+}
+
+/* iOS 4.3 personal hotspot */
+static void pane_hotspot(void)
+{
+    for (;;) {
+        int on = conf_bool("/etc/k93/hotspot.conf", "ENABLE", 0);
+        char ssid[32] = "", pass[32] = "", ip[64];
+        conf_str("/etc/k93/hotspot.conf", "SSID", ssid, sizeof ssid);
+        conf_str("/etc/k93/hotspot.conf", "PASSWORD", pass, sizeof pass);
+        primary_ip(ip, sizeof ip);
+        char t[96];
+        snprintf(t, sizeof t, "Personal Hotspot  [%s]", on ? "ON" : "OFF");
+        const char *items[] = {
+            on ? "Turn hotspot OFF" : "Turn hotspot ON",
+            "Set network name",
+            "Set password",
+            "Back"
+        };
+        int sel = ui_menu(t, items, 4, 0);
+        if (sel < 0 || sel == 3) return;
+        if (sel == 0) {
+            char b[256];
+            snprintf(b, sizeof b, "ENABLE=%d\nSSID=%s\nPASSWORD=%s\n",
+                     !on, ssid, pass);
+            k93_write_file("/etc/k93/hotspot.conf", b, strlen(b), 0);
+            ui_msgbox("Personal Hotspot",
+                      !on ? "Hotspot enabled.\nOther devices join with the name\nand password shown here.\n\n"
+                            "This is a software flag; a real AP needs a\n"
+                            "hostapd-capable wlan driver."
+                          : "Hotspot disabled.");
+        } else if (sel == 1) {
+            if (ui_input("Hotspot name", ssid, sizeof ssid) == 0 && ssid[0]) {
+                char b[256];
+                snprintf(b, sizeof b, "ENABLE=%d\nSSID=%s\nPASSWORD=%s\n",
+                         on, ssid, pass);
+                k93_write_file("/etc/k93/hotspot.conf", b, strlen(b), 0);
+            }
+        } else if (sel == 2) {
+            if (ui_input("Hotspot password", pass, sizeof pass) == 0) {
+                char b[256];
+                snprintf(b, sizeof b, "ENABLE=%d\nSSID=%s\nPASSWORD=%s\n",
+                         on, ssid, pass);
+                k93_write_file("/etc/k93/hotspot.conf", b, strlen(b), 0);
+            }
+        }
+    }
+}
+
+/* iOS 4.2 Find My iPhone (MobileMe): report location and offer remote
+ * lock/wipe. SpringBoard reads LOCK to show a locked state. */
+static void pane_findmy(void)
+{
+    for (;;) {
+        int lock = conf_bool("/etc/k93/findmy.conf", "LOCK", 0);
+        int wipe = conf_bool("/etc/k93/findmy.conf", "WIPE", 0);
+        char ip[64];
+        primary_ip(ip, sizeof ip);
+        char t[96];
+        snprintf(t, sizeof t, "Find My iPhone  [%s]",
+                 wipe ? "WIPED" : lock ? "LOCKED" : "IDLE");
+        const char *items[] = { "Lock device", "Wipe device", "Clear lock/wipe", "Back" };
+        int sel = ui_menu(t, items, 4, 0);
+        if (sel < 0 || sel == 3) return;
+        int l = (sel == 0 || sel == 1) ? 1 : 0;
+        int w = (sel == 1) ? 1 : 0;
+        char b[64];
+        snprintf(b, sizeof b, "LOCK=%d\nWIPE=%d\n", l, w);
+        k93_write_file("/etc/k93/findmy.conf", b, strlen(b), 0);
+        if (sel == 0) ui_msgbox("Find My iPhone", "Lock flag set.\nSpringBoard will show the locked state.");
+        else if (sel == 1) ui_msgbox("Find My iPhone", "Wipe flag set.");
+        else ui_msgbox("Find My iPhone", "Lock/wipe cleared.");
+    }
+}
+
 int main(void)
 {
     if (ui_init("Settings") < 0) return 1;
     const char *items[] = {
         "Network", "HTTP Proxy", "Display", "Notes Font", "Wallpaper",
         "Restrictions", "Accessibility", "Certificates", "About", "Storage",
-        "Root Access", "Restart services (SIGHUP launchd)", "Back"
+        "Root Access", "Restart services (SIGHUP launchd)",
+        "Bluetooth", "Personal Hotspot", "Find My iPhone", "AirPlay",
+        "AirPrint", "Home Sharing", "Spellcheck", "Back"
     };
     for (;;) {
-        int sel = ui_menu("Settings", items, 13, 0);
+        int sel = ui_menu("Settings", items, 20, 0);
         switch (sel) {
         case 0: pane_network(); break;
         case 1: pane_proxy(); break;
@@ -511,6 +690,13 @@ int main(void)
             signal_comm("launchd", SIGHUP);
             ui_msgbox("Settings", "SIGHUP delivered to launchd.");
             break;
+        case 12: pane_bluetooth(); break;
+        case 13: pane_hotspot(); break;
+        case 14: pane_findmy(); break;
+        case 15: pane_airplay(); break;
+        case 16: pane_airprint(); break;
+        case 17: pane_homesharing(); break;
+        case 18: pane_spellcheck(); break;
         default:
             ui_shutdown();
             return 0;

@@ -96,6 +96,29 @@ static void install_deb_ui(const char *path)
     else ui_msgbox("Installer failed", err);
 }
 
+/* iOS 4.2 AirPrint: with the flag on, stage the file into a print queue dir.
+ * A real network print needs a CUPS/IPP client (ceiling). */
+static void print_ui(const char *path)
+{
+    size_t l = 0;
+    char *c = k93_read_file("/etc/k93/airprint.conf", &l);
+    int on = 0;
+    if (c) {
+        for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n"))
+            if (!strncmp(line, "ENABLE=", 7)) on = atoi(line + 7);
+        free(c);
+    }
+    if (!on) { ui_msgbox("AirPrint", "AirPrint is OFF.\nEnable it in Settings > AirPrint."); return; }
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    char dir[256], dst[600];
+    snprintf(dir, sizeof dir, "/var/mobile/Library/Prints");
+    mkdir(dir, 0755);
+    snprintf(dst, sizeof dst, "%s/%s", dir, base);
+    if (k93_copy_file(path, dst, 0644) == 0) ui_statusmsg("sent to print queue");
+    else ui_statusmsg("print failed");
+}
+
 /* dispatch on extension: .ipa -> app bundle install, .deb -> package extract */
 static void install_ui(const char *path)
 {
@@ -202,12 +225,14 @@ int main(int argc, char **argv)
             continue;
         }
         /* file action menu */
-        const char *fa[] = { "Open / View", "Install (ipa/deb)", "Convert (dmg)", "Delete", "Cancel" };
-        int f = ui_menu(ents[sel].name, fa, 5, 0);
+        const char *fa[] = { "Open / View", "Install (ipa/deb)", "Convert (dmg)",
+                             "Print", "Delete", "Cancel" };
+        int f = ui_menu(ents[sel].name, fa, 6, 0);
         if (f == 0) view_file(full);
         else if (f == 1) install_ui(full);
         else if (f == 2) install_dmg_ui(full);
-        else if (f == 3) {
+        else if (f == 3) print_ui(full);
+        else if (f == 4) {
             char q[512];
             snprintf(q, sizeof q, "Really delete?\n%s", full);
             if (ui_confirm("Delete", q)) {
