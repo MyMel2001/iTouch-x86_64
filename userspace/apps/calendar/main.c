@@ -10,6 +10,20 @@
 #include <time.h>
 
 #define EVENTS "/var/mobile/Library/Calendar/events.txt"
+#define A11Y_CONF "/etc/k93/accessibility.conf"
+
+/* iOS 4.3 Accessibility > Large Text (Mail/Calendar/Contacts list size) */
+static int large_text(void)
+{
+    size_t l = 0;
+    char *c = k93_read_file(A11Y_CONF, &l);
+    if (!c) return 0;
+    int on = 0;
+    for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n"))
+        if (!strncmp(line, "LARGE_TEXT=", 11)) on = atoi(line + 11);
+    free(c);
+    return on;
+}
 
 static int dim(int y, int m)
 {
@@ -140,7 +154,7 @@ int main(void)
             char wrapped[4600];
             snprintf(wrapped, sizeof wrapped,
                      "%s\n[A]dd  [D]elete last  [I]mport .ics  [Esc]close", body);
-            ui_textview(title, wrapped);
+            ui_textview_scale(title, wrapped, large_text() ? 2 : 1);
             int k2 = ui_getkey(600);
             if (k2 == UI_KEY_CHAR_BASE + 'a' || k2 == UI_KEY_CHAR_BASE + 'A') {
                 char ev[160] = "";

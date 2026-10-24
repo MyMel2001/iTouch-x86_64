@@ -80,6 +80,7 @@ void ui_msgbox(const char *title, const char *body);    /* any key closes */
 int  ui_confirm(const char *title, const char *body);   /* 1=yes 0=no */
 int  ui_input(const char *prompt, char *buf, size_t cap);
 int  ui_textview(const char *title, const char *text);
+int  ui_textview_scale(const char *title, const char *text, int scale); /* Large Text */
 
 /* --- styled page view (Safari): multi-run lines, colors, images, links ---
  * One run = one text span with its own color/bold/link. A line can also be

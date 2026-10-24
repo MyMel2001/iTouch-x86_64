@@ -373,27 +373,141 @@ static void pane_wallpaper(void)
     }
 }
 
+/* iOS 4.0: Restrictions (parental controls). Writes /etc/k93/restrictions.conf;
+ * SpringBoard hides any app whose ALLOW_<leaf> is 0. */
+#define RESTRICT_CONF "/etc/k93/restrictions.conf"
+
+static int restrict_allowed(const char *leaf)
+{
+    size_t l = 0;
+    char *c = k93_read_file(RESTRICT_CONF, &l);
+    if (!c) return 1;
+    char key[64];
+    snprintf(key, sizeof key, "ALLOW_%s", leaf);
+    int allowed = 1;
+    for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        if (!strcasecmp(k93_trim(line), key)) { allowed = atoi(k93_trim(eq + 1)); break; }
+    }
+    free(c);
+    return allowed;
+}
+
+static void restrict_set(const char *leaf, int val)
+{
+    char key[64];
+    snprintf(key, sizeof key, "ALLOW_%s", leaf);
+    size_t l = 0;
+    char *c = k93_read_file(RESTRICT_CONF, &l);
+    char out[2048];
+    size_t o = 0;
+    int found = 0;
+    if (c) {
+        for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+            char *eq = strchr(line, '=');
+            if (eq) {
+                *eq = 0;
+                if (!strcasecmp(k93_trim(line), key)) {
+                    o += (size_t)snprintf(out + o, sizeof out - o, "%s=%d\n", key, val);
+                    found = 1;
+                    continue;
+                }
+                *eq = '=';
+            }
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s\n", line);
+        }
+        free(c);
+    }
+    if (!found) o += (size_t)snprintf(out + o, sizeof out - o, "%s=%d\n", key, val);
+    k93_mkdir_p("/etc/k93", 0755);
+    k93_write_file(RESTRICT_CONF, out, o, 0);
+}
+
+static void pane_restrictions(void)
+{
+    static const char *names[] = {
+        "Safari", "YouTube", "Music", "Store", "Photos", "Camera",
+        "iBooks", "Calculator", "Voice Memos", "Game Center", "Maps"
+    };
+    static const char *ids[] = {
+        "safari", "youtube", "music", "store", "photos", "camera",
+        "ibooks", "calculator", "voicememos", "gamecenter", "maps"
+    };
+    int na = (int)(sizeof names / sizeof names[0]);
+    for (;;) {
+        static char buf[16][64];
+        const char *items[18];
+        int n = 0, off = 0;
+        for (int i = 0; i < na; i++) {
+            int on = restrict_allowed(ids[i]);
+            if (!on) off++;
+            snprintf(buf[i], sizeof buf[i], "%-12s %s", names[i], on ? "ON" : "OFF");
+            items[n++] = buf[i];
+        }
+        items[n++] = "Back";
+        char title[64];
+        snprintf(title, sizeof title, "Restrictions  (%d off)", off);
+        int sel = ui_menu(title, items, n, 0);
+        if (sel < 0 || sel == n - 1) return;
+        restrict_set(ids[sel], !restrict_allowed(ids[sel]));
+    }
+}
+
+/* iOS 4.3 Accessibility > Large Text (Mail/Calendar/Contacts list size).
+ * Calendar reads LARGE_TEXT from /etc/k93/accessibility.conf. */
+#define A11Y_CONF "/etc/k93/accessibility.conf"
+
+static int a11y_large(void)
+{
+    size_t l = 0;
+    char *c = k93_read_file(A11Y_CONF, &l);
+    if (!c) return 0;
+    int on = 0;
+    for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n"))
+        if (!strncmp(line, "LARGE_TEXT=", 11)) on = atoi(line + 11);
+    free(c);
+    return on;
+}
+
+static void pane_accessibility(void)
+{
+    for (;;) {
+        int on = a11y_large();
+        const char *items[] = { on ? "Large Text: ON" : "Large Text: OFF", "Back" };
+        int sel = ui_menu("Accessibility", items, 2, 0);
+        if (sel < 0 || sel == 1) return;
+        k93_mkdir_p("/etc/k93", 0755);
+        char b[128];
+        snprintf(b, sizeof b, "LARGE_TEXT=%d\n", !on);
+        k93_write_file(A11Y_CONF, b, strlen(b), 0);
+    }
+}
+
 int main(void)
 {
     if (ui_init("Settings") < 0) return 1;
     const char *items[] = {
         "Network", "HTTP Proxy", "Display", "Notes Font", "Wallpaper",
-        "Certificates", "About", "Storage", "Root Access",
-        "Restart services (SIGHUP launchd)", "Back"
+        "Restrictions", "Accessibility", "Certificates", "About", "Storage",
+        "Root Access", "Restart services (SIGHUP launchd)", "Back"
     };
     for (;;) {
-        int sel = ui_menu("Settings", items, 11, 0);
+        int sel = ui_menu("Settings", items, 13, 0);
         switch (sel) {
         case 0: pane_network(); break;
         case 1: pane_proxy(); break;
         case 2: pane_display(); break;
         case 3: pane_notesfont(); break;
         case 4: pane_wallpaper(); break;
-        case 5: pane_certs(); break;
-        case 6: pane_about(); break;
-        case 7: pane_storage(); break;
-        case 8: pane_root(); break;
-        case 9:
+        case 5: pane_restrictions(); break;
+        case 6: pane_accessibility(); break;
+        case 7: pane_certs(); break;
+        case 8: pane_about(); break;
+        case 9: pane_storage(); break;
+        case 10: pane_root(); break;
+        case 11:
             signal_comm("launchd", SIGHUP);
             ui_msgbox("Settings", "SIGHUP delivered to launchd.");
             break;

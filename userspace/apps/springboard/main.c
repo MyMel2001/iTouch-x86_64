@@ -154,10 +154,33 @@ static void draw_folder_cell(int cx, int cy, int cw, const folder_t *f, int sel)
 static int dlist[256];
 static int ndlist;
 
+/* iOS 4.0 Restrictions: an app is hidden when /etc/k93/restrictions.conf
+ * carries ALLOW_<ident-leaf>=0. Missing keys default to allowed. */
+static int app_allowed(const char *ident)
+{
+    const char *dot = strrchr(ident, '.');
+    const char *leaf = dot && dot[1] ? dot + 1 : ident;
+    size_t l = 0;
+    char *c = k93_read_file("/etc/k93/restrictions.conf", &l);
+    if (!c) return 1;
+    char key[64];
+    snprintf(key, sizeof key, "ALLOW_%s", leaf);
+    int allowed = 1;
+    for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        if (!strcasecmp(k93_trim(line), key)) { allowed = atoi(k93_trim(eq + 1)); break; }
+    }
+    free(c);
+    return allowed;
+}
+
 static void build_dlist(const k93_app *apps, int n)
 {
     ndlist = 0;
     for (int i = 0; i < n; i++) {
+        if (!app_allowed(apps[i].ident)) continue;
         int inf = 0;
         for (int fi = 0; fi < nfolders && !inf; fi++)
             for (int j = 0; j < folders[fi].n; j++)

@@ -240,6 +240,19 @@ PROXY_HOST=
 PROXY_PORT=0
 EOF
 
+# iOS 4.0 Restrictions (Settings > Restrictions): SpringBoard hides any app
+# whose ALLOW_<ident-leaf> is 0. Absent keys default to allowed.
+cat > "$ROOT/etc/k93/restrictions.conf" <<'EOF'
+# K93OS app restrictions (parental controls). ALLOW_<app>=1/0.
+# SpringBoard hides an app when its leaf is 0.
+EOF
+
+# iOS 4.3 Accessibility > Large Text (Settings > Accessibility).
+cat > "$ROOT/etc/k93/accessibility.conf" <<'EOF'
+# K93OS accessibility settings (read by text apps)
+LARGE_TEXT=0
+EOF
+
 # display: landscape default (spare-PC monitor stays physically landscape);
 # static orientation - no auto-rotate. Settable in Settings > Display.
 cat > "$ROOT/etc/k93/display.conf" <<'EOF'

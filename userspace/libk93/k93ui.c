@@ -2038,20 +2038,22 @@ int ui_input(const char *prompt, char *buf, size_t cap)
     }
 }
 
-static void textview_render(const char *title, char **lines, int nlines, int top, int sel)
+static void textview_render(const char *title, char **lines, int nlines, int top, int sel, int scale)
 {
     if (G.backend == BACK_FB) {
         /* document skin: white page, dark text, blue selection band */
         int px, py, pw, ph;
         gui_page(title, G.fbh_px - 64 - 24 - 12, &px, &py, &pw, &ph);
-        int view = (ph - 8) / 18; if (view < 1) view = 1;
+        int lh = 18 * scale;
+        if (lh < 1) lh = 1;
+        int view = (ph - 8) / lh; if (view < 1) view = 1;
         for (int i = 0; i < view && top + i < nlines; i++) {
-            int y = py + 4 + i * 18;
+            int y = py + 4 + i * lh;
             if (top + i == sel) {
-                ui_roundrect(px + 2, y - 1, pw - 4, 19, 4, ui_tint(GUI_SEL0, 112, 100), GUI_SEL1);
-                ui_text(px + 14, y, 1, lines[top + i], GUI_WHITE);
+                ui_roundrect(px + 2, y - 1, pw - 4, lh + 1, 4, ui_tint(GUI_SEL0, 112, 100), GUI_SEL1);
+                ui_text(px + 14, y, scale, lines[top + i], GUI_WHITE);
             } else {
-                ui_text(px + 14, y, 1, lines[top + i], GUI_INK);
+                ui_text(px + 14, y, scale, lines[top + i], GUI_INK);
             }
         }
         ui_statusmsg("Up/Dn scroll   PgUp/PgDn   Esc close");
@@ -2072,7 +2074,7 @@ static void textview_render(const char *title, char **lines, int nlines, int top
     ui_flush();
 }
 
-int ui_textview(const char *title, const char *text)
+static int textview_run(const char *title, const char *text, int scale)
 {
     size_t len = text ? strlen(text) : 0;
     char *copy = k93_xmalloc(len + 2);
@@ -2092,12 +2094,14 @@ int ui_textview(const char *title, const char *text)
         p = nl + 1;
     }
     n = idx;
+    int lh = 18 * scale;
+    if (lh < 1) lh = 1;
     int top = 0, sel = 0;
     for (;;) {
-        textview_render(title, lines, n, top, sel);
+        textview_render(title, lines, n, top, sel, scale);
         int view = G.rows - 4;
         if (G.backend == BACK_FB)
-            view = (G.fbh_px - 64 - 24 - 12 - 8) / 18;
+            view = (G.fbh_px - 64 - 24 - 12 - 8) / lh;
         if (view < 1) view = 1;
         int k = ui_getkey(250);
         switch (k) {
@@ -2112,6 +2116,19 @@ int ui_textview(const char *title, const char *text)
         if (sel < top) top = sel;
         if (sel >= top + view) top = sel - view + 1;
     }
+}
+
+int ui_textview(const char *title, const char *text)
+{
+    return textview_run(title, text, 1);
+}
+
+/* iOS 4.3 Accessibility > Large Text: same view, doubled glyph scale on the
+ * graphical backend. The text console uses a fixed 8x16 font, so it ignores
+ * the scale. */
+int ui_textview_scale(const char *title, const char *text, int scale)
+{
+    return textview_run(title, text, scale);
 }
 
 /* --------------------------------------------------- styled page view */
