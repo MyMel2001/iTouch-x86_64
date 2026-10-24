@@ -18,6 +18,70 @@
 #include <sys/ioctl.h>
 
 #define DIRN "/var/mobile/Media/Music"
+#define PL_DIR "/var/mobile/Library/Playlists"
+
+static void play_wav(const char *path);
+
+/* iOS 4.0: user-created playlists (one .m3u per list, absolute paths) */
+static int list_songs(char names[64][128], int max)
+{
+    int n = 0;
+    DIR *d = opendir(DIRN);
+    struct dirent *e;
+    while (d && (e = readdir(d)) && n < max) {
+        size_t l = strlen(e->d_name);
+        if (l < 4) continue;
+        k93_strlcpy(names[n], e->d_name, 128);
+        n++;
+    }
+    if (d) closedir(d);
+    return n;
+}
+
+static void pick_add(const char *plpath)
+{
+    for (;;) {
+        char names[64][128];
+        const char *items[66];
+        int n = list_songs(names, 64);
+        if (n == 0) { ui_msgbox("Music", "No songs in library."); return; }
+        for (int i = 0; i < n; i++) items[i] = names[i];
+        items[n] = "Cancel";
+        int sel = ui_menu("Add songs to playlist", items, n + 1, 0);
+        if (sel < 0 || sel == n) return;
+        char sp[256], l[300];
+        snprintf(sp, sizeof sp, "%s/%s", DIRN, names[sel]);
+        snprintf(l, sizeof l, "%s\n", sp);
+        k93_write_file(plpath, l, strlen(l), 1);
+        ui_statusmsg("added to playlist");
+    }
+}
+
+static void playlist_menu(const char *plpath, const char *name)
+{
+    for (;;) {
+        const char *items[] = { "Play all", "Add songs", "Delete playlist",
+                                "Back" };
+        int sel = ui_menu(name, items, 4, 0);
+        if (sel < 0 || sel == 3) return;
+        if (sel == 0) {
+            size_t l = 0;
+            char *t = k93_read_file(plpath, &l);
+            if (t) {
+                for (char *line = strtok(t, "\n"); line; line = strtok(NULL, "\n"))
+                    if (line[0]) play_wav(line);
+                free(t);
+            }
+        } else if (sel == 1) {
+            pick_add(plpath);
+        } else if (sel == 2) {
+            if (ui_confirm("Music", "Delete this playlist?")) {
+                unlink(plpath);
+                return;
+            }
+        }
+    }
+}
 
 /* ALSA playback fallback: modern kernels have no OSS (/dev/dsp), only the
  * ALSA PCM node. Negotiate the WAV's own rate/channels, then stream frames. */
@@ -101,33 +165,70 @@ int main(void)
 {
     if (ui_init("Music") < 0) return 1;
     k93_mkdir_p(DIRN, 0777);
+    k93_mkdir_p(PL_DIR, 0777);
     for (;;) {
-        char names[64][128];
-        const char *items[70];
-        int n = 0;
-        DIR *d = opendir(DIRN);
-        struct dirent *e;
-        while (d && (e = readdir(d)) && n < 60) {
-            size_t l = strlen(e->d_name);
-            if (l < 4) continue;
-            k93_strlcpy(names[n], e->d_name, sizeof names[n]);
-            items[n] = names[n];
-            n++;
+        char pls[32][128];
+        int npl = 0;
+        DIR *pd = opendir(PL_DIR);
+        struct dirent *pe;
+        while (pd && (pe = readdir(pd)) && npl < 32) {
+            size_t l = strlen(pe->d_name);
+            if (l < 5 || strcmp(pe->d_name + l - 4, ".m3u")) continue;
+            k93_strlcpy(pls[npl], pe->d_name, 128);
+            pls[npl][l - 4] = 0;
+            npl++;
         }
-        if (d) closedir(d);
-        items[n] = "Back";
-        int sel = ui_menu("Music library", items, n + 1, 0);
-        if (sel < 0 || sel == n) break;
+        if (pd) closedir(pd);
+
+        static char titles[32][128];
+        const char *items[40];
+        int n = 0;
+        items[n++] = "+ New playlist";
+        for (int i = 0; i < npl; i++) {
+            snprintf(titles[i], sizeof titles[i], "Playlist: %s", pls[i]);
+            items[n++] = titles[i];
+        }
+        items[n++] = "All songs";
+        items[n++] = "Back";
+
+        int sel = ui_menu("Music", items, n, 0);
+        if (sel < 0 || sel == n - 1) break;
+        if (sel == 0) {
+            char name[96] = "";
+            if (ui_input("Playlist name", name, sizeof name) == 0 && name[0]) {
+                for (char *p = name; *p; p++)
+                    if (*p == '/' || *p == '\n' || *p == '\r') *p = '_';
+                char path[256];
+                snprintf(path, sizeof path, "%s/%s.m3u", PL_DIR, name);
+                k93_write_file(path, "", 0, 0);
+            }
+            continue;
+        }
+        if (sel >= 1 && sel <= npl) {
+            char path[256];
+            snprintf(path, sizeof path, "%s/%s.m3u", PL_DIR, pls[sel - 1]);
+            playlist_menu(path, pls[sel - 1]);
+            continue;
+        }
+        /* All songs */
+        char names[64][128];
+        const char *sitems[66];
+        int ns = list_songs(names, 64);
+        if (ns == 0) { ui_msgbox("Music", "No songs."); continue; }
+        for (int i = 0; i < ns; i++) sitems[i] = names[i];
+        sitems[ns] = "Cancel";
+        int s = ui_menu("All songs", sitems, ns + 1, 0);
+        if (s < 0 || s == ns) continue;
         char path[256];
-        snprintf(path, sizeof path, "%s/%s", DIRN, names[sel]);
+        snprintf(path, sizeof path, "%s/%s", DIRN, names[s]);
         struct stat st;
         char info[256];
         if (stat(path, &st) == 0) {
             char h[32];
             k93_human_size(h, sizeof h, (unsigned long long)st.st_size);
-            snprintf(info, sizeof info, "%s\n%s\n\nPlay this file?", names[sel], h);
+            snprintf(info, sizeof info, "%s\n%s\n\nPlay this file?", names[s], h);
         } else {
-            snprintf(info, sizeof info, "%s\n\nPlay this file?", names[sel]);
+            snprintf(info, sizeof info, "%s\n\nPlay this file?", names[s]);
         }
         if (ui_confirm("Music", info)) play_wav(path);
     }

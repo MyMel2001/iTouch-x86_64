@@ -17,10 +17,27 @@
 
 /* ---- GUI home screen ---------------------------------------------------- */
 
-/* glossy backdrop: vertical gradient + faint light bands, all from code */
+/* glossy backdrop: user wallpaper image if set (iOS 4.0 home-screen
+ * wallpaper), else the code-drawn vertical gradient + light bands. */
 static void draw_wallpaper(void)
 {
     int W = ui_px_width(), H = ui_px_height();
+    size_t len = 0;
+    char *c = k93_read_file("/etc/k93/wallpaper.conf", &len);
+    char path[512] = "";
+    if (c) {
+        for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n"))
+            if (!strncmp(line, "PATH=", 5)) k93_strlcpy(path, line + 5, sizeof path);
+        free(c);
+    }
+    if (path[0]) {
+        ui_image im;
+        if (ui_image_load(&im, path) == 0) {
+            ui_blit_scaled(0, 0, W, H, im.px, im.w, im.h);
+            ui_image_free(&im);
+            return;
+        }
+    }
     uint32_t top = ui_rgb(0x1B, 0x2A, 0x4A), bot = ui_rgb(0x0B, 0x11, 0x20);
     ui_fill_grad(0, 0, W, H, top, bot);
     uint32_t sheen = ui_tint(top, 118, 100);
@@ -227,14 +244,21 @@ static int launch_sel(k93_app **papps, int *pn, int *psel)
     int sel = *psel;
     if (ui_is_graphical()) {
         draw_wallpaper();
-        int W = ui_px_width();
+        int W = ui_px_width(), H = ui_px_height();
         const uint32_t *img = k93_icon_by_name(apps[sel].ident, NULL, NULL);
-        ui_blit((W - ICON_PX) / 2, (ui_px_height() - ICON_PX) / 2 - 20,
-                ICON_PX, ICON_PX, img);
+        /* iOS 4.2 app-opening animation: icon zooms up, then launches */
+        for (int i = 0; i < 5; i++) {
+            int sz = ICON_PX + (ICON_PX * 3 / 2 - ICON_PX) * i / 4;
+            draw_wallpaper();
+            ui_blit_scaled((W - sz) / 2, (H - sz) / 2 - 20, sz, sz,
+                           img, ICON_PX, ICON_PX);
+            ui_flush();
+            usleep(40000);
+        }
         char msg[64];
         snprintf(msg, sizeof msg, "Launching %.40s", apps[sel].name);
         ui_text_bold((W - ui_text_width(1, msg)) / 2,
-                     (ui_px_height() + ICON_PX) / 2, 1, msg,
+                     (H + ICON_PX) / 2, 1, msg,
                      ui_rgb(0xE8, 0xEE, 0xF6), 0x060C18);
         ui_flush();
     } else {

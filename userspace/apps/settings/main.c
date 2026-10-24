@@ -338,25 +338,62 @@ static void pane_notesfont(void)
     }
 }
 
+/* iOS 4.0: home-screen wallpaper image (picked from Photos) */
+static void pane_wallpaper(void)
+{
+    static const char *exts[] = { ".png", ".jpg", ".jpeg", ".gif", ".bmp" };
+    for (;;) {
+        static char buf[64][128];
+        const char *items[66];
+        int n = 0;
+        DIR *d = opendir("/var/mobile/Media/Photos");
+        struct dirent *e;
+        while (d && (e = readdir(d)) && n < 60) {
+            size_t l = strlen(e->d_name);
+            int ok = 0;
+            for (int x = 0; x < 5; x++)
+                if (l > strlen(exts[x]) &&
+                    !strcasecmp(e->d_name + l - strlen(exts[x]), exts[x])) ok = 1;
+            if (!ok) continue;
+            k93_strlcpy(buf[n], e->d_name, 128);
+            items[n] = buf[n];
+            n++;
+        }
+        if (d) closedir(d);
+        items[n++] = "Default (code-drawn)";
+        items[n++] = "Back";
+        int sel = ui_menu("Wallpaper (Photos)", items, n, 0);
+        if (sel < 0 || sel == n - 1) return;
+        k93_mkdir_p("/etc/k93", 0755);
+        char b[1024];
+        if (sel == n - 2) snprintf(b, sizeof b, "PATH=\n");
+        else snprintf(b, sizeof b, "PATH=/var/mobile/Media/Photos/%s\n", buf[sel]);
+        k93_write_file("/etc/k93/wallpaper.conf", b, strlen(b), 0);
+        ui_msgbox("Wallpaper", "Wallpaper saved.\nRestart SpringBoard to apply.");
+    }
+}
+
 int main(void)
 {
     if (ui_init("Settings") < 0) return 1;
     const char *items[] = {
-        "Network", "HTTP Proxy", "Display", "Notes Font", "Certificates", "About",
-        "Storage", "Root Access", "Restart services (SIGHUP launchd)", "Back"
+        "Network", "HTTP Proxy", "Display", "Notes Font", "Wallpaper",
+        "Certificates", "About", "Storage", "Root Access",
+        "Restart services (SIGHUP launchd)", "Back"
     };
     for (;;) {
-        int sel = ui_menu("Settings", items, 10, 0);
+        int sel = ui_menu("Settings", items, 11, 0);
         switch (sel) {
         case 0: pane_network(); break;
         case 1: pane_proxy(); break;
         case 2: pane_display(); break;
         case 3: pane_notesfont(); break;
-        case 4: pane_certs(); break;
-        case 5: pane_about(); break;
-        case 6: pane_storage(); break;
-        case 7: pane_root(); break;
-        case 8:
+        case 4: pane_wallpaper(); break;
+        case 5: pane_certs(); break;
+        case 6: pane_about(); break;
+        case 7: pane_storage(); break;
+        case 8: pane_root(); break;
+        case 9:
             signal_comm("launchd", SIGHUP);
             ui_msgbox("Settings", "SIGHUP delivered to launchd.");
             break;
