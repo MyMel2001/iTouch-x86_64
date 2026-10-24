@@ -143,7 +143,7 @@ binary.
 | `int ui_input(prompt, buf, cap)` | one-line input, 0 ok / -1 cancel |
 | `int ui_textview(title, text)` | scrollable text viewer |
 | `int ui_editbox(title, buf, cap)` | multiline editor |
-| `int ui_pageview(title, ui_page *, tick, arg)` | styled page view (see below) |
+| `int ui_pageview(title, ui_page *, tick, key, arg)` | styled page view (see below); `key` consumes keys for app chrome |
 | `void ui_statusbar(title) / ui_statusmsg(msg)` | top/bottom chrome |
 | `int ui_display_modes(modes[][32], max)` | connector modes "WxH" |
 

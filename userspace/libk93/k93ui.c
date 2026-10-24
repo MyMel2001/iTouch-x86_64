@@ -2275,7 +2275,8 @@ static int page_hit_link(ui_page *p, int li, int x)
 }
 
 int ui_pageview(const char *title, ui_page *p,
-                int (*tick)(ui_page *p, void *ctx), void *ctx)
+                int (*tick)(ui_page *p, void *ctx),
+                int (*key)(int k, ui_page *p, void *ctx), void *ctx)
 {
     int sel = p->sel, top = p->top;       /* preserved across re-entries */
     if (sel >= p->n) sel = p->n - 1;
@@ -2319,7 +2320,12 @@ int ui_pageview(const char *title, ui_page *p,
         } else {
             view = G.rows - 4; if (view < 1) view = 1;
         }
-        switch (k) {
+        int consumed = 0;
+        if (key && k != UI_KEY_NONE) {
+            consumed = key(k, p, ctx);
+            if (consumed) { sel = p->sel; top = p->top; } /* callback moved sel */
+        }
+        if (!consumed) switch (k) {
         case UI_KEY_UP: if (sel > 0) sel--; break;
         case UI_KEY_DOWN: if (sel < p->n - 1) sel++; break;
         case UI_KEY_PGUP: sel -= view; if (sel < 0) sel = 0; break;

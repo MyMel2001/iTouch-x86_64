@@ -109,9 +109,11 @@ typedef struct { ui_pline *lines; int n; int cap; int top, sel; } ui_page;
 
 /* Returns >= 0: link index activated with Enter. -1: Esc (close).
  * tick: called each ~250ms idle; returns 1 = page rebuilt (redraw),
- * 2 = close now. */
+ * 2 = close now. key: called on every key before the built-in scroll keys;
+ * return nonzero to consume the key (Safari uses it for browser chrome). */
 int  ui_pageview(const char *title, ui_page *p,
-                 int (*tick)(ui_page *p, void *ctx), void *ctx);  /* scrollable */
+                 int (*tick)(ui_page *p, void *ctx),
+                 int (*key)(int k, ui_page *p, void *ctx), void *ctx);
 int  ui_editbox(const char *title, char *buf, size_t cap); /* multiline editor */
 
 #endif
