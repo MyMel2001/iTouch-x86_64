@@ -259,6 +259,12 @@ console keeps the plain look, so headless autotests are unchanged):
   BMP (24/32bpp) + PPM only; other formats show as describe-only text.
 * AdSheet remains a provider-neutral stub by design — app developers pick
   their own ad provider; we do not ship a tracking client.
+* iOS 4.0–4.3.4 positive-feature parity is behavioural, not a WebKit port:
+  App Store gift-apps / Game Center badge are not ported (Store is a
+  deliberate stub), YouTube voting is not wired (no public vote API), HDR
+  capture, FaceTime/HD-video upload, CoreMIDI, per-contact text tones and
+  the Arabic/Greek/Hebrew keyboards are out of scope. See
+  `NOTES-BY-AGENT.md` section 9.
 
 ## Legal
 

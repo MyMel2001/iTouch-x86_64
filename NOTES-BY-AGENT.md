@@ -536,3 +536,52 @@ Goal: replace Safari placeholder paths with real implementations.
   clip/save/transform), iframe = inline sub-document with scripts inert,
   media = labels only (no codecs), `toDataURL` = null, file: iframe +
   main doc share the same 1280-char URL buffer.
+
+## 9. iOS 4.0–4.3.4 positive-feature pass (2026-10-23)
+
+Goal: implement every *positive* update in `iOS-4-version-history.md`
+(4.0→4.3.4) as a behavioural clean-room counterpart, after the Safari
+web-engine parity pass.
+
+### Web engine (MobileSafari / WebKit / JavaScriptCore)
+Done via `apps/safari/{main,render,js}.c`, `libk93/k93{html,net,svg,img,font}.c`,
+QuickJS 2025-04-26 + stb_image + mbedTLS (commits `662ecf9`→`f8ff85f`):
+real element renderers (iframe/media/details/canvas), file:// pages,
+IDN punycode + percent-encoded paths (Chinese URL), browser chrome
+(history/bookmarks/find-in-page/reload), localStorage disk persistence,
+XHR + fetch POST, CSS `linear-gradient`. Ceilings: no WebGL, no codecs,
+no WebKit port (clean-room; `third_party/apple-oss` WebCore/JSC are
+reference trees only, never compiled).
+
+### Apps
+* **Calculator** (`apps/calculator`, `libk93/k93calc.c`): 4-function keypad
+  + recursive-descent evaluator, selfcheck-covered.
+* **iBooks** (`apps/ibooks`): plain-text book reader (`ui_textview`),
+  import from `Media/Downloads` into `Library/iBooks`. Ceiling: no PDF/ePub.
+* **Voice Memos** (`apps/voicememos`): S16_LE PCM WAV record via
+  `k93_snd_cap_*` (nonblocking capture loop), list/play/delete.
+* **Mail** (`apps/mail`): multiple inboxes (per-account dirs under
+  `Library/Mail`, INBOX + Sent), `.eml` viewer/composer, delete.
+  Ceiling: local mailboxes only — no SMTP/IMAP client ships.
+
+### Settings / OS features
+* **Restrictions** (parental controls): `Settings > Restrictions` toggles;
+  SpringBoard hides any app whose `ALLOW_<leaf>=0` in
+  `/etc/k93/restrictions.conf`.
+* **Accessibility > Large Text**: `ui_textview_scale` doubles glyph scale on
+  the graphical backend; Calendar event list honours `LARGE_TEXT`.
+* **Bluetooth keyboards**: `Settings > Bluetooth` lists `/dev/input/event*`;
+  a paired BT keyboard is just another input node (already consumed).
+* **Personal Hotspot**, **Find My iPhone** (Lock/Wipe flags; SpringBoard
+  shows a locked screen), **AirPlay**, **AirPrint** (Files print action),
+  **iTunes Home Sharing** (Music exports shared-library `.m3u`), **Spellcheck**
+  (`libk93/k93spell.c` + host dictionary; Notes reports unknown words).
+* Camera **LED flash** (`L` key, sysfs LED node); tap-to-focus, 8x digital
+  zoom and AF already present.
+
+### Deliberate ceilings (not ported)
+App Store gift-apps + Game Center badge (Store intentionally not ported),
+YouTube voting (no public vote API), HDR photo capture, FaceTime / HD
+video upload (iPhone-only; no video decoder), CoreMIDI, per-contact text
+tones, ringer/alerts switch, Birthdays calendar, Arabic/Greek/Hebrew
+keyboards. Documented in README.md.
