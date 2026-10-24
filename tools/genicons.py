@@ -235,6 +235,7 @@ ICONS = {
     "gamecenter":  ("#9b59b6", g_dice),
     "ibooks":      ("#a9744a", g_book),
     "installtohd": ("#4a90d9", g_drive),
+    "mail":        ("#2f6fd0", g_envelope),
     "installer":   ("#2f9e55", g_package),
     "maps":        ("#3aa66f", g_map),
     "music":       ("#f0721e", g_note),
