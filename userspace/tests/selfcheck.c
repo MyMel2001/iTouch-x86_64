@@ -681,6 +681,20 @@ int main(int argc, char **argv)
         printf("info - ui_image ok\n");
     }
 
+    /* Calculator expression evaluator */
+    {
+        double v;
+        chk(k93_calc_eval("2+3", &v) == 0 && v == 5, "calc 2+3");
+        chk(k93_calc_eval("2+3*4", &v) == 0 && v == 14, "calc precedence");
+        chk(k93_calc_eval("(2+3)*4", &v) == 0 && v == 20, "calc parens");
+        chk(k93_calc_eval("10/4", &v) == 0 && v == 2.5, "calc division");
+        chk(k93_calc_eval("-3+4", &v) == 0 && v == 1, "calc unary minus");
+        chk(k93_calc_eval("1/0", &v) < 0, "calc divide-by-zero");
+        chk(k93_calc_eval("2+", &v) < 0, "calc trailing op");
+        chk(k93_calc_eval("(1+2", &v) < 0, "calc unbalanced paren");
+        chk(k93_calc_eval("1.5*2", &v) == 0 && v == 3, "calc decimals");
+    }
+
     printf("%s (%d failures)\n", fails ? "SELFCHECK FAILED" : "SELFCHECK PASSED", fails);
     return fails ? 1 : 0;
 }

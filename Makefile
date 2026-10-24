@@ -31,7 +31,7 @@ LIBK93_OBJ := $(patsubst $(TOP)/userspace/libk93/%.c,$(BUILD)/obj/%.o,$(filter $
 # ---------------------------------------------------------------- apps
 APPS := springboard settings files terminal installer installtohd \
         notes calendar contacts music photos camera diagnostics safari \
-        store youtube maps gamecenter trustme adsheet
+        store youtube maps gamecenter trustme adsheet calculator ibooks voicememos
 APP_BINS := $(patsubst %,$(GBIN)/%,$(APPS))
 
 .PHONY: all clean deps font rootfs initrd disk run qemu-test selfcheck hostselfcheck fixtures uapi

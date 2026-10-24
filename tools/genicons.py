@@ -197,15 +197,43 @@ def g_generic(base, ink):
             f'<circle cx="40" cy="40" r="6" fill="#fff"/>')
 
 
+def g_calc(base, ink):
+    keys = "".join(
+        f'<rect x="{23 + 10 * i}" y="{41 + 6 * j}" width="6" height="4" rx="1" fill="{ink}"/>'
+        for j in range(2) for i in range(4))
+    return (f'<rect x="22" y="16" width="36" height="48" rx="5" fill="#fff"/>'
+            f'<rect x="26" y="21" width="28" height="10" rx="2" fill="{ink}"/>'
+            + keys)
+
+
+def g_book(base, ink):
+    return (f'<rect x="18" y="20" width="44" height="40" rx="4" fill="#fff"/>'
+            f'<path d="M40,20 v40" stroke="{ink}" stroke-width="2.5"/>'
+            f'<rect x="23" y="27" width="12" height="2.5" rx="1.2" fill="{ink}"/>'
+            f'<rect x="23" y="33" width="12" height="2.5" rx="1.2" fill="{ink}"/>'
+            f'<rect x="45" y="27" width="12" height="2.5" rx="1.2" fill="{ink}"/>'
+            f'<rect x="45" y="33" width="12" height="2.5" rx="1.2" fill="{ink}"/>')
+
+
+def g_memo(base, ink):
+    return (f'<rect x="34" y="18" width="12" height="26" rx="6" fill="#fff"/>'
+            f'<path d="M34,32 h12 M34,38 h12" stroke="{ink}" stroke-width="2"/>'
+            f'<path d="M29,30 a11,11 0 0 0 22,0" fill="none" stroke="#fff" stroke-width="4"/>'
+            f'<path d="M40,44 v7 M32,51 h16" stroke="#fff" stroke-width="4" fill="none" '
+            f'stroke-linecap="round"/>')
+
+
 # name -> (base hue, glyph fn)
 ICONS = {
     "adsheet":     ("#8899aa", g_envelope),
+    "calculator":  ("#e8862b", g_calc),
     "calendar":    ("#d94f3d", g_calendar),
     "camera":      ("#556270", g_camera),
     "contacts":    ("#3f8fd8", g_contacts),
     "diagnostics": ("#707880", g_gauge),
     "files":       ("#d8a520", g_folder),
     "gamecenter":  ("#9b59b6", g_dice),
+    "ibooks":      ("#a9744a", g_book),
     "installtohd": ("#4a90d9", g_drive),
     "installer":   ("#2f9e55", g_package),
     "maps":        ("#3aa66f", g_map),
@@ -218,6 +246,7 @@ ICONS = {
     "store":       ("#c0508f", g_bag),
     "terminal":    ("#37424f", g_prompt),
     "trustme":     ("#34495e", g_shield),
+    "voicememos":  ("#2f7fd0", g_memo),
     "youtube":     ("#d33b3b", g_play),
     "generic":     ("#5b6470", g_generic),
 }

@@ -21,6 +21,7 @@ mkdir -p "$ROOT/var/k93/videos" "$ROOT/var/k93/maps" "$ROOT/var/k93/ads" \
     "$ROOT/var/k93/gamecenter" "$ROOT/var/k93/profiles"
 mkdir -p "$ROOT/var/mobile/Media/Downloads" "$ROOT/var/mobile/Library/Notes" \
     "$ROOT/var/mobile/Library/Calendar" "$ROOT/var/mobile/Library/Contacts" \
+    "$ROOT/var/mobile/Library/iBooks" "$ROOT/var/mobile/Library/VoiceMemos" \
     "$ROOT/var/mobile/Media/Photos" "$ROOT/var/mobile/Media/Music"
 
 # ------------------------------------------------------------- base userland
@@ -134,6 +135,9 @@ maps Maps
 gamecenter GameCenter
 trustme TrustMe
 adsheet AdSheet
+calculator Calculator
+ibooks iBooks
+voicememos VoiceMemos
 "
 while read -r app bundle; do
     [ -n "$app" ] || continue

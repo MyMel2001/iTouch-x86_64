@@ -20,5 +20,6 @@ const char *k93_cmdline_arg(const char *key);                 /* value of key=..
 int   k93_cmdline_flag(const char *key);                      /* 1 if bare key present */
 long  k93_sysinfo_long(const char *path);                     /* read a long from a sysfs/proc file, -1 on error */
 int   k93_human_size(char *out, size_t n, unsigned long long bytes);
+int   k93_calc_eval(const char *expr, double *out);   /* four-function + - * / ( ) */
 
 #endif
