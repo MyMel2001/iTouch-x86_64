@@ -56,6 +56,9 @@ static struct {
     int zoom;                          /* 1,2,4,8 digital */
     int rec;
     int af_supported, af_on;
+    int fx, fy;                        /* tap-to-focus point, percent; -1 none */
+    long fshow_until;
+    int px0, py0, ppw, pph;            /* preview rect (for tap mapping) */
     char lastmsg[96];                  /* transient status line */
     long lastmsg_until;                /* now_ms() deadline */
     int have_audio, arate, achan;
@@ -641,6 +644,19 @@ static void draw(int new_frame, long now)
     ui_fill(rx, ry, rw, rh, ui_rgb(0x10, 0x14, 0x1C));   /* letterbox */
     int ox = rx + (rw - pw) / 2, oy = ry + (rh - ph) / 2;
     ui_blit(ox, oy, pw, ph, K.prev);
+    K.px0 = ox; K.py0 = oy; K.ppw = pw; K.pph = ph;
+
+    /* iOS 4.0 tap-to-focus reticle (drawn wherever the tap landed) */
+    if (now < K.fshow_until && K.fx >= 0) {
+        int cxp = ox + (int)((long)K.fx * pw / 100);
+        int cyp = oy + (int)((long)K.fy * ph / 100);
+        int r = pw < ph ? pw / 8 : ph / 8;
+        if (r < 8) r = 8;
+        uint32_t fc = ui_rgb(0x40, 0xFF, 0x40);
+        ui_frame(cxp - r, cyp - r, 2 * r, 2 * r, 2, 2, fc);
+        ui_frame(cxp - r - 4, cyp - 2, 6, 4, 0, 0, fc);
+        ui_frame(cxp + r - 2, cyp - 2, 6, 4, 0, 0, fc);
+    }
 
     char title[80];
     if (K.streaming)
@@ -652,7 +668,7 @@ static void draw(int new_frame, long now)
 
     char hint[176];
     snprintf(hint, sizeof hint,
-             "%s  +/-:zoom  F:AF(%s)  C:cam  SPACE:photo  %s  Q:quit",
+             "%s  +/-:zoom  F:AF(%s)  C:cam  click:focus  SPACE:photo  %s  Q:quit",
              K.streaming ? K.dev[K.cur].path : "pattern",
              K.streaming ? (K.af_supported ? (K.af_on ? "auto" : "off")
                                            : "fixed") : "n/a",
@@ -747,6 +763,16 @@ int main(void)
     for (;;) {
         long now = now_ms();
 
+        if (ui_mouse_clicked(0)) {          /* iOS 4.0 tap-to-focus */
+            int mx = ui_mouse_x(), my = ui_mouse_y();
+            if (K.ppw > 0 && mx >= K.px0 && mx < K.px0 + K.ppw &&
+                my >= K.py0 && my < K.py0 + K.pph) {
+                K.fx = (mx - K.px0) * 100 / K.ppw;
+                K.fy = (my - K.py0) * 100 / K.pph;
+                K.fshow_until = now + 1500;
+                say("tap-to-focus");
+            }
+        }
         int k = ui_getkey(0);
         if (k > 0) {
             if (k == UI_KEY_ESC || k == UI_KEY_CTRL_C ||

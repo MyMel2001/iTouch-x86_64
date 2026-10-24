@@ -301,24 +301,62 @@ static void pane_display(void)
     }
 }
 
+static void pane_notesfont(void)
+{
+    const char *fonts[] = { "sans", "serif", "mono" };
+    int nf = 3;
+    for (;;) {
+        char cur[32] = "sans";
+        size_t len = 0;
+        char *c = k93_read_file("/etc/k93/notes.conf", &len);
+        if (c) {
+            for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n")) {
+                if (!strncmp(line, "FONT=", 5))
+                    k93_strlcpy(cur, line + 5, sizeof cur);
+            }
+            free(c);
+        }
+        char title[64];
+        snprintf(title, sizeof title, "Notes Font  (current: %s)", cur);
+        const char *items[5];
+        int n = 0;
+        for (int i = 0; i < nf; i++) {
+            static char buf[3][64];
+            snprintf(buf[i], sizeof buf[i], "%s%s",
+                     fonts[i], !strcmp(cur, fonts[i]) ? "  (selected)" : "");
+            items[n++] = buf[i];
+        }
+        items[n++] = "Back";
+        int sel = ui_menu(title, items, n, 0);
+        if (sel < 0 || sel == n - 1) return;
+        if (sel >= 0 && sel < nf) {
+            k93_mkdir_p("/etc/k93", 0755);
+            char b[256];
+            snprintf(b, sizeof b, "FONT=%s\n", fonts[sel]);
+            k93_write_file("/etc/k93/notes.conf", b, strlen(b), 0);
+        }
+    }
+}
+
 int main(void)
 {
     if (ui_init("Settings") < 0) return 1;
     const char *items[] = {
-        "Network", "HTTP Proxy", "Display", "Certificates", "About", "Storage",
-        "Root Access", "Restart services (SIGHUP launchd)", "Back"
+        "Network", "HTTP Proxy", "Display", "Notes Font", "Certificates", "About",
+        "Storage", "Root Access", "Restart services (SIGHUP launchd)", "Back"
     };
     for (;;) {
-        int sel = ui_menu("Settings", items, 9, 0);
+        int sel = ui_menu("Settings", items, 10, 0);
         switch (sel) {
         case 0: pane_network(); break;
         case 1: pane_proxy(); break;
         case 2: pane_display(); break;
-        case 3: pane_certs(); break;
-        case 4: pane_about(); break;
-        case 5: pane_storage(); break;
-        case 6: pane_root(); break;
-        case 7:
+        case 3: pane_notesfont(); break;
+        case 4: pane_certs(); break;
+        case 5: pane_about(); break;
+        case 6: pane_storage(); break;
+        case 7: pane_root(); break;
+        case 8:
             signal_comm("launchd", SIGHUP);
             ui_msgbox("Settings", "SIGHUP delivered to launchd.");
             break;

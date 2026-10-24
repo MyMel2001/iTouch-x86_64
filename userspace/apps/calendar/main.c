@@ -48,6 +48,59 @@ static void draw_month(int year, int month, int sel)
     ui_flush();
 }
 
+/* iOS 4.2: import .ics calendar files directly (VEVENT -> local events) */
+static void import_ics(const char *path)
+{
+    size_t l = 0;
+    char *t = k93_read_file(path, &l);
+    if (!t) { char m[256]; snprintf(m, sizeof m, "cannot open %.80s", path);
+              ui_msgbox("Calendar", m); return; }
+    FILE *out = fopen(EVENTS, "a");
+    if (!out) { free(t); return; }
+    int n = 0;
+    char *p = t;
+    while (*p) {
+        char *be = strstr(p, "BEGIN:VEVENT");
+        if (!be) break;
+        char *ee = strstr(be, "END:VEVENT");
+        if (!ee) break;
+        char *body = be + strlen("BEGIN:VEVENT");
+        char ev[160] = "";
+        char *s = strstr(body, "SUMMARY:");
+        if (s) {
+            char *e2 = strchr(s, '\n');
+            size_t sl = e2 ? (size_t)(e2 - s) - 9 : strlen(s + 9);
+            if (sl > sizeof ev - 1) sl = sizeof ev - 1;
+            memcpy(ev, s + 9, sl); ev[sl] = 0;
+            while (sl && (ev[sl - 1] == '\r' || ev[sl - 1] == ' ')) ev[--sl] = 0;
+        }
+        char ymd[9] = "";
+        char *d = strstr(body, "DTSTART");
+        if (d) {
+            char *colon = strchr(d, ':');
+            if (colon) {
+                char *q = colon + 1;
+                for (int i = 0; i < 8 && q[i] >= '0' && q[i] <= '9'; i++)
+                    ymd[i] = q[i];
+            }
+        }
+        if (ymd[0]) {
+            char key[16];
+            snprintf(key, sizeof key, "%c%c%c%c-%c%c-%c%c",
+                     ymd[0], ymd[1], ymd[2], ymd[3],
+                     ymd[4], ymd[5], ymd[6], ymd[7]);
+            fprintf(out, "%s|%s\n", key, ev);
+            n++;
+        }
+        p = ee + strlen("END:VEVENT");
+    }
+    fclose(out);
+    free(t);
+    char m[96];
+    snprintf(m, sizeof m, "Imported %d event(s).", n);
+    ui_msgbox("Calendar", m);
+}
+
 int main(void)
 {
     if (ui_init("Calendar") < 0) return 1;
@@ -85,7 +138,8 @@ int main(void)
             snprintf(title, sizeof title, "Events %s", key);
             if (!body[0]) k93_strlcpy(body, "  (no events)\n", sizeof body);
             char wrapped[4600];
-            snprintf(wrapped, sizeof wrapped, "%s\n[A]dd  [D]elete last  [Esc]close", body);
+            snprintf(wrapped, sizeof wrapped,
+                     "%s\n[A]dd  [D]elete last  [I]mport .ics  [Esc]close", body);
             ui_textview(title, wrapped);
             int k2 = ui_getkey(600);
             if (k2 == UI_KEY_CHAR_BASE + 'a' || k2 == UI_KEY_CHAR_BASE + 'A') {
@@ -94,6 +148,11 @@ int main(void)
                     FILE *f = fopen(EVENTS, "a");
                     if (f) { fprintf(f, "%s|%s\n", key, ev); fclose(f); }
                 }
+            } else if (k2 == UI_KEY_CHAR_BASE + 'i' ||
+                       k2 == UI_KEY_CHAR_BASE + 'I') {
+                char path[512];
+                if (ui_input(".ics file path", path, sizeof path) == 0)
+                    import_ics(path);
             } else if (k2 == UI_KEY_CHAR_BASE + 'd' || k2 == UI_KEY_CHAR_BASE + 'D') {
                 size_t l2 = 0;
                 char *all2 = k93_read_file(EVENTS, &l2);

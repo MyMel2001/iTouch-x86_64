@@ -20,6 +20,17 @@ static void sanitize(char *s)
 int main(void)
 {
     if (ui_init("Notes") < 0) return 1;
+    /* iOS 4.2: Notes font (Settings > Notes Font). sans = Helvetica stand-in,
+     * serif = Chalkboard stand-in, mono = Marker Felt stand-in. */
+    {
+        size_t len = 0;
+        char *c = k93_read_file("/etc/k93/notes.conf", &len);
+        if (c) {
+            for (char *line = strtok(c, "\n"); line; line = strtok(NULL, "\n"))
+                if (!strncmp(line, "FONT=", 5)) ui_set_font(line + 5);
+            free(c);
+        }
+    }
     k93_mkdir_p(DIRN, 0777);
     char msg[128] = "";
     for (;;) {
